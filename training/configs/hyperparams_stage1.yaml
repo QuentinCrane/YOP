@@ -1,0 +1,39 @@
+# ============================================================
+# Stage 1: Public Data Pre-Adaptation
+# ============================================================
+# Trains on public nighttime / low-light driving datasets to
+# build a strong baseline before fine-tuning on phone-captured
+# data.  Uses aggressive augmentation (mosaic closed late) and
+# cosine LR schedule for smooth convergence.
+# ============================================================
+
+# --- optimizer ---
+lr0: 0.01            # initial learning rate
+lrf: 0.01            # final LR = lr0 * lrf
+momentum: 0.937      # SGD momentum / beta1
+weight_decay: 0.0005 # L2 regularization
+
+# --- warmup ---
+warmup_epochs: 3.0   # warmup duration (epochs)
+warmup_momentum: 0.8 # warmup initial momentum
+warmup_bias_lr: 0.1  # warmup bias parameter learning rate
+
+# --- loss weights ---
+box: 7.5             # box regression loss gain
+cls: 0.5             # classification loss gain
+dfl: 1.5             # distribution focal loss gain
+
+# --- training schedule ---
+epochs: 120          # total training epochs
+patience: 30         # early-stopping patience (epochs without improvement)
+
+# --- augmentation ---
+close_mosaic: 15     # disable mosaic augmentation N epochs before end
+cos_lr: True         # use cosine annealing LR schedule
+
+# --- image ---
+imgsz: 640           # training image size (square)
+
+# --- performance ---
+amp: True            # automatic mixed precision (FP16)
+cache: disk          # cache preprocessed images on disk to reduce I/O

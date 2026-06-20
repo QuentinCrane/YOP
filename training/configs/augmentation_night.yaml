@@ -1,0 +1,298 @@
+# ============================================================================
+# Night Road Detection - Data Augmentation Configuration
+# ============================================================================
+# Purpose: Optimized augmentation settings for training object detection models
+#          on night-time road scenes (headlights, streetlights, dark roads,
+#          pedestrians, vehicles, signs, lane markings).
+#
+# Based on Ultralytics YOLO augmentation parameters.
+# Reference: https://docs.ultralytics.com/usage/cfg/#augmentation
+#
+# Usage:
+#   from ultralytics import YOLO
+#   model = YOLO("yolov8n.pt")
+#   model.train(data="night_road.yaml", cfg="augmentation_night.yaml")
+#
+# Or pass individual parameters:
+#   model.train(data="night_road.yaml", hsv_v=0.4, mosaic=1.0, ...)
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# HSV Color Space Augmentation
+# ----------------------------------------------------------------------------
+# Night scenes exhibit fundamentally different color distributions than daytime.
+# Under sodium-vapor streetlights, LED headlights, and mixed artificial lighting,
+# hue shifts are subtle but saturation and value (brightness) vary dramatically.
+
+hsv_h: 0.015    # Hue shift (+/- fraction of 360 deg). Kept very low because
+                 # night lighting already introduces strong color casts (orange
+                 # sodium lamps, blue-white LEDs). A large hue jitter would
+                 # create unrealistic color combinations not seen in real night
+                 # driving. Range: 0.0-1.0.
+
+hsv_s: 0.5      # Saturation variation (+/- fraction). Set moderately high
+                 # because night scenes are naturally desaturated (low-light
+                 # reduces color intensity in camera sensors). This forces the
+                 # model to learn from both washed-out low-sat frames and the
+                 # rare vivid light source (neon signs, traffic lights).
+                 # Range: 0.0-1.0.
+
+hsv_v: 0.4      # Value (brightness) variation (+/- fraction). This is the
+                 # MOST CRITICAL augmentation for night detection. Night images
+                 # span an enormous brightness range: pitch-black road shoulders
+                 # vs. blown-out headlights and streetlights. A high value here
+                 # simulates varying exposure settings, different camera sensors,
+                 # and the natural brightness variance of night driving.
+                 # Range: 0.0-1.0.
+
+# ----------------------------------------------------------------------------
+# Geometric Transformations
+# ----------------------------------------------------------------------------
+# Small geometric augmentations simulate natural variation in camera mounting
+# position, road grade, and vehicle pitch without introducing unrealistic
+# orientations (e.g., upside-down road signs).
+
+degrees: 5.0     # Rotation range (+/- degrees). Small rotation simulates
+                  # slight camera tilt from vehicle pitch (braking, acceleration,
+                  # road bumps). Kept conservative because large rotations create
+                  # physically impossible road orientations. Range: -180 to 180.
+
+translate: 0.1    # Translation fraction (+/- of image size). Simulates slight
+                  # lateral camera offset and the fact that objects of interest
+                  # are not always centered. 10% allows moderate positional
+                  # jitter without losing objects at image edges.
+                  # Range: 0.0-1.0.
+
+scale: 0.3        # Scale gain range (+/- fraction). Simulates objects at
+                  # different distances from the camera. A range of 0.3 means
+                  # the effective scale varies from 0.7x to 1.3x. Important for
+                  # night scenes where approaching headlights or distant
+                  # pedestrians appear at very different scales.
+                  # Range: 0.0-1.0 (representing +/- of base scale).
+
+shear: 2.0        # Shear magnitude (+/- degrees). Simulates perspective
+                  # distortion from non-level camera mounting or road camber.
+                  # Kept small to avoid excessive distortion of lane markings
+                  # and signs. Range: -180 to 180.
+
+perspective: 0.0  # Perspective distortion factor. Disabled because night road
+                  # images already have natural perspective from the forward-
+                  # facing camera. Additional synthetic perspective can create
+                  # unrealistic vanishing point distortions that confuse the
+                  # model on lane detection. Range: 0.0-0.001.
+
+# ----------------------------------------------------------------------------
+# Flip Augmentations
+# ----------------------------------------------------------------------------
+# Flipping must respect the physics of road scenes. Vertical flips are
+# meaningless (roads don't appear above the horizon), while horizontal flips
+# effectively mirror left-hand and right-hand traffic scenes.
+
+flipud: 0.0       # Vertical flip probability. DISABLED for road scenes.
+                   # A vertical flip places the sky at the bottom and road at
+                   # top, which is physically impossible and would teach the
+                   # model nonsense spatial relationships.
+                   # Range: 0.0-1.0 (probability of applying the flip).
+
+fliplr: 0.5       # Horizontal flip probability. Enabled at 50% to simulate
+                   # both directions of travel and help the model generalize
+                   # across left-hand and right-hand traffic scenarios. Also
+                   # doubles effective dataset size for symmetric road layouts.
+                   # Range: 0.0-1.0 (probability of applying the flip).
+
+# ----------------------------------------------------------------------------
+# Channel and Format Augmentations
+# ----------------------------------------------------------------------------
+
+bgr: 0.0          # BGR channel swap probability. Disabled because we want
+                   # consistent color representation. Night scenes rely on
+                   # specific color cues (red taillights, green traffic lights,
+                   # white headlights) that should not be scrambled.
+                   # Range: 0.0-1.0.
+
+# ----------------------------------------------------------------------------
+# Mosaic and Mixup Augmentations
+# ----------------------------------------------------------------------------
+# These are powerful multi-image augmentations that create composite training
+# samples, dramatically increasing scene diversity.
+
+mosaic: 1.0       # Mosaic augmentation probability. ENABLED at 100% during
+                   # early training. Mosaic stitches 4 images into one,
+                   # simulating varied object densities and different lighting
+                   # conditions within a single training sample. This is
+                   # especially valuable for night scenes where a single image
+                   # may only contain a few objects.
+                   #
+                   # IMPORTANT: Disable mosaic in the final training epochs
+                   # using the close_mosaic parameter (typically last 10-15
+                   # epochs) to allow the model to fine-tune on natural,
+                   # un-mosaicked images. Set close_mosaic=15 in your training
+                   # config.
+                   # Range: 0.0-1.0.
+
+mixup: 0.1        # Mixup augmentation probability. A low value blends two
+                   # images at 50% opacity, creating soft overlays. Useful for
+                   # night scenes where light sources naturally bleed across
+                   # the image (headlight glow, streetlight halos). Kept low
+                   # because excessive mixup can make small objects
+                   # (distant pedestrians) too faint to learn from.
+                   # Range: 0.0-1.0.
+
+# ----------------------------------------------------------------------------
+# Erasing Augmentation
+# ----------------------------------------------------------------------------
+
+erasing: 0.2      # Random erasing probability. Randomly masks out rectangular
+                   # regions of the image during training. This forces the
+                   # model to recognize objects from partial views, improving
+                   # robustness to occlusion (e.g., a pedestrian partially
+                   # hidden behind a parked car at night). The 20% rate
+                   # balances occlusion simulation without removing too much
+                   # visual information from already-dim night images.
+                   # Range: 0.0-1.0.
+
+# ----------------------------------------------------------------------------
+# Copy-Paste Augmentation
+# ----------------------------------------------------------------------------
+
+copy_paste: 0.0   # Copy-paste augmentation probability. Disabled for initial
+                   # training. This augmentation segments objects from one image
+                   # and pastes them into another. Can be enabled later
+                   # (0.1-0.3) if the dataset has good segmentation masks and
+                   # you need to increase rare-class (e.g., cyclists, animals)
+                   # frequency. Requires instance segmentation labels.
+                   # Range: 0.0-1.0.
+
+# ----------------------------------------------------------------------------
+# Crop Augmentation
+# ----------------------------------------------------------------------------
+
+crop_fraction: 0.5  # Random crop fraction. Crops a random region of the image
+                     # and resizes back to original dimensions. At 0.5, crops
+                     # between 50-100% of the image area. This simulates
+                     # different zoom levels and helps the model detect objects
+                     # at various positions and partial visibility, which is
+                     # critical for night scenes where illumination varies
+                     # across the frame.
+                     # Range: 0.0-1.0.
+
+# ============================================================================
+# CUSTOM AUGMENTATIONS (Manual Implementation Required)
+# ============================================================================
+# The following augmentations are NOT supported natively by Ultralytics and
+# must be implemented as custom preprocessing transforms. Apply these in a
+# custom Dataset class or via Albumentments integration.
+#
+# Implementation example with Albumentments:
+#
+#   import albumentations as A
+#   night_transform = A.Compose([
+#       A.RandomGamma(gamma_limit=(60, 150), p=0.4),
+#       A.GaussNoise(var_limit=(10.0, 80.0), p=0.3),
+#       ...
+#   ])
+#
+# ============================================================================
+
+# --- Exposure and Brightness Simulation ---
+#
+# Exposure Reduction:
+#   Simulates underexposure common in night driving (fast shutter speed to
+#   reduce motion blur, or scenes with minimal ambient light). Apply random
+#   brightness reduction of 10-40% to image pixel values.
+#   Albumentments: A.RandomBrightnessContrast(brightness_limit=(-0.4, -0.1), p=0.4)
+#
+# Gamma Correction Variation:
+#   Gamma correction non-linearly adjusts brightness, darkening shadows more
+#   than highlights (gamma > 1) or brightening shadows (gamma < 1). This
+#   simulates different camera tone-mapping curves and HDR processing.
+#   Night cameras often use aggressive gamma to pull detail from shadows.
+#   Albumentments: A.RandomGamma(gamma_limit=(60, 150), p=0.4)
+
+# --- Sensor Noise Simulation ---
+#
+# Gaussian Noise:
+#   Electronic noise in the sensor readout circuit. More pronounced in night
+#   scenes due to higher ISO gain. Add zero-mean Gaussian noise with
+#   sigma proportional to image brightness (darker regions get more relative
+#   noise). Variance range: 10-80 (for 8-bit images).
+#   Albumentments: A.GaussNoise(var_limit=(10.0, 80.0), p=0.3)
+#
+# Poisson Noise (Shot Noise):
+#   Photon shot noise follows a Poisson distribution and dominates in low-
+#   light conditions where fewer photons hit each sensor pixel. Simulate by
+#   adding Poisson-distributed noise scaled by sqrt(pixel_intensity).
+#   Implement: noisy = np.random.poisson(image * scale) / scale
+#
+# High ISO Color Noise:
+#   At high ISO settings, chrominance noise becomes visible as random color
+#   speckles, especially in shadow regions. Simulate by adding independent
+#   noise to each color channel with higher noise in dark areas.
+#   Implement: Add channel-independent Gaussian noise with variance
+#   inversely proportional to local brightness.
+
+# --- Blur Augmentations ---
+#
+# Motion Blur:
+#   Camera or object motion during exposure creates directional blur. Common
+#   in night photography due to longer exposure times (1/30s to 1/60s).
+#   Apply a linear motion kernel at random angles with length 3-15 pixels.
+#   Albumentments: A.MotionBlur(blur_limit=(3, 15), p=0.3)
+#
+# Defocus Blur:
+#   Out-of-focus regions (background bokeh, autofocus hunting in low light)
+#   create circular blur. Simulate with a disk-shaped convolution kernel.
+#   Albumentments: A.Defocus(radius=(1, 3), p=0.1)
+
+# --- Compression Artifacts ---
+#
+# JPEG Compression Artifacts:
+#   Dashcam and traffic camera footage is heavily compressed, producing
+#   blocking artifacts and ringing, especially in low-detail dark areas.
+#   Simulate by re-encoding images at quality 30-70.
+#   Albumentments: A.ImageCompression(quality_lower=30, quality_upper=70, p=0.3)
+
+# --- Weather and Environmental Effects ---
+#
+# Rain Drops on Lens:
+#   Water droplets on the windshield or camera lens create out-of-focus
+#   circles and streaks that partially occlude the scene. Simulate by
+#   overlaying semi-transparent circular blobs at random positions with
+#   varying opacity (0.1-0.5) and radius (5-50 pixels).
+#   Implement: Custom transform with cv2.circle() overlays.
+#
+# Wet Road Reflections:
+#   Wet asphalt reflects headlights and streetlights, creating bright
+#   specular patches and extended light halos. Simulate by adding brightness-
+#   boosted elliptical regions near the bottom half of the image.
+#   Implement: Custom transform with cv2.ellipse() brightness overlay.
+#
+# Lens Flare from Headlights:
+#   Bright point sources (oncoming headlights, streetlights) create lens
+#   flare artifacts -- streaks, hexagonal ghosts, and starbursts radiating
+#   from the light source. Simulate by overlaying radial gradient streaks
+#   and semi-transparent polygonal ghosts near detected bright spots.
+#   Implement: Custom transform identifying bright pixels, then drawing
+#   flare elements along the radial axis through the image center.
+
+# ============================================================================
+# RECOMMENDED TRAINING PARAMETERS (complement these augmentations)
+# ============================================================================
+#
+# These parameters should be set in the main training config or command line:
+#
+#   close_mosaic: 15      # Disable mosaic for last 15 epochs to let the
+#                          # model fine-tune on natural image statistics.
+#
+#   copy_paste_mode: ""   # Leave empty unless using instance segmentation.
+#
+#   erasing: 0.2          # (included above for completeness)
+#
+# For night-specific training strategy:
+#   - Train longer than daytime models (200-300 epochs) due to higher
+#     visual complexity and class imbalance.
+#   - Use cosine learning rate schedule to allow fine-grained convergence.
+#   - Consider class-weighted loss if pedestrians/cyclists are rare.
+#   - Validate on a held-out night-only split to measure true night perf.
+#
+# ============================================================================

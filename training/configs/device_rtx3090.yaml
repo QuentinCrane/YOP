@@ -1,0 +1,26 @@
+# ============================================================
+# Device Profile: NVIDIA GeForce RTX 3090
+# ============================================================
+# Hardware-specific recommendations for training on an RTX 3090
+# with 24 GB VRAM.  Values below assume YOLOv8-n/s at 640 px;
+# larger models may require a smaller batch size.
+# ============================================================
+
+gpu_name: "NVIDIA GeForce RTX 3090"
+vram_gb: 24
+
+# --- batch size recommendations ---
+recommended_batch_640: 48   # batch size at imgsz=640
+recommended_batch_512: 64   # batch size at imgsz=512
+
+# --- dataloader ---
+recommended_workers: 8      # number of dataloader workers
+
+# --- training flags ---
+amp: True                   # automatic mixed precision (FP16)
+cache: disk                 # cache preprocessed images on disk
+
+# --- notes ---
+notes: >
+  RTX 3090 has excellent FP16 throughput. batch=-1 recommended
+  for auto-calibration.

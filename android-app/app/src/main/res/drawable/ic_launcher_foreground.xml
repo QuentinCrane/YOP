@@ -1,0 +1,74 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <!-- Night Vision Eye Icon -->
+    <group
+        android:translateX="27"
+        android:translateY="27">
+
+        <!-- Outer eye shape -->
+        <path
+            android:pathData="M27,15 C35,15 42,20 48,27 C42,34 35,39 27,39 C19,39 12,34 6,27 C12,20 19,15 27,15Z"
+            android:strokeColor="#FFFFFF"
+            android:strokeWidth="2.5"
+            android:fillColor="#00000000" />
+
+        <!-- Inner circle (iris) -->
+        <path
+            android:pathData="M27,21 A6,6 0 1,1 27,33 A6,6 0 1,1 27,21Z"
+            android:fillColor="#00FF41" />
+
+        <!-- Pupil -->
+        <path
+            android:pathData="M27,24 A3,3 0 1,1 27,30 A3,3 0 1,1 27,24Z"
+            android:fillColor="#000000" />
+
+        <!-- Light reflection -->
+        <path
+            android:pathData="M25,25 A1.5,1.5 0 1,1 25,28 A1.5,1.5 0 1,1 25,25Z"
+            android:fillColor="#FFFFFF" />
+
+        <!-- Radar/scan lines -->
+        <path
+            android:pathData="M15,27 L6,27"
+            android:strokeColor="#00FF41"
+            android:strokeWidth="1.5"
+            android:strokeAlpha="0.6" />
+
+        <path
+            android:pathData="M48,27 L39,27"
+            android:strokeColor="#00FF41"
+            android:strokeWidth="1.5"
+            android:strokeAlpha="0.6" />
+
+        <!-- Corner brackets -->
+        <path
+            android:pathData="M8,18 L8,15 L11,15"
+            android:strokeColor="#00FF41"
+            android:strokeWidth="1.5"
+            android:strokeAlpha="0.8" />
+
+        <path
+            android:pathData="M46,18 L46,15 L43,15"
+            android:strokeColor="#00FF41"
+            android:strokeWidth="1.5"
+            android:strokeAlpha="0.8" />
+
+        <path
+            android:pathData="M8,36 L8,39 L11,39"
+            android:strokeColor="#00FF41"
+            android:strokeWidth="1.5"
+            android:strokeAlpha="0.8" />
+
+        <path
+            android:pathData="M46,36 L46,39 L43,39"
+            android:strokeColor="#00FF41"
+            android:strokeWidth="1.5"
+            android:strokeAlpha="0.8" />
+
+    </group>
+</vector>

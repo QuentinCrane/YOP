@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="48dp"
+    android:height="48dp"
+    android:viewportWidth="48"
+    android:viewportHeight="48">
+
+    <!-- Background -->
+    <path
+        android:pathData="M0,0 L48,0 L48,48 L0,48 Z"
+        android:fillColor="#0D1117" />
+
+    <!-- Night Vision Eye Icon (centered) -->
+    <group
+        android:translateX="9"
+        android:translateY="9">
+
+        <!-- Outer eye shape -->
+        <path
+            android:pathData="M15,8 C19,8 23,11 26,15 C23,19 19,22 15,22 C11,22 7,19 4,15 C7,11 11,8 15,8Z"
+            android:strokeColor="#FFFFFF"
+            android:strokeWidth="1.5"
+            android:fillColor="#00000000" />
+
+        <!-- Inner circle (iris) -->
+        <path
+            android:pathData="M15,11 A4,4 0 1,1 15,19 A4,4 0 1,1 15,11Z"
+            android:fillColor="#00FF41" />
+
+        <!-- Pupil -->
+        <path
+            android:pathData="M15,13 A2,2 0 1,1 15,17 A2,2 0 1,1 15,13Z"
+            android:fillColor="#000000" />
+
+        <!-- Light reflection -->
+        <path
+            android:pathData="M14,14 A1,1 0 1,1 14,16 A1,1 0 1,1 14,14Z"
+            android:fillColor="#FFFFFF" />
+
+    </group>
+</vector>

@@ -1,0 +1,29 @@
+# Android build artifacts
+android-app/.gradle/
+android-app/app/build/
+android-app/build/
+android-app/local.properties
+
+# IDE
+.idea/
+*.iml
+*.iws
+*.ipr
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Python / training artifacts
+*.pyc
+__pycache__/
+*.egg-info/
+training/runs/
+training/raw_datasets/
+*.npy
+*.pt
+*.onnx
+*_saved_model/
+
+# Gradle wrapper jar (if generated)
+android-app/gradle/wrapper/gradle-wrapper.jar
