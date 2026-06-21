@@ -133,9 +133,11 @@ class ObjectTracker {
      */
     fun update(detections: List<Detection>): List<Track> {
         // -- 1. Build IoU cost matrix (class-matched) -------------------------
-        data class CandidatePair(val trackIdx: Int, val detIdx: Int, val iou: Float)
+        // Use parallel arrays instead of data class to reduce allocation
+        val candTrackIdx = mutableListOf<Int>()
+        val candDetIdx = mutableListOf<Int>()
+        val candIou = mutableListOf<Float>()
 
-        val candidates = mutableListOf<CandidatePair>()
         for (ti in tracks.indices) {
             val track = tracks[ti]
             for (di in detections.indices) {
@@ -143,33 +145,36 @@ class ObjectTracker {
                 if (det.classId != track.classId) continue
                 val iou = computeIoU(track.box, det.box)
                 if (iou >= IOU_THRESHOLD) {
-                    candidates.add(CandidatePair(ti, di, iou))
+                    candTrackIdx.add(ti)
+                    candDetIdx.add(di)
+                    candIou.add(iou)
                 }
             }
         }
 
         // -- 2. Greedy matching in descending IoU order -----------------------
-        candidates.sortByDescending { it.iou }
+        val indices = (0 until candIou.size).sortedByDescending { candIou[it] }
 
-        val matchedTrackIndices = mutableSetOf<Int>()
-        val matchedDetIndices = mutableSetOf<Int>()
-        // trackIdx -> detectionIdx
-        val assignment = mutableMapOf<Int, Int>()
+        val matchedTracks = BooleanArray(tracks.size)
+        val matchedDets = BooleanArray(detections.size)
+        // trackIdx -> detectionIdx (use IntArray with -1 sentinel)
+        val assignment = IntArray(tracks.size) { -1 }
 
-        for (c in candidates) {
-            if (c.trackIdx in matchedTrackIndices) continue
-            if (c.detIdx in matchedDetIndices) continue
-            matchedTrackIndices.add(c.trackIdx)
-            matchedDetIndices.add(c.detIdx)
-            assignment[c.trackIdx] = c.detIdx
+        for (idx in indices) {
+            val ti = candTrackIdx[idx]
+            val di = candDetIdx[idx]
+            if (matchedTracks[ti] || matchedDets[di]) continue
+            matchedTracks[ti] = true
+            matchedDets[di] = true
+            assignment[ti] = di
         }
 
         // -- 3. Update matched tracks -----------------------------------------
         for (ti in tracks.indices) {
             val track = tracks[ti]
-            if (ti in assignment) {
-                val det = detections[assignment[ti]!!]
-                tracks[ti] = track.applyDetection(det)
+            val di = assignment[ti]
+            if (di >= 0) {
+                tracks[ti] = track.applyDetection(detections[di])
             } else {
                 // Unmatched -- increment missed counter, age the track
                 tracks[ti] = track.copy(
@@ -184,7 +189,7 @@ class ObjectTracker {
 
         // -- 5. Create new tracks for unmatched detections --------------------
         for (di in detections.indices) {
-            if (di in matchedDetIndices) continue
+            if (matchedDets[di]) continue
             val det = detections[di]
             tracks.add(
                 InternalTrack(
@@ -202,7 +207,7 @@ class ObjectTracker {
 
         // -- 6. Return confirmed tracks as public snapshot --------------------
         return tracks
-            .filter { it.consecutiveMatches >= CONFIRM_THRESHOLD }
+            .filter { it.consecutiveMatches >= CONFIRM_THRESHOLD && it.missedFrames <= 2 }
             .map { it.toPublicTrack() }
     }
 

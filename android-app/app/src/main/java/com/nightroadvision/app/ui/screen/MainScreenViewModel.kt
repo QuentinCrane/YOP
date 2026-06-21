@@ -7,11 +7,17 @@ import androidx.camera.core.ImageProxy
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.nightroadvision.app.FileLogger
+import com.nightroadvision.app.alert.AlertSoundPlayer
 import com.nightroadvision.app.alert.RidingRisk
 import com.nightroadvision.app.alert.RidingRiskEvaluator
 import com.nightroadvision.app.alert.RidingVibrationController
 import com.nightroadvision.app.camera.CameraManager
+import com.nightroadvision.app.camera.FrameGeometry
 import com.nightroadvision.app.inference.InferenceEngine
+import com.nightroadvision.app.inference.LeadVehicleMerger
+import com.nightroadvision.app.inference.SupercomboConstants
+import com.nightroadvision.app.inference.SupercomboEngine
+import com.nightroadvision.app.inference.SupercomboPreprocessor
 import com.nightroadvision.app.model.ModelManager
 import com.nightroadvision.app.performance.PerformanceMonitor
 import com.nightroadvision.app.tracking.Detection as TrackingDetection
@@ -23,7 +29,6 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import java.nio.ByteBuffer
-import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * ViewModel for MainScreen.
@@ -49,6 +54,22 @@ class MainScreenViewModel(application: Application) : AndroidViewModel(applicati
     private val objectTracker = ObjectTracker()
     private val ridingRiskEvaluator = RidingRiskEvaluator()
     private val ridingVibrationController = RidingVibrationController(application)
+    private val alertSoundPlayer = AlertSoundPlayer()
+
+    // -- Supercombo (openpilot) ------------------------------------------------
+
+    private val supercomboEngine = SupercomboEngine(application)
+    private val supercomboPreprocessor = SupercomboPreprocessor()
+    private val leadVehicleMerger = LeadVehicleMerger()
+
+    private val _supercomboEnabled = MutableStateFlow(false)
+    val supercomboEnabled: StateFlow<Boolean> = _supercomboEnabled.asStateFlow()
+
+    private val _supercomboLatencyMs = MutableStateFlow(0L)
+    val supercomboLatencyMs: StateFlow<Long> = _supercomboLatencyMs.asStateFlow()
+
+    @Volatile
+    private var supercomboReady = false
 
     // -- Camera ---------------------------------------------------------------
 
@@ -58,6 +79,7 @@ class MainScreenViewModel(application: Application) : AndroidViewModel(applicati
     // Actual camera frame dimensions (updated when first frame arrives)
     private var cameraFrameWidth = InferenceEngine.DEFAULT_CAMERA_WIDTH
     private var cameraFrameHeight = InferenceEngine.DEFAULT_CAMERA_HEIGHT
+    private var lastFrameGeometry: FrameGeometry? = null
 
     // -- Detections -----------------------------------------------------------
 
@@ -100,9 +122,8 @@ class MainScreenViewModel(application: Application) : AndroidViewModel(applicati
     private var fpsWindowStartNs = System.nanoTime()
     private var totalFrameCount = 0L
 
-    // -- Inference guard (keep-only-latest) -----------------------------------
+    // -- Camera-frame gate -----------------------------------------------------
 
-    private val isProcessing = AtomicBoolean(false)
     private var frameSkipCounter = 0
     private var errorCount = 0
 
@@ -135,6 +156,19 @@ class MainScreenViewModel(application: Application) : AndroidViewModel(applicati
                         "input=${inferenceEngine.modelInputWidth}x${inferenceEngine.modelInputHeight}, " +
                         "isRawFormat=${inferenceEngine.isRawFormat}, " +
                         "delegate: ${inferenceEngine.getActiveDelegate()}")
+
+                    // Try loading supercombo model (optional, non-fatal)
+                    try {
+                        val scPath = "models/driving_supercombo.onnx"
+                        supercomboReady = supercomboEngine.loadModel(scPath)
+                        if (supercomboReady) {
+                            FileLogger.i(TAG, "Supercombo model loaded OK")
+                        } else {
+                            FileLogger.w(TAG, "Supercombo model not found (optional)")
+                        }
+                    } catch (e: Exception) {
+                        FileLogger.w(TAG, "Supercombo load skipped: ${e.message}")
+                    }
                 } else {
                     FileLogger.e(TAG, "Model load failed: ${savedModel.name} — interpreter is null")
                     _errorMessage.value = "模型加载失败: ${savedModel.name}"
@@ -162,11 +196,18 @@ class MainScreenViewModel(application: Application) : AndroidViewModel(applicati
         val manager = CameraManager(
             context = getApplication(),
             lifecycleOwner = lifecycleOwner,
-            onFrameReady = { buffer, imageProxy ->
-                onCameraFrame(buffer, imageProxy)
+            onFrameReady = { buffer, imageProxy, geometry ->
+                onCameraFrame(buffer, imageProxy, geometry)
             },
             modelInputWidth = currentModel.inputWidth,
             modelInputHeight = currentModel.inputHeight,
+            onYuvFrameReady = { nv21, width, height ->
+                if (_supercomboEnabled.value && supercomboReady) {
+                    supercomboPreprocessor.feedFrame(nv21, width, height)
+                }
+            },
+            shouldAnalyzeFrame = ::shouldAnalyzeCameraFrame,
+            shouldCaptureYuvFrame = { _supercomboEnabled.value && supercomboReady },
         )
         cameraManager = manager
         FileLogger.i(TAG, "createCameraManager: model=${currentModel.name}, " +
@@ -178,36 +219,47 @@ class MainScreenViewModel(application: Application) : AndroidViewModel(applicati
      * Called by CameraManager when a new frame is available.
      * Runs inference on the analysis thread with keep-only-latest backpressure.
      */
-    private fun onCameraFrame(inputBuffer: ByteBuffer, imageProxy: ImageProxy) {
-        // Keep inference geometry synchronized when orientation or camera output changes.
-        if (imageProxy.width != cameraFrameWidth || imageProxy.height != cameraFrameHeight) {
-            cameraFrameWidth = imageProxy.width
-            cameraFrameHeight = imageProxy.height
-            inferenceEngine.setActualCameraDimensions(imageProxy.width, imageProxy.height)
-            FileLogger.i(TAG, "Camera frame: ${imageProxy.width}x${imageProxy.height}")
-        }
+    private fun shouldAnalyzeCameraFrame(): Boolean {
         totalFrameCount++
-
-        // Frame skipping based on settings
+        if (!inferenceEngine.isReady) return false
         frameSkipCounter++
-        val skipInterval = _settings.value.frameSkip
-        if (frameSkipCounter < skipInterval) {
-            imageProxy.close()
-            return
-        }
+        val interval = _settings.value.frameSkip.coerceAtLeast(1)
+        if (frameSkipCounter < interval) return false
         frameSkipCounter = 0
+        return true
+    }
 
-        // Keep-only-latest: if inference is running, drop this frame
-        if (!isProcessing.compareAndSet(false, true)) {
-            imageProxy.close()
-            return
+    private fun onCameraFrame(
+        inputBuffer: ByteBuffer,
+        imageProxy: ImageProxy,
+        geometry: FrameGeometry,
+    ) {
+        // The model tensor and its output use the same upright coordinate space.
+        if (geometry != lastFrameGeometry) {
+            val dimensionsChanged = geometry.width != cameraFrameWidth ||
+                geometry.height != cameraFrameHeight
+            lastFrameGeometry = geometry
+            cameraFrameWidth = geometry.width
+            cameraFrameHeight = geometry.height
+            inferenceEngine.setInputTransform(
+                cameraWidth = geometry.width,
+                cameraHeight = geometry.height,
+                scale = geometry.modelScale,
+                offsetX = geometry.modelOffsetX,
+                offsetY = geometry.modelOffsetY,
+            )
+            if (dimensionsChanged) {
+                synchronized(objectTracker) { objectTracker.reset() }
+                ridingRiskEvaluator.reset()
+                _detections.value = emptyList()
+            }
+            FileLogger.i(TAG, "Model frame geometry: ${geometry.width}x${geometry.height} @ " +
+                "${geometry.rotationDegrees}°, crop=${geometry.centerCrop}")
         }
+        val currentSettings = _settings.value
 
         try {
             if (!inferenceEngine.isReady) {
-                // Interpreter not ready — skip this frame silently
-                isProcessing.set(false)
-                imageProxy.close()
                 return
             }
 
@@ -221,46 +273,60 @@ class MainScreenViewModel(application: Application) : AndroidViewModel(applicati
                     "${inferenceEngine.modelInputWidth}x${inferenceEngine.modelInputHeight}")
             }
 
-            val s = _settings.value
-            FileLogger.d(TAG, "Running inference: buffer=${inputBuffer.remaining()} bytes, " +
-                "conf=${s.confidenceThreshold}, iou=${s.iouThreshold}, " +
-                "modelInput=${inferenceEngine.modelInputWidth}x${inferenceEngine.modelInputHeight}, " +
-                "camera=${inferenceEngine.actualCameraWidth}x${inferenceEngine.actualCameraHeight}, " +
-                "isRaw=${inferenceEngine.isRawFormat}")
-
             val result = inferenceEngine.runInference(
                 inputBuffer = inputBuffer,
-                confidenceThreshold = s.confidenceThreshold,
-                iouThreshold = s.iouThreshold,
+                confidenceThreshold = currentSettings.confidenceThreshold,
+                iouThreshold = currentSettings.iouThreshold,
             )
 
-            val roadDetections = result.detections.filter(::isRoadUserDetection)
+            // Hoist model lookup outside filter to avoid per-detection getCurrentModel() call
+            val currentModel = modelManager.getCurrentModel()
+            val useNightRoad = currentModel.numClasses <= NIGHT_ROAD_CLASS_NAMES.size
+            var roadDetections = if (useNightRoad) {
+                result.detections.filter { it.classId in NIGHT_ROAD_CLASS_NAMES.indices }
+            } else {
+                result.detections.filter { it.classId in COCO_ROAD_USER_CLASS_IDS }
+            }
+
+            // Run supercombo if enabled and ready
+            if (_supercomboEnabled.value && supercomboReady) {
+                val scInputs = supercomboPreprocessor.prepareInputs()
+                if (scInputs != null) {
+                    val scOutput = supercomboEngine.runInference(scInputs)
+                    if (scOutput != null) {
+                        _supercomboLatencyMs.value = scOutput.inferenceTimeMs
+                        // Merge YOLO detections with supercombo lead vehicles
+                        roadDetections = leadVehicleMerger.merge(
+                            roadDetections, scOutput,
+                            cameraFrameWidth, cameraFrameHeight
+                        )
+                    }
+                }
+            }
+
             val stabilizedDetections = stabilizeDetections(roadDetections)
             _detections.value = stabilizedDetections
             val ridingRisk = ridingRiskEvaluator.evaluate(
                 detections = stabilizedDetections,
-                rotationDegrees = getSensorRotationDegrees(),
-                cameraWidth = getCameraFrameWidth(),
-                cameraHeight = getCameraFrameHeight(),
+                rotationDegrees = 0,
+                cameraWidth = cameraFrameWidth,
+                cameraHeight = cameraFrameHeight,
             )
             _ridingRisk.value = ridingRisk
             ridingVibrationController.update(
                 risk = ridingRisk,
-                enabled = s.vibrationAlertsEnabled,
+                enabled = currentSettings.vibrationAlertsEnabled,
             )
+            alertSoundPlayer.setEnabled(currentSettings.soundAlertsEnabled)
+            alertSoundPlayer.onRiskChanged(ridingRisk)
             _activeDelegate.value = result.delegateUsed
             errorCount = 0 // reset on success
 
-            FileLogger.d(TAG, "Inference result: ${result.detections.size} raw, " +
-                "${roadDetections.size} road-user, " +
-                "${stabilizedDetections.size} tracked, " +
-                "time=${result.inferenceTimeMs}ms, delegate=${result.delegateUsed}")
-
-            if (stabilizedDetections.isNotEmpty()) {
-                val d = stabilizedDetections[0]
-                FileLogger.d(TAG, "First detection: " +
-                    "cam=(${d.x1.toInt()},${d.y1.toInt()})-(${d.x2.toInt()},${d.y2.toInt()}) " +
-                    "conf=${d.confidence} cls=${d.className}")
+            // Periodic summary log every 60 frames to avoid hot-path overhead
+            if (totalFrameCount % 60 == 0L) {
+                FileLogger.d(TAG, "Inference: ${result.detections.size} raw, " +
+                    "${roadDetections.size} road, ${stabilizedDetections.size} tracked, " +
+                    "${result.inferenceTimeMs}ms, ${result.delegateUsed}")
             }
 
             updatePerformanceMetrics(result.inferenceTimeMs, stabilizedDetections.size)
@@ -274,7 +340,6 @@ class MainScreenViewModel(application: Application) : AndroidViewModel(applicati
                 _errorMessage.value = "推理失败: ${e.message}"
             }
         } finally {
-            isProcessing.set(false)
             imageProxy.close()
         }
     }
@@ -330,6 +395,28 @@ class MainScreenViewModel(application: Application) : AndroidViewModel(applicati
 
     fun clearError() {
         _errorMessage.value = null
+    }
+
+    // -- Public API: supercombo toggle -----------------------------------------
+
+    fun setSupercomboEnabled(enabled: Boolean) {
+        _supercomboEnabled.value = enabled
+        if (!enabled) {
+            supercomboPreprocessor.reset()
+            _supercomboLatencyMs.value = 0L
+        }
+        FileLogger.i(TAG, "Supercombo ${if (enabled) "enabled" else "disabled"}")
+    }
+
+    // -- Public API: camera switching ------------------------------------------
+
+    fun cycleCamera(): CameraManager.LensOption? {
+        val selected = cameraManager?.cycleCamera() ?: return null
+        synchronized(objectTracker) { objectTracker.reset() }
+        ridingRiskEvaluator.reset()
+        _ridingRisk.value = RidingRisk()
+        _detections.value = emptyList()
+        return selected
     }
 
     // -- Public API: model switching ------------------------------------------
@@ -419,7 +506,6 @@ class MainScreenViewModel(application: Application) : AndroidViewModel(applicati
 
     fun getCameraFrameWidth(): Int = cameraManager?.actualFrameWidth ?: cameraFrameWidth
     fun getCameraFrameHeight(): Int = cameraManager?.actualFrameHeight ?: cameraFrameHeight
-    fun getSensorRotationDegrees(): Int = cameraManager?.sensorRotationDegrees ?: 90
 
     // -- Public API: camera exposure ----------------------------------------
 
@@ -478,6 +564,18 @@ class MainScreenViewModel(application: Application) : AndroidViewModel(applicati
 
         return tracks.map { track ->
             val box = track.smoothedBox
+            val className = roadClassName(track.classId)
+
+            // Match against the tracker's latest unsmoothed box. The previous center-key
+            // lookup almost never matched after EMA smoothing and silently lost distance.
+            val originalIndex = detections.indices
+                .asSequence()
+                .filter { detections[it].classId == track.classId }
+                .maxByOrNull { ObjectTracker.computeIoU(track.box, trackingInput[it].box) }
+            val original = originalIndex
+                ?.takeIf { ObjectTracker.computeIoU(track.box, trackingInput[it].box) >= 0.5f }
+                ?.let(detections::get)
+
             InferenceEngine.Detection(
                 x1 = box.left,
                 y1 = box.top,
@@ -485,10 +583,13 @@ class MainScreenViewModel(application: Application) : AndroidViewModel(applicati
                 y2 = box.bottom,
                 confidence = track.confidence,
                 classId = track.classId,
-                className = roadClassName(track.classId),
+                className = className,
                 trackId = track.id,
                 cameraWidth = cameraFrameWidth,
                 cameraHeight = cameraFrameHeight,
+                distanceMeters = original?.distanceMeters,
+                velocityMps = original?.velocityMps,
+                isLeadVehicle = original?.isLeadVehicle ?: false,
             )
         }
     }
@@ -533,7 +634,9 @@ class MainScreenViewModel(application: Application) : AndroidViewModel(applicati
         super.onCleared()
         cameraManager?.release()
         ridingVibrationController.reset()
+        alertSoundPlayer.release()
         inferenceEngine.close()
+        supercomboEngine.close()
         FileLogger.i(TAG, "onCleared — resources released")
     }
 }

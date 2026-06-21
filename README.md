@@ -1,186 +1,152 @@
-# Night Road Vision
+# YOP - Real-time YOLO Camera on phone
 
-Real-time night-time road object detection for Android, powered by custom-trained YOLO models exported to TFLite with GPU delegate support.
+Android phone-side real-time road perception project focused on on-device YOLO inference, rider-facing alerts, and a matching training/export pipeline.
 
-## Project Overview
+## What This Repo Contains
 
-Night Road Vision is an Android application that provides real-time object detection optimized for low-light / night driving conditions. It detects pedestrians, riders, cyclists, motorcycles, cars, buses, and trucks using a lightweight YOLO model running on-device via TensorFlow Lite.
+This repository currently has two main parts:
 
-### Architecture
+- `android-app/`: Android app built with Jetpack Compose, CameraX, LiteRT, and ONNX Runtime
+- `training/`: dataset preparation, training, evaluation, and model export scripts for the YOLO pipeline
 
-```
+In the current codebase, the app uses YOLO models for live camera detection and can optionally load an `openpilot`-style `supercombo` ONNX model to enrich lead-vehicle perception when that asset is present.
+
+## Current App Capabilities
+
+- Real-time camera inference on Android phones
+- YOLO model hot-switching through the app model manager
+- LiteRT backend with GPU first, plus fallback behavior in the inference stack
+- CameraX preview and analysis pipeline
+- Object tracking for more stable overlay behavior
+- Riding-risk evaluation with vibration and sound alerts
+- Optional `supercombo` ONNX inference path for lead-vehicle merging
+- Runtime performance monitoring and file-based logging
+
+## Repository Structure
+
+```text
 night-road-vision/
-  android-app/          # Jetpack Compose Android application
-    app/src/main/java/com/nightroadvision/app/
-      MainActivity.kt           # Entry point, permission handling
-      MainScreenViewModel.kt    # Pipeline orchestrator (camera -> inference -> UI)
-      NightRoadApp.kt           # Application class (FileLogger init)
-      CrashLogger.kt            # Uncaught exception logger
-      FileLogger.kt             # File-based logging for debugging
-      camera/
-        CameraManager.kt        # CameraX pipeline, YUV->RGB, letterboxing, exposure control
-      inference/
-        InferenceEngine.kt      # TFLite with GPU/NNAPI/CPU fallback, NMS
-      model/
-        ModelManager.kt          # Model selection and hot-switching
-      tracking/
-        ObjectTracker.kt         # ByteTrack-inspired tracker with EMA
-      performance/
-        PerformanceMonitor.kt    # FPS, latency, thermal monitoring
-      ui/
-        screen/
-          MainScreen.kt         # Primary detection screen
-          MainScreenViewModel.kt # ViewModel for detection pipeline
-        overlay/
-          DetectionOverlay.kt   # Bounding box rendering with rotation
-        theme/
-          Color.kt, Theme.kt, Type.kt
-  training/
-    configs/
-      hyperparams_stage1.yaml       # Stage 1 hyperparameters (public data pre-adaptation)
-      hyperparams_stage2.yaml       # Stage 2 hyperparameters (phone data fine-tune)
-      device_rtx3090.yaml           # RTX 3090 device profile
-      augmentation_night.yaml       # Night-scene augmentation settings
-    scripts/
-      train.py                      # Two-stage training pipeline
-      prepare_datasets.py           # Dataset preparation (BDD100K, NightOwls, ExDark, video)
-      export_models.py              # Model export to TFLite FP16/INT8 and QNN
-      evaluate.py                   # Evaluation: standard, slice-based, video, multi-format
-      download_model.py             # Quick-start: download model, export TFLite, deploy
+├─ android-app/
+│  ├─ app/
+│  │  ├─ src/main/java/com/nightroadvision/app/
+│  │  │  ├─ MainActivity.kt
+│  │  │  ├─ NightRoadApp.kt
+│  │  │  ├─ FileLogger.kt
+│  │  │  ├─ CrashLogger.kt
+│  │  │  ├─ camera/
+│  │  │  ├─ inference/
+│  │  │  ├─ model/
+│  │  │  ├─ performance/
+│  │  │  ├─ tracking/
+│  │  │  ├─ alert/
+│  │  │  └─ ui/
+│  │  └─ src/main/assets/
+│  │     ├─ labels.txt
+│  │     └─ models/
+│  └─ gradle/
+├─ training/
+│  ├─ configs/
+│  ├─ docs/
+│  ├─ scripts/
+│  ├─ TRAINING_GUIDE.md
+│  └─ DEPLOY_3090.md
+├─ DEVELOPMENT.md
+└─ OPENPILOT_HUD_RESEARCH.md
 ```
 
-### Key Features
+## Android Stack
 
-- **7-class detection**: person, rider, bicycle, motorcycle, car, bus, truck
-- **Per-class confidence thresholds**: lower thresholds for pedestrians/riders (safety-critical)
-- **Three performance modes**: ECO (every 3rd frame), BALANCED (every 2nd), FINE (every frame)
-- **Auto device calibration**: measures inference latency on first launch to select optimal mode
-- **ByteTrack-inspired tracking**: persistent object IDs with EMA-smoothed bounding boxes
-- **Multi-model support**: YOLO26n, YOLOv8n/s/m with runtime hot-switching
-- **GPU delegate with automatic fallback**: TFLite GPU -> NNAPI -> CPU fallback chain
-- **Snapdragon 8 Gen 3 / Adreno 750 optimized**: FP16, sustained-speed preference, GPU kernel serialization
-- **Camera exposure control**: auto/manual ISO, shutter speed, and exposure compensation via Camera2Interop
-- **Per-frame rotation-aware coordinate mapping**: sensor coordinates mapped to display with per-frame rotation
-- **File-based logging**: runtime logs written to device storage for debugging without logcat
-- **Immersive fullscreen**: landscape orientation, hidden system bars, keep-screen-on
-- **Real-time performance HUD**: detection FPS, preview FPS, inference latency, thermal status
-- **Dark-first UI**: Material 3 dark theme optimized for night-vision preservation
+- Kotlin + Jetpack Compose
+- CameraX
+- Google LiteRT (`com.google.ai.edge.litert`)
+- ONNX Runtime Android
+- Material 3
 
-### Model Details
+Key app settings from the current Gradle config:
 
-| Model | Size | Parameters | Input Resolution | Description |
-|-------|------|------------|-----------------|-------------|
-| YOLO26n | ~5 MB | 2.8M | 512x320 | Custom FP16 model, fast inference |
-| YOLOv8n | ~6 MB | 3.2M | 640x640 | Nano -- fastest, lowest accuracy |
-| YOLOv8s | ~22 MB | 11.2M | 640x640 | Small -- balanced speed/accuracy |
-| YOLOv8m | ~50 MB | 25.9M | 640x640 | Medium -- highest accuracy |
+- `compileSdk = 35`
+- `targetSdk = 35`
+- `minSdk = 26`
+- Java/Kotlin target = `11`
 
-YOLO26n outputs [1, 300, 6] post-NMS. YOLOv8 models output raw [1, 84, 8400] (4 bbox + 80 classes); the engine applies NMS and produces the same detection format: `[x1, y1, x2, y2, confidence, class_id]`.
+## Included Model Assets
 
-## Build Instructions
+The repository currently includes multiple model assets under `android-app/app/src/main/assets/models/`, including lightweight YOLO variants that are suitable for running on-device.
 
-### Prerequisites
+The Gradle build also contains a lightweight asset-sync step so larger experimental assets are not packaged into every APK by default.
 
-- Android Studio Ladybug (2024.2) or later
-- JDK 11+
-- Android SDK 35
-- Python 3.10+ (for training/export scripts)
-- CUDA-capable GPU with 24GB+ VRAM (for training)
+## Quick Start
 
-### Android App
+### 1. Open the Android project
 
-1. **Obtain a TFLite model**. Either:
-   - Run the quick-start download script:
-     ```bash
-     cd training/scripts
-     pip install ultralytics
-     python download_model.py
-     ```
-   - Or train your own model (see Training below).
+Open `android-app/` in Android Studio.
 
-2. **Open the project** in Android Studio:
-   ```
-   File > Open > <repo>/night-road-vision/android-app
-   ```
+### 2. Build and install
 
-3. **Sync Gradle** and let dependencies download.
+On Windows:
 
-4. **Build and run** on a device with a camera:
-   ```bash
-   cd android-app
-   ./gradlew installDebug
-   ```
+```powershell
+cd android-app
+.\gradlew.bat installDebug
+```
 
-The app will request camera permission on first launch, auto-detect device capability, and begin real-time detection.
-
-### Training (Optional)
-
-Training requires an NVIDIA GPU with at least 24GB VRAM (RTX 3090 recommended).
-
-1. **Install Python dependencies**:
-   ```bash
-   pip install ultralytics torch torchvision tqdm pandas pyyaml opencv-python
-   ```
-
-2. **Prepare datasets** (BDD100K night, NightOwls, ExDark, or custom video):
-   ```bash
-   cd training/scripts
-   python prepare_datasets.py bdd100k --input /path/to/bdd100k --output datasets/night_road
-   python prepare_datasets.py extract-frames --input /path/to/videos --output datasets/night_road --fps 2
-   python prepare_datasets.py split --dataset datasets/night_road
-   python prepare_datasets.py create-yaml --dataset datasets/night_road
-   ```
-
-3. **Run two-stage training**:
-   ```bash
-   python train.py both \
-       --data-stage1 datasets/night_road/night_road.yaml \
-       --data-stage2 datasets/night_road_phone/night_road.yaml
-   ```
-
-4. **Export to mobile formats**:
-   ```bash
-   python export_models.py all \
-       --model runs/night-road/stage2_finetune/weights/best.pt \
-       --calibration-data datasets/night_road/night_road.yaml \
-       --android-assets ../../android-app/app/src/main/assets
-   ```
-
-5. **Evaluate**:
-   ```bash
-   python evaluate.py standard --model best.pt --data night_road.yaml
-   python evaluate.py compare --models best.pt fp16.tflite int8.tflite
-   ```
-
-## Configuration
-
-### Performance Modes
-
-| Mode | Frame Skip | Best For |
-|------|-----------|----------|
-| ECO | Every 3rd frame | Low-end devices, thermal throttling |
-| BALANCED | Every 2nd frame | Default for most devices |
-| FINE | Every frame | High-end devices, maximum accuracy |
-
-The app auto-selects the best mode based on measured inference latency:
-- < 25ms average: FINE
-- 25-50ms average: BALANCED
-- > 50ms average: ECO
-
-### Augmentation Settings
-
-Night-scene augmentation is configured in `training/configs/augmentation_night.yaml` and includes HSV jitter, geometric transforms, mosaic, mixup, and random erasing -- all tuned for low-light road scenes.
-
-## Debugging
-
-The app writes runtime logs to device storage via `FileLogger`. Retrieve logs with:
+On macOS or Linux:
 
 ```bash
-adb pull /sdcard/Android/data/com.nightroadvision.app/files/NightRoadVision/app_log.txt
+cd android-app
+./gradlew installDebug
 ```
 
-Crash logs are saved to the same directory as `crash_log.txt`. The app log rotates automatically at 5 MB.
+### 3. Grant permissions
+
+The app currently requests:
+
+- Camera permission
+- Vibration permission
+
+### 4. Run on a physical device
+
+A real device is recommended because the project depends on camera input and mobile inference performance.
+
+## Training Pipeline
+
+The training workspace under `training/` includes scripts for:
+
+- downloading or preparing datasets
+- converting annotations into the YOLO workflow
+- running training
+- evaluating exported models
+- exporting mobile assets for Android use
+
+Useful entry points:
+
+- [training/TRAINING_GUIDE.md](/E:/Github%20Program/YLOP/night-road-vision/training/TRAINING_GUIDE.md)
+- [training/DEPLOY_3090.md](/E:/Github%20Program/YLOP/night-road-vision/training/DEPLOY_3090.md)
+- [training/docs/DATASET_CARD.md](/E:/Github%20Program/YLOP/night-road-vision/training/docs/DATASET_CARD.md)
+- [training/docs/MODEL_CARD.md](/E:/Github%20Program/YLOP/night-road-vision/training/docs/MODEL_CARD.md)
+
+Example flow:
+
+```bash
+cd training/scripts
+python prepare_datasets.py --help
+python train.py --help
+python export_models.py --help
+python evaluate.py --help
+```
+
+## Notes About the Current State
+
+- The repository name is still `night-road-vision`, but the project title in this README is now `YOP - Real-time YOLO Camera on phone`
+- The Android app name shown in resources is currently `夜视路况`
+- `supercombo` support is optional in code and depends on the corresponding ONNX model asset being available
+- This repo already contains committed model files, so `.gitignore` should be kept careful not to hide the tracked assets you still want in source control
+
+## Development Docs
+
+- [DEVELOPMENT.md](/E:/Github%20Program/YLOP/night-road-vision/DEVELOPMENT.md)
+- [OPENPILOT_HUD_RESEARCH.md](/E:/Github%20Program/YLOP/night-road-vision/OPENPILOT_HUD_RESEARCH.md)
 
 ## License
 
-This project is provided as-is for educational and research purposes.
+No explicit license file is present in the repository at the moment. If you plan to publish or collaborate externally, adding a license file would be a good next step.
