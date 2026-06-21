@@ -18,6 +18,8 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.CheckCircle
+import androidx.compose.material.icons.filled.FlashlightOff
+import androidx.compose.material.icons.filled.FlashlightOn
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -26,6 +28,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
@@ -36,6 +39,9 @@ import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.camera.view.PreviewView
 import com.nightroadvision.app.model.ModelManager
+import com.nightroadvision.app.alert.RidingRisk
+import com.nightroadvision.app.alert.RiskReason
+import com.nightroadvision.app.alert.RiskSeverity
 import com.nightroadvision.app.ui.overlay.DetectionOverlay
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -115,9 +121,10 @@ data class InferenceSettings(
     val iouThreshold: Float = 0.45f,
     val detectionMode: DetectionMode = DetectionMode.BALANCED,
     val frameSkip: Int = 1,
-    val selectedModelId: String = "yolov8n",
+    val selectedModelId: String = "yolo26n",
     val backendPreference: BackendPreference = BackendPreference.AUTO,
-    val gpuPrecision: GpuPrecision = GpuPrecision.FP16
+    val gpuPrecision: GpuPrecision = GpuPrecision.FP16,
+    val vibrationAlertsEnabled: Boolean = true,
 )
 
 data class PerformanceMetrics(
@@ -527,6 +534,38 @@ fun SettingsDialog(
                     }
                 }
 
+                SettingsSection(label = "RIDING ALERTS") {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = "接近目标震动提醒",
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = NightVisionColors.Text,
+                            )
+                            Text(
+                                text = "仅对已确认、进入中央注意区域的目标触发，并带冷却去抖",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = NightVisionColors.TextMuted,
+                            )
+                        }
+                        Switch(
+                            checked = settings.vibrationAlertsEnabled,
+                            onCheckedChange = { enabled ->
+                                onSettingsChanged(settings.copy(vibrationAlertsEnabled = enabled))
+                            },
+                            colors = SwitchDefaults.colors(
+                                checkedThumbColor = NightVisionColors.Background,
+                                checkedTrackColor = NightVisionColors.Accent,
+                                uncheckedThumbColor = NightVisionColors.TextSecondary,
+                                uncheckedTrackColor = NightVisionColors.Border,
+                            ),
+                        )
+                    }
+                }
+
                 // ── Frame Skip Control ──
                 SettingsSection(label = "FRAME SKIP") {
                     Column {
@@ -871,15 +910,192 @@ private fun CircleIconButton(
 ) {
     Surface(
         onClick = onClick,
-        modifier = modifier.size(44.dp),
+        modifier = modifier.size(48.dp),
         shape = CircleShape,
-        color = NightVisionColors.Background.copy(alpha = 0.85f),
-        border = BorderStroke(1.dp, NightVisionColors.Border.copy(alpha = 0.6f))
+        color = Color.Black.copy(alpha = 0.48f),
+        border = BorderStroke(1.dp, Color.White.copy(alpha = 0.14f))
     ) {
         Box(contentAlignment = Alignment.Center) {
             icon()
         }
     }
+}
+
+@Composable
+private fun VisionStatusChip(
+    modelName: String,
+    modifier: Modifier = Modifier,
+) {
+    Surface(
+        modifier = modifier,
+        shape = RoundedCornerShape(18.dp),
+        color = Color.Black.copy(alpha = 0.48f),
+        border = BorderStroke(1.dp, NightVisionColors.Accent.copy(alpha = 0.34f)),
+    ) {
+        Row(
+            modifier = Modifier.padding(horizontal = 11.dp, vertical = 7.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Box(
+                modifier = Modifier
+                    .size(8.dp)
+                    .background(NightVisionColors.Accent, CircleShape),
+            )
+            Spacer(Modifier.width(7.dp))
+            Column {
+                Text(
+                    text = "VISION",
+                    color = Color.White,
+                    fontWeight = FontWeight.Black,
+                    fontSize = 10.sp,
+                    letterSpacing = 1.sp,
+                )
+                Text(
+                    text = modelName,
+                    color = Color.White.copy(alpha = 0.66f),
+                    fontFamily = FontFamily.Monospace,
+                    fontSize = 8.sp,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun TelemetryChip(
+    metrics: PerformanceMetrics,
+    active: Boolean,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    Surface(
+        onClick = onClick,
+        modifier = modifier.height(48.dp),
+        shape = RoundedCornerShape(18.dp),
+        color = Color.Black.copy(alpha = 0.48f),
+        border = BorderStroke(
+            1.dp,
+            if (active) NightVisionColors.Accent.copy(alpha = 0.65f)
+            else Color.White.copy(alpha = 0.14f),
+        ),
+    ) {
+        Row(
+            modifier = Modifier.padding(horizontal = 11.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(
+                text = String.format("%.0f", metrics.fps),
+                color = Color.White,
+                fontWeight = FontWeight.Bold,
+                fontFamily = FontFamily.Monospace,
+                fontSize = 13.sp,
+            )
+            Text(
+                text = " FPS  ·  ${metrics.inferenceLatencyMs.toInt()} ms",
+                color = Color.White.copy(alpha = 0.65f),
+                fontFamily = FontFamily.Monospace,
+                fontSize = 9.sp,
+            )
+        }
+    }
+}
+
+@Composable
+private fun TargetAlertChip(
+    risk: RidingRisk,
+    modifier: Modifier = Modifier,
+) {
+    if (risk.severity == RiskSeverity.NONE) return
+
+    val alertColor = when (risk.severity) {
+        RiskSeverity.CRITICAL -> Color(0xFFC92231)
+        RiskSeverity.CAUTION -> Color(0xFFDA6F25)
+        RiskSeverity.NONE -> Color.Transparent
+    }
+    val reason = when (risk.reason) {
+        RiskReason.VERY_NEAR -> "目标很近"
+        RiskReason.APPROACHING_QUICKLY -> "正在快速接近"
+        RiskReason.IN_ATTENTION_ZONE -> "进入注意区域"
+        RiskReason.NONE -> ""
+    }
+    val target = buildString {
+        append(risk.className)
+        risk.trackId?.let { append("  #$it") }
+    }
+
+    Surface(
+        modifier = modifier,
+        shape = RoundedCornerShape(18.dp),
+        color = alertColor.copy(alpha = 0.92f),
+        border = BorderStroke(1.dp, Color.White.copy(alpha = 0.18f)),
+    ) {
+        Text(
+            text = "$target  ·  $reason",
+            color = Color.White,
+            fontWeight = FontWeight.Black,
+            fontSize = 12.sp,
+            modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp),
+        )
+    }
+}
+
+@Composable
+private fun HudControls(
+    portrait: Boolean,
+    flashlightOn: Boolean,
+    onToggleFlashlight: () -> Unit,
+    onOpenSettings: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    if (portrait) {
+        Column(
+            modifier = modifier,
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            HudFlashlightButton(flashlightOn, onToggleFlashlight)
+            HudSettingsButton(onOpenSettings)
+        }
+    } else {
+        Row(
+            modifier = modifier,
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            HudFlashlightButton(flashlightOn, onToggleFlashlight)
+            HudSettingsButton(onOpenSettings)
+        }
+    }
+}
+
+@Composable
+private fun HudFlashlightButton(flashlightOn: Boolean, onClick: () -> Unit) {
+    CircleIconButton(
+        onClick = onClick,
+        icon = {
+            Icon(
+                imageVector = if (flashlightOn) Icons.Filled.FlashlightOn else Icons.Filled.FlashlightOff,
+                contentDescription = if (flashlightOn) "关闭手电筒" else "打开手电筒",
+                tint = if (flashlightOn) NightVisionColors.Warning else Color.White.copy(alpha = 0.78f),
+                modifier = Modifier.size(21.dp),
+            )
+        },
+    )
+}
+
+@Composable
+private fun HudSettingsButton(onClick: () -> Unit) {
+    CircleIconButton(
+        onClick = onClick,
+        icon = {
+            Icon(
+                imageVector = Icons.Filled.Settings,
+                contentDescription = "设置",
+                tint = Color.White.copy(alpha = 0.78f),
+                modifier = Modifier.size(21.dp),
+            )
+        },
+    )
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -900,6 +1116,7 @@ fun MainScreen(
     modifier: Modifier = Modifier
 ) {
     val lifecycleOwner = LocalLifecycleOwner.current
+    val configuration = LocalConfiguration.current
 
     // ViewModel state
     val detections by viewModel.detections.collectAsState()
@@ -908,11 +1125,12 @@ fun MainScreen(
     val currentModelName by viewModel.currentModelName.collectAsState()
     val errorMessage by viewModel.errorMessage.collectAsState()
     val activeDelegate by viewModel.activeDelegate.collectAsState()
+    val ridingRisk by viewModel.ridingRisk.collectAsState()
 
     // Local UI state
     var showSettingsDialog by remember { mutableStateOf(false) }
     var showModelSelector by remember { mutableStateOf(false) }
-    var showPerformancePanel by remember { mutableStateOf(true) }
+    var showPerformancePanel by remember { mutableStateOf(false) }
     var flashlightOn by remember { mutableStateOf(false) }
 
     // Camera setup - runs once on first composition
@@ -920,6 +1138,10 @@ fun MainScreen(
         viewModel.createCameraManager(lifecycleOwner)
     }
     var cameraStarted by remember { mutableStateOf(false) }
+
+    LaunchedEffect(configuration.orientation, cameraStarted) {
+        if (cameraStarted) cameraManager.refreshDisplayRotation()
+    }
 
     // Cleanup camera when composable leaves composition
     DisposableEffect(Unit) {
@@ -929,11 +1151,14 @@ fun MainScreen(
     }
 
     NightVisionTheme {
-        Box(
+        BoxWithConstraints(
             modifier = modifier
                 .fillMaxSize()
                 .background(NightVisionColors.Background)
         ) {
+            val portrait = maxHeight > maxWidth
+            val edgePadding = if (portrait) 10.dp else 14.dp
+
             // ── Camera Preview ──
             AndroidView(
                 factory = { ctx ->
@@ -954,13 +1179,63 @@ fun MainScreen(
                 modifier = Modifier.fillMaxSize()
             )
 
+            // openpilot-style edge fade: enough contrast for corner HUD elements while
+            // keeping the central camera feed effectively untouched.
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(
+                        Brush.verticalGradient(
+                            0f to Color.Black.copy(alpha = 0.34f),
+                            0.14f to Color.Transparent,
+                            0.88f to Color.Transparent,
+                            1f to Color.Black.copy(alpha = 0.28f),
+                        ),
+                    ),
+            )
+
             // ── Detection overlay ──
             DetectionOverlay(
                 detections = detections,
+                highlightedTrackId = ridingRisk.trackId,
                 cameraWidth = viewModel.getCameraFrameWidth(),
                 cameraHeight = viewModel.getCameraFrameHeight(),
                 sensorRotationDegrees = viewModel.getSensorRotationDegrees(),
                 modifier = Modifier.fillMaxSize()
+            )
+
+            // Like openpilot's state border, this remains peripheral and changes only
+            // when a tracked person or vehicle occupies a large part of the frame.
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .border(
+                        width = if (ridingRisk.severity == RiskSeverity.CRITICAL) 3.dp else 1.dp,
+                        color = when (ridingRisk.severity) {
+                            RiskSeverity.CRITICAL -> Color(0xFFC92231).copy(alpha = 0.72f)
+                            RiskSeverity.CAUTION -> Color(0xFFDA6F25).copy(alpha = 0.58f)
+                            RiskSeverity.NONE -> NightVisionColors.Accent.copy(alpha = 0.20f)
+                        },
+                    ),
+            )
+
+            VisionStatusChip(
+                modelName = currentModelName,
+                modifier = Modifier
+                    .align(Alignment.TopStart)
+                    .statusBarsPadding()
+                    .padding(start = edgePadding, top = 8.dp)
+                    .widthIn(max = if (portrait) 142.dp else 180.dp),
+            )
+
+            TelemetryChip(
+                metrics = metrics,
+                active = showPerformancePanel,
+                onClick = { showPerformancePanel = !showPerformancePanel },
+                modifier = Modifier
+                    .align(Alignment.TopEnd)
+                    .statusBarsPadding()
+                    .padding(end = edgePadding, top = 8.dp),
             )
 
             // ── Performance Panel (top-left) ──
@@ -970,8 +1245,8 @@ fun MainScreen(
                 exit = fadeOut() + slideOutHorizontally(targetOffsetX = { -it }),
                 modifier = Modifier
                     .statusBarsPadding()
-                    .padding(start = 12.dp, top = 12.dp)
-                    .align(Alignment.TopStart)
+                    .padding(end = edgePadding, top = 64.dp)
+                    .align(Alignment.TopEnd)
                     .widthIn(min = 160.dp, max = 200.dp)
             ) {
                 PerformancePanel(
@@ -980,78 +1255,28 @@ fun MainScreen(
                 )
             }
 
-            // ── Bottom toolbar ──
-            Row(
+            TargetAlertChip(
+                risk = ridingRisk,
                 modifier = Modifier
                     .align(Alignment.BottomCenter)
                     .navigationBarsPadding()
-                    .padding(bottom = 16.dp)
-                    .clip(RoundedCornerShape(24.dp))
-                    .background(NightVisionColors.Background.copy(alpha = 0.85f))
-                    .border(1.dp, NightVisionColors.Border.copy(alpha = 0.6f), RoundedCornerShape(24.dp))
-                    .padding(horizontal = 12.dp, vertical = 8.dp),
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                // Flashlight toggle
-                CircleIconButton(
-                    onClick = {
-                        flashlightOn = viewModel.toggleFlashlight()
-                    },
-                    icon = {
-                        Text(
-                            text = if (flashlightOn) "\u26A1" else "\u25CB",
-                            fontSize = 18.sp,
-                            color = if (flashlightOn) NightVisionColors.Warning
-                                    else NightVisionColors.TextSecondary
-                        )
-                    }
-                )
+                    .padding(bottom = 10.dp),
+            )
 
-                // Telemetry toggle
-                CircleIconButton(
-                    onClick = { showPerformancePanel = !showPerformancePanel },
-                    icon = {
-                        Text(
-                            text = "T",
-                            color = if (showPerformancePanel) NightVisionColors.Accent
-                                    else NightVisionColors.TextSecondary,
-                            fontWeight = FontWeight.Bold,
-                            fontSize = 14.sp,
-                            fontFamily = FontFamily.Monospace
-                        )
-                    }
-                )
-
-                // Detection count badge
-                Surface(
-                    shape = RoundedCornerShape(12.dp),
-                    color = if (metrics.detectionCount > 0) NightVisionColors.Accent.copy(alpha = 0.15f)
-                            else NightVisionColors.SurfaceVariant
-                ) {
-                    Text(
-                        text = "${metrics.detectionCount} obj",
-                        style = MaterialTheme.typography.labelMedium,
-                        fontWeight = FontWeight.Bold,
-                        color = if (metrics.detectionCount > 0) NightVisionColors.Accent
-                                else NightVisionColors.TextMuted,
-                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp)
-                    )
-                }
-
-                // Settings button
-                CircleIconButton(
-                    onClick = { showSettingsDialog = true },
-                    icon = {
-                        Icon(
-                            imageVector = Icons.Filled.Settings,
-                            contentDescription = "Settings",
-                            tint = NightVisionColors.TextSecondary,
-                            modifier = Modifier.size(20.dp)
-                        )
-                    }
-                )
-            }
+            HudControls(
+                portrait = portrait,
+                flashlightOn = flashlightOn,
+                onToggleFlashlight = {
+                    flashlightOn = viewModel.toggleFlashlight()
+                },
+                onOpenSettings = {
+                    showSettingsDialog = true
+                },
+                modifier = Modifier
+                    .align(Alignment.BottomEnd)
+                    .navigationBarsPadding()
+                    .padding(end = edgePadding, bottom = 8.dp),
+            )
 
             // ── Error Snackbar ──
             errorMessage?.let { error ->
@@ -1059,7 +1284,7 @@ fun MainScreen(
                     modifier = Modifier
                         .align(Alignment.BottomCenter)
                         .navigationBarsPadding()
-                        .padding(bottom = 80.dp, start = 16.dp, end = 16.dp),
+                        .padding(bottom = 64.dp, start = 16.dp, end = 16.dp),
                     containerColor = NightVisionColors.Danger.copy(alpha = 0.9f),
                     contentColor = NightVisionColors.Text,
                     dismissAction = {

@@ -96,6 +96,7 @@ class CameraManager(
     @Volatile private var focusMode = FocusMode.CONTINUOUS
 
     private var previewSurfaceProvider: Preview.SurfaceProvider? = null
+    private var lastDisplayRotation: Int? = null
 
     private var frameCount = 0L
 
@@ -128,6 +129,7 @@ class CameraManager(
 
         // Get display rotation to match preview orientation
         val displayRotation = getDisplayRotation()
+        lastDisplayRotation = displayRotation
         sensorRotationDegrees = rotationDegrees(displayRotation)
         FileLogger.i(TAG, "Display rotation: $displayRotation (display=$displayRotation, " +
             "sensor rotation will be updated from first frame)")
@@ -183,18 +185,32 @@ class CameraManager(
         else -> 0
     }
 
+    /** Rebind preview and analysis when the phone rotates without recreating the Activity. */
+    fun refreshDisplayRotation() {
+        val displayRotation = getDisplayRotation()
+        if (displayRotation == lastDisplayRotation) return
+
+        val provider = cameraProvider ?: return
+        val surfaceProvider = previewSurfaceProvider ?: return
+        FileLogger.i(TAG, "Display rotation changed: $lastDisplayRotation -> $displayRotation")
+        bindUseCases(provider, surfaceProvider)
+    }
+
     /**
      * Convert ImageProxy to letterboxed ByteBuffer and deliver via callback.
      * The callback receives the ImageProxy and is responsible for closing it.
      */
     private fun processFrame(imageProxy: ImageProxy) {
         try {
-            // Log actual frame dimensions on first frame
-            if (frameCount == 0L) {
+            val frameRotation = imageProxy.imageInfo.rotationDegrees
+            val frameGeometryChanged = imageProxy.width != actualFrameWidth ||
+                imageProxy.height != actualFrameHeight ||
+                frameRotation != sensorRotationDegrees
+            if (frameCount == 0L || frameGeometryChanged) {
                 actualFrameWidth = imageProxy.width
                 actualFrameHeight = imageProxy.height
-                sensorRotationDegrees = imageProxy.imageInfo.rotationDegrees
-                FileLogger.i(TAG, "First frame: ${imageProxy.width}x${imageProxy.height}, " +
+                sensorRotationDegrees = frameRotation
+                FileLogger.i(TAG, "Frame geometry: ${imageProxy.width}x${imageProxy.height}, " +
                     "sensorRotation: ${sensorRotationDegrees}")
             }
             frameCount++

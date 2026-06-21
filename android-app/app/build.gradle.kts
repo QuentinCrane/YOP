@@ -4,6 +4,16 @@ plugins {
     id("org.jetbrains.kotlin.plugin.compose")
 }
 
+val lightweightAssetsDir = layout.buildDirectory.dir("generated/lightweightAssets")
+val prepareLightweightAssets by tasks.registering(org.gradle.api.tasks.Sync::class) {
+    from("src/main/assets")
+    exclude(
+        "models/yolov8s.tflite",
+        "models/yolov8m.tflite",
+    )
+    into(lightweightAssetsDir)
+}
+
 android {
     namespace = "com.nightroadvision.app"
     compileSdk = 35
@@ -32,6 +42,13 @@ android {
         compose = true
     }
 
+    // Keep the riding build lightweight. Larger accuracy experiments remain in the
+    // repository but are not shipped inside every APK; YOLO26n is the default and
+    // YOLOv8n remains available as a compatibility fallback.
+    sourceSets.getByName("main") {
+        assets.setSrcDirs(listOf(lightweightAssetsDir.get().asFile))
+    }
+
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_11
         targetCompatibility = JavaVersion.VERSION_11
@@ -40,6 +57,10 @@ android {
     kotlinOptions {
         jvmTarget = "11"
     }
+}
+
+tasks.matching { it.name.startsWith("merge") && it.name.endsWith("Assets") }.configureEach {
+    dependsOn(prepareLightweightAssets)
 }
 
 dependencies {

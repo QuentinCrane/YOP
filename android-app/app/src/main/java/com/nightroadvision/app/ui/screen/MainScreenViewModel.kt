@@ -1,15 +1,21 @@
 package com.nightroadvision.app.ui.screen
 
 import android.app.Application
+import android.graphics.RectF
 import android.util.Log
 import androidx.camera.core.ImageProxy
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.nightroadvision.app.FileLogger
+import com.nightroadvision.app.alert.RidingRisk
+import com.nightroadvision.app.alert.RidingRiskEvaluator
+import com.nightroadvision.app.alert.RidingVibrationController
 import com.nightroadvision.app.camera.CameraManager
 import com.nightroadvision.app.inference.InferenceEngine
 import com.nightroadvision.app.model.ModelManager
 import com.nightroadvision.app.performance.PerformanceMonitor
+import com.nightroadvision.app.tracking.Detection as TrackingDetection
+import com.nightroadvision.app.tracking.ObjectTracker
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -29,6 +35,10 @@ class MainScreenViewModel(application: Application) : AndroidViewModel(applicati
 
     companion object {
         private const val TAG = "MainScreenVM"
+        private val COCO_ROAD_USER_CLASS_IDS = setOf(0, 1, 2, 3, 5, 7)
+        private val NIGHT_ROAD_CLASS_NAMES = listOf(
+            "person", "rider", "bicycle", "motorcycle", "car", "bus", "truck",
+        )
     }
 
     // -- Engine & manager -----------------------------------------------------
@@ -36,6 +46,9 @@ class MainScreenViewModel(application: Application) : AndroidViewModel(applicati
     private val inferenceEngine = InferenceEngine(application)
     private val modelManager = ModelManager(application)
     private val performanceMonitor = PerformanceMonitor(application)
+    private val objectTracker = ObjectTracker()
+    private val ridingRiskEvaluator = RidingRiskEvaluator()
+    private val ridingVibrationController = RidingVibrationController(application)
 
     // -- Camera ---------------------------------------------------------------
 
@@ -50,6 +63,9 @@ class MainScreenViewModel(application: Application) : AndroidViewModel(applicati
 
     private val _detections = MutableStateFlow<List<InferenceEngine.Detection>>(emptyList())
     val detections: StateFlow<List<InferenceEngine.Detection>> = _detections.asStateFlow()
+
+    private val _ridingRisk = MutableStateFlow(RidingRisk())
+    val ridingRisk: StateFlow<RidingRisk> = _ridingRisk.asStateFlow()
 
     // -- Settings (driven by UI's InferenceSettings data class) ----------------
 
@@ -163,8 +179,8 @@ class MainScreenViewModel(application: Application) : AndroidViewModel(applicati
      * Runs inference on the analysis thread with keep-only-latest backpressure.
      */
     private fun onCameraFrame(inputBuffer: ByteBuffer, imageProxy: ImageProxy) {
-        // Update actual camera dimensions from the first frame
-        if (totalFrameCount == 0L) {
+        // Keep inference geometry synchronized when orientation or camera output changes.
+        if (imageProxy.width != cameraFrameWidth || imageProxy.height != cameraFrameHeight) {
             cameraFrameWidth = imageProxy.width
             cameraFrameHeight = imageProxy.height
             inferenceEngine.setActualCameraDimensions(imageProxy.width, imageProxy.height)
@@ -218,21 +234,36 @@ class MainScreenViewModel(application: Application) : AndroidViewModel(applicati
                 iouThreshold = s.iouThreshold,
             )
 
-            _detections.value = result.detections
+            val roadDetections = result.detections.filter(::isRoadUserDetection)
+            val stabilizedDetections = stabilizeDetections(roadDetections)
+            _detections.value = stabilizedDetections
+            val ridingRisk = ridingRiskEvaluator.evaluate(
+                detections = stabilizedDetections,
+                rotationDegrees = getSensorRotationDegrees(),
+                cameraWidth = getCameraFrameWidth(),
+                cameraHeight = getCameraFrameHeight(),
+            )
+            _ridingRisk.value = ridingRisk
+            ridingVibrationController.update(
+                risk = ridingRisk,
+                enabled = s.vibrationAlertsEnabled,
+            )
             _activeDelegate.value = result.delegateUsed
             errorCount = 0 // reset on success
 
-            FileLogger.d(TAG, "Inference result: ${result.detections.size} detections, " +
+            FileLogger.d(TAG, "Inference result: ${result.detections.size} raw, " +
+                "${roadDetections.size} road-user, " +
+                "${stabilizedDetections.size} tracked, " +
                 "time=${result.inferenceTimeMs}ms, delegate=${result.delegateUsed}")
 
-            if (result.detections.isNotEmpty()) {
-                val d = result.detections[0]
+            if (stabilizedDetections.isNotEmpty()) {
+                val d = stabilizedDetections[0]
                 FileLogger.d(TAG, "First detection: " +
                     "cam=(${d.x1.toInt()},${d.y1.toInt()})-(${d.x2.toInt()},${d.y2.toInt()}) " +
                     "conf=${d.confidence} cls=${d.className}")
             }
 
-            updatePerformanceMetrics(result.inferenceTimeMs, result.detections.size)
+            updatePerformanceMetrics(result.inferenceTimeMs, stabilizedDetections.size)
         } catch (e: Exception) {
             errorCount++
             if (errorCount <= 5 || errorCount % 30 == 0) {
@@ -313,6 +344,13 @@ class MainScreenViewModel(application: Application) : AndroidViewModel(applicati
 
                 modelManager.switchModel(model)
                 inferenceEngine.loadModel(model.path)
+                synchronized(objectTracker) {
+                    objectTracker.reset()
+                }
+                ridingRiskEvaluator.reset()
+                ridingVibrationController.reset()
+                _ridingRisk.value = RidingRisk()
+                _detections.value = emptyList()
 
                 if (inferenceEngine.isReady) {
                     inferenceEngine.warmUp()
@@ -401,6 +439,60 @@ class MainScreenViewModel(application: Application) : AndroidViewModel(applicati
 
     // -- Internals ------------------------------------------------------------
 
+    private fun isRoadUserDetection(detection: InferenceEngine.Detection): Boolean {
+        val model = modelManager.getCurrentModel()
+        return if (model.numClasses <= NIGHT_ROAD_CLASS_NAMES.size) {
+            detection.classId in NIGHT_ROAD_CLASS_NAMES.indices
+        } else {
+            detection.classId in COCO_ROAD_USER_CLASS_IDS
+        }
+    }
+
+    private fun roadClassName(classId: Int): String {
+        val model = modelManager.getCurrentModel()
+        return if (model.numClasses <= NIGHT_ROAD_CLASS_NAMES.size) {
+            NIGHT_ROAD_CLASS_NAMES.getOrElse(classId) { "target" }
+        } else {
+            InferenceEngine.CLASS_NAMES.getOrElse(classId) { "target" }
+        }
+    }
+
+    /**
+     * Confirm detections across frames and smooth their coordinates before drawing.
+     * This suppresses one-frame giant boxes and reduces HUD jitter while driving.
+     */
+    private fun stabilizeDetections(
+        detections: List<InferenceEngine.Detection>,
+    ): List<InferenceEngine.Detection> {
+        val trackingInput = detections.map { detection ->
+            TrackingDetection(
+                classId = detection.classId,
+                confidence = detection.confidence,
+                box = RectF(detection.x1, detection.y1, detection.x2, detection.y2),
+            )
+        }
+
+        val tracks = synchronized(objectTracker) {
+            objectTracker.update(trackingInput)
+        }
+
+        return tracks.map { track ->
+            val box = track.smoothedBox
+            InferenceEngine.Detection(
+                x1 = box.left,
+                y1 = box.top,
+                x2 = box.right,
+                y2 = box.bottom,
+                confidence = track.confidence,
+                classId = track.classId,
+                className = roadClassName(track.classId),
+                trackId = track.id,
+                cameraWidth = cameraFrameWidth,
+                cameraHeight = cameraFrameHeight,
+            )
+        }
+    }
+
     private fun updatePerformanceMetrics(inferenceTimeMs: Long, detectionCount: Int) {
         frameCount++
         val now = System.nanoTime()
@@ -440,6 +532,7 @@ class MainScreenViewModel(application: Application) : AndroidViewModel(applicati
     override fun onCleared() {
         super.onCleared()
         cameraManager?.release()
+        ridingVibrationController.reset()
         inferenceEngine.close()
         FileLogger.i(TAG, "onCleared — resources released")
     }

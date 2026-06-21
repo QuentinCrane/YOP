@@ -48,7 +48,9 @@ object FileLogger {
 
     fun d(tag: String, message: String) {
         Log.d(tag, message)
-        append("D", tag, message)
+        // Per-frame camera/inference diagnostics are intentionally kept out of the
+        // on-disk log. Synchronous file appends at detection FPS cause avoidable I/O,
+        // heat and frame jitter during a ride. Info/warning/error events remain saved.
     }
 
     private fun append(level: String, tag: String, message: String) {

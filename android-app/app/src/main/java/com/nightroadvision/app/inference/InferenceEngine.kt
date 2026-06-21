@@ -826,6 +826,7 @@ class InferenceEngine(private val context: Context) {
         val confidence: Float,
         val classId: Int,
         val className: String = CLASS_NAMES.getOrElse(classId) { "unknown" },
+        val trackId: Int? = null,
         val cameraWidth: Int = DEFAULT_CAMERA_WIDTH,
         val cameraHeight: Int = DEFAULT_CAMERA_HEIGHT,
     ) {
