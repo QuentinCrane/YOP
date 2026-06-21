@@ -25,9 +25,9 @@ class ModelManager(private val context: Context) {
         private const val KEY_CURRENT_MODEL = "current_model"
         private const val DEFAULT_MODEL = "models/yolo26n_float16.tflite"
 
-        /** Default YOLOv8 input dimensions (width x height). */
-        const val DEFAULT_INPUT_WIDTH = 512
-        const val DEFAULT_INPUT_HEIGHT = 320
+        /** Default YOLO input dimensions (width x height). */
+        const val DEFAULT_INPUT_WIDTH = 640
+        const val DEFAULT_INPUT_HEIGHT = 640
         const val DEFAULT_NUM_CLASSES = 80 // COCO 80 classes
     }
 
@@ -67,11 +67,23 @@ class ModelManager(private val context: Context) {
             name = "YOLO26n",
             path = "models/yolo26n_float16.tflite",
             size = "~5 MB",
-            sizeBytes = 5_388_624L,
-            description = "YOLO26 Nano FP16 -- custom model, fast inference with good accuracy.",
-            parameterCount = "2.8M",
-            inputWidth = 512,
-            inputHeight = 320,
+            sizeBytes = 5_449_141L,
+            description = "YOLO26 Nano FP16 -- NMS-free, fast inference with good accuracy.",
+            parameterCount = "2.4M",
+            inputWidth = 640,
+            inputHeight = 640,
+            numClasses = 80,
+        ),
+        ModelInfo(
+            id = "yolo26s",
+            name = "YOLO26s",
+            path = "models/yolo26s_float16.tflite",
+            size = "~20 MB",
+            sizeBytes = 19_628_630L,
+            description = "YOLO26 Small FP16 -- high accuracy (+7.7 mAP), recommended for road detection.",
+            parameterCount = "9.5M",
+            inputWidth = 640,
+            inputHeight = 640,
             numClasses = 80,
         ),
         ModelInfo(

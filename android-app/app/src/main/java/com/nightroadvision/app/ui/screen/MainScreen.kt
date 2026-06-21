@@ -43,6 +43,7 @@ import com.nightroadvision.app.alert.RidingRisk
 import com.nightroadvision.app.alert.RiskReason
 import com.nightroadvision.app.alert.RiskSeverity
 import com.nightroadvision.app.ui.overlay.DetectionOverlay
+import java.util.Locale
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Color Palette -- Night Vision Dark Theme
@@ -125,6 +126,7 @@ data class InferenceSettings(
     val backendPreference: BackendPreference = BackendPreference.AUTO,
     val gpuPrecision: GpuPrecision = GpuPrecision.FP16,
     val vibrationAlertsEnabled: Boolean = true,
+    val soundAlertsEnabled: Boolean = true,
 )
 
 data class PerformanceMetrics(
@@ -316,7 +318,10 @@ fun SettingsDialog(
     currentModelName: String,
     onSettingsChanged: (InferenceSettings) -> Unit,
     onOpenModelSelector: () -> Unit,
-    onDismiss: () -> Unit
+    onDismiss: () -> Unit,
+    supercomboEnabled: Boolean = false,
+    onSupercomboToggle: (Boolean) -> Unit = {},
+    supercomboLatencyMs: Long = 0L,
 ) {
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -401,7 +406,7 @@ fun SettingsDialog(
                                 color = NightVisionColors.TextSecondary
                             )
                             Text(
-                                text = String.format("%.2f", settings.confidenceThreshold),
+                                text = String.format(Locale.US, "%.2f", settings.confidenceThreshold),
                                 style = MaterialTheme.typography.bodySmall,
                                 fontWeight = FontWeight.Bold,
                                 color = NightVisionColors.Accent,
@@ -447,7 +452,7 @@ fun SettingsDialog(
                                 color = NightVisionColors.TextSecondary
                             )
                             Text(
-                                text = String.format("%.2f", settings.iouThreshold),
+                                text = String.format(Locale.US, "%.2f", settings.iouThreshold),
                                 style = MaterialTheme.typography.bodySmall,
                                 fontWeight = FontWeight.Bold,
                                 color = NightVisionColors.Accent,
@@ -555,6 +560,38 @@ fun SettingsDialog(
                             checked = settings.vibrationAlertsEnabled,
                             onCheckedChange = { enabled ->
                                 onSettingsChanged(settings.copy(vibrationAlertsEnabled = enabled))
+                            },
+                            colors = SwitchDefaults.colors(
+                                checkedThumbColor = NightVisionColors.Background,
+                                checkedTrackColor = NightVisionColors.Accent,
+                                uncheckedThumbColor = NightVisionColors.TextSecondary,
+                                uncheckedTrackColor = NightVisionColors.Border,
+                            ),
+                        )
+                    }
+
+                    Spacer(modifier = Modifier.height(10.dp))
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = "接近目标声音提醒",
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = NightVisionColors.Text,
+                            )
+                            Text(
+                                text = "CAUTION 短提示音，CRITICAL 急促重复提示音",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = NightVisionColors.TextMuted,
+                            )
+                        }
+                        Switch(
+                            checked = settings.soundAlertsEnabled,
+                            onCheckedChange = { enabled ->
+                                onSettingsChanged(settings.copy(soundAlertsEnabled = enabled))
                             },
                             colors = SwitchDefaults.colors(
                                 checkedThumbColor = NightVisionColors.Background,
@@ -681,6 +718,47 @@ fun SettingsDialog(
                                     }
                                 }
                             }
+                        }
+                    }
+                }
+
+                // ── Supercombo (openpilot) ──
+                SettingsSection(label = "SUPERCOMBO") {
+                    Column {
+                        Text(
+                            text = "openpilot 前车检测 + 真实距离 (需要 supercombo 模型文件)",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = NightVisionColors.TextSecondary
+                        )
+                        Spacer(modifier = Modifier.height(8.dp))
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.SpaceBetween
+                        ) {
+                            Text(
+                                text = "启用 Supercombo",
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = NightVisionColors.Text
+                            )
+                            Switch(
+                                checked = supercomboEnabled,
+                                onCheckedChange = { onSupercomboToggle(it) },
+                                colors = SwitchDefaults.colors(
+                                    checkedThumbColor = NightVisionColors.Accent,
+                                    checkedTrackColor = NightVisionColors.Accent.copy(alpha = 0.3f),
+                                    uncheckedThumbColor = NightVisionColors.TextMuted,
+                                    uncheckedTrackColor = NightVisionColors.Background,
+                                )
+                            )
+                        }
+                        if (supercomboEnabled && supercomboLatencyMs > 0) {
+                            Spacer(modifier = Modifier.height(4.dp))
+                            Text(
+                                text = "Supercombo 延迟: ${supercomboLatencyMs}ms",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = NightVisionColors.TextMuted
+                            )
                         }
                     }
                 }
@@ -819,7 +897,7 @@ fun PerformancePanel(
             // FPS
             MetricRow(
                 label = "FPS",
-                value = String.format("%.1f", metrics.fps),
+                value = String.format(Locale.US, "%.1f", metrics.fps),
                 valueColor = when {
                     metrics.fps >= 24f -> NightVisionColors.Success
                     metrics.fps >= 15f -> NightVisionColors.Warning
@@ -986,7 +1064,7 @@ private fun TelemetryChip(
             verticalAlignment = Alignment.CenterVertically,
         ) {
             Text(
-                text = String.format("%.0f", metrics.fps),
+                text = String.format(Locale.US, "%.0f", metrics.fps),
                 color = Color.White,
                 fontWeight = FontWeight.Bold,
                 fontFamily = FontFamily.Monospace,
@@ -1048,6 +1126,9 @@ private fun HudControls(
     onToggleFlashlight: () -> Unit,
     onOpenSettings: () -> Unit,
     modifier: Modifier = Modifier,
+    showCameraSwitch: Boolean = false,
+    cameraLensLabel: String = "CAM",
+    onCycleCamera: () -> Unit = {},
 ) {
     if (portrait) {
         Column(
@@ -1055,6 +1136,7 @@ private fun HudControls(
             verticalArrangement = Arrangement.spacedBy(8.dp),
         ) {
             HudFlashlightButton(flashlightOn, onToggleFlashlight)
+            if (showCameraSwitch) HudCameraSwitchButton(cameraLensLabel, onCycleCamera)
             HudSettingsButton(onOpenSettings)
         }
     } else {
@@ -1063,9 +1145,26 @@ private fun HudControls(
             horizontalArrangement = Arrangement.spacedBy(8.dp),
         ) {
             HudFlashlightButton(flashlightOn, onToggleFlashlight)
+            if (showCameraSwitch) HudCameraSwitchButton(cameraLensLabel, onCycleCamera)
             HudSettingsButton(onOpenSettings)
         }
     }
+}
+
+@Composable
+private fun HudCameraSwitchButton(label: String, onClick: () -> Unit) {
+    CircleIconButton(
+        onClick = onClick,
+        icon = {
+            Text(
+                text = label,
+                color = Color.White.copy(alpha = 0.92f),
+                fontSize = if (label.length > 3) 9.sp else 11.sp,
+                fontWeight = FontWeight.Black,
+                fontFamily = FontFamily.Monospace,
+            )
+        },
+    )
 }
 
 @Composable
@@ -1112,11 +1211,11 @@ private fun HudSettingsButton(onClick: () -> Unit) {
  */
 @Composable
 fun MainScreen(
+    modifier: Modifier = Modifier,
     viewModel: MainScreenViewModel = viewModel(),
-    modifier: Modifier = Modifier
 ) {
     val lifecycleOwner = LocalLifecycleOwner.current
-    val configuration = LocalConfiguration.current
+    val configurationOrientation = LocalConfiguration.current.orientation
 
     // ViewModel state
     val detections by viewModel.detections.collectAsState()
@@ -1126,6 +1225,8 @@ fun MainScreen(
     val errorMessage by viewModel.errorMessage.collectAsState()
     val activeDelegate by viewModel.activeDelegate.collectAsState()
     val ridingRisk by viewModel.ridingRisk.collectAsState()
+    val supercomboEnabled by viewModel.supercomboEnabled.collectAsState()
+    val supercomboLatencyMs by viewModel.supercomboLatencyMs.collectAsState()
 
     // Local UI state
     var showSettingsDialog by remember { mutableStateOf(false) }
@@ -1138,15 +1239,13 @@ fun MainScreen(
         viewModel.createCameraManager(lifecycleOwner)
     }
     var cameraStarted by remember { mutableStateOf(false) }
-
-    LaunchedEffect(configuration.orientation, cameraStarted) {
-        if (cameraStarted) cameraManager.refreshDisplayRotation()
-    }
+    val availableLenses by cameraManager.availableLenses.collectAsState()
+    val selectedLens by cameraManager.currentLens.collectAsState()
 
     // Cleanup camera when composable leaves composition
     DisposableEffect(Unit) {
         onDispose {
-            cameraManager.stopCamera()
+            cameraManager.release()
         }
     }
 
@@ -1171,9 +1270,18 @@ fun MainScreen(
                     }
                 },
                 update = { previewView ->
+                    val displayRotation = previewView.display?.rotation ?: if (
+                        configurationOrientation == android.content.res.Configuration.ORIENTATION_LANDSCAPE
+                    ) {
+                        android.view.Surface.ROTATION_90
+                    } else {
+                        android.view.Surface.ROTATION_0
+                    }
                     if (!cameraStarted) {
                         cameraStarted = true
-                        cameraManager.startCamera(previewView.surfaceProvider)
+                        cameraManager.startCamera(previewView.surfaceProvider, displayRotation)
+                    } else {
+                        cameraManager.updateTargetRotation(displayRotation)
                     }
                 },
                 modifier = Modifier.fillMaxSize()
@@ -1185,12 +1293,23 @@ fun MainScreen(
                 modifier = Modifier
                     .fillMaxSize()
                     .background(
-                        Brush.verticalGradient(
-                            0f to Color.Black.copy(alpha = 0.34f),
-                            0.14f to Color.Transparent,
-                            0.88f to Color.Transparent,
-                            1f to Color.Black.copy(alpha = 0.28f),
-                        ),
+                        if (portrait) {
+                            Brush.verticalGradient(
+                                0f to Color.Black.copy(alpha = 0.34f),
+                                0.14f to Color.Transparent,
+                                0.88f to Color.Transparent,
+                                1f to Color.Black.copy(alpha = 0.28f),
+                            )
+                        } else {
+                            // Landscape: fade top/bottom edges with shorter stops,
+                            // plus subtle left/right fade for HUD contrast.
+                            Brush.verticalGradient(
+                                0f to Color.Black.copy(alpha = 0.30f),
+                                0.18f to Color.Transparent,
+                                0.82f to Color.Transparent,
+                                1f to Color.Black.copy(alpha = 0.24f),
+                            )
+                        },
                     ),
             )
 
@@ -1200,7 +1319,6 @@ fun MainScreen(
                 highlightedTrackId = ridingRisk.trackId,
                 cameraWidth = viewModel.getCameraFrameWidth(),
                 cameraHeight = viewModel.getCameraFrameHeight(),
-                sensorRotationDegrees = viewModel.getSensorRotationDegrees(),
                 modifier = Modifier.fillMaxSize()
             )
 
@@ -1272,6 +1390,12 @@ fun MainScreen(
                 onOpenSettings = {
                     showSettingsDialog = true
                 },
+                showCameraSwitch = availableLenses.size > 1,
+                cameraLensLabel = selectedLens?.label ?: "CAM",
+                onCycleCamera = {
+                    viewModel.cycleCamera()
+                    flashlightOn = false
+                },
                 modifier = Modifier
                     .align(Alignment.BottomEnd)
                     .navigationBarsPadding()
@@ -1315,7 +1439,10 @@ fun MainScreen(
                     showSettingsDialog = false
                     showModelSelector = true
                 },
-                onDismiss = { showSettingsDialog = false }
+                onDismiss = { showSettingsDialog = false },
+                supercomboEnabled = supercomboEnabled,
+                onSupercomboToggle = { viewModel.setSupercomboEnabled(it) },
+                supercomboLatencyMs = supercomboLatencyMs,
             )
         }
 

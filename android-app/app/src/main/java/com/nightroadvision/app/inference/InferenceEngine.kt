@@ -177,6 +177,9 @@ class InferenceEngine(private val context: Context) {
     // Letterbox params -- recomputed when model or camera dimensions change
     @Volatile private var cachedLetterboxParams: LetterboxParams = calculateLetterboxParams()
 
+    // Pooled output buffer — reused across frames to avoid per-frame allocation
+    private var cachedOutputBuffer: Array<Array<FloatArray>>? = null
+
     init {
         // Do not auto-load -- let the ViewModel control model selection
     }
@@ -199,6 +202,9 @@ class InferenceEngine(private val context: Context) {
 
             // Read actual model input dimensions from TFLite
             readModelInputDimensions()
+
+            // Reset pooled output buffer (output shape may have changed)
+            cachedOutputBuffer = null
 
             // Recompute letterbox params with new model dimensions
             cachedLetterboxParams = calculateLetterboxParams()
@@ -765,7 +771,7 @@ class InferenceEngine(private val context: Context) {
      * Update the actual camera frame dimensions and recompute letterbox params.
      * Called by ViewModel when first camera frame arrives or camera dimensions change.
      */
-    fun setActualCameraDimensions(width: Int, height: Int) {
+    fun setActualCameraDimensions(width: Int, height: Int) = synchronized(lock) {
         actualCameraWidth = width
         actualCameraHeight = height
         cachedLetterboxParams = calculateLetterboxParams()
@@ -775,10 +781,37 @@ class InferenceEngine(private val context: Context) {
     }
 
     /**
+     * Set the exact preprocessing transform used for this camera orientation.
+     * Offsets may be negative when portrait mode uses center-crop instead of
+     * wasting most of a landscape model tensor on padding.
+     */
+    fun setInputTransform(
+        cameraWidth: Int,
+        cameraHeight: Int,
+        scale: Float,
+        offsetX: Float,
+        offsetY: Float,
+    ) = synchronized(lock) {
+        actualCameraWidth = cameraWidth
+        actualCameraHeight = cameraHeight
+        cachedLetterboxParams = LetterboxParams(
+            scale = scale,
+            padX = offsetX,
+            padY = offsetY,
+            modelInputWidth = modelInputWidth,
+            modelInputHeight = modelInputHeight,
+            cameraWidth = cameraWidth,
+            cameraHeight = cameraHeight,
+        )
+        FileLogger.i(TAG, "Input transform updated: ${cameraWidth}x${cameraHeight}, " +
+            "scale=$scale, offset=$offsetX,$offsetY")
+    }
+
+    /**
      * Update model input dimensions (e.g., when CameraManager needs to know
      * what size to letterbox to). Also recomputes letterbox params.
      */
-    fun setModelInputDimensions(width: Int, height: Int) {
+    fun setModelInputDimensions(width: Int, height: Int) = synchronized(lock) {
         modelInputWidth = width
         modelInputHeight = height
         cachedLetterboxParams = calculateLetterboxParams()
@@ -829,6 +862,9 @@ class InferenceEngine(private val context: Context) {
         val trackId: Int? = null,
         val cameraWidth: Int = DEFAULT_CAMERA_WIDTH,
         val cameraHeight: Int = DEFAULT_CAMERA_HEIGHT,
+        val distanceMeters: Float? = null,   // real distance from supercombo (meters)
+        val velocityMps: Float? = null,      // velocity from supercombo (m/s)
+        val isLeadVehicle: Boolean = false,   // detected by supercombo as lead vehicle
     ) {
         val centerX: Float get() = (x1 + x2) / 2f
         val centerY: Float get() = (y1 + y2) / 2f
@@ -864,17 +900,21 @@ class InferenceEngine(private val context: Context) {
         inputBuffer: ByteBuffer,
         confidenceThreshold: Float = DEFAULT_CONFIDENCE_THRESHOLD,
         iouThreshold: Float = DEFAULT_NMS_IOU_THRESHOLD,
-    ): InferenceResult {
+    ): InferenceResult = synchronized(lock) {
         val letterboxParams = cachedLetterboxParams
 
-        val output = createOutputBuffer()
+        // Reuse output buffer across frames to avoid GC pressure
+        val output = cachedOutputBuffer ?: createOutputBuffer().also { cachedOutputBuffer = it }
+        // Only zero for post-processed format (small buffer, sparse writes).
+        // For raw format, TFLite overwrites the entire output tensor.
+        if (!isRawFormat) {
+            for (row in output[0]) row.fill(0f)
+        }
 
         val startTime = System.nanoTime()
-        synchronized(lock) {
-            val interp = interpreter
-                ?: throw IllegalStateException("No interpreter loaded — model may have failed to initialize")
-            interp.run(inputBuffer, output)
-        }
+        val interp = interpreter
+            ?: throw IllegalStateException("No interpreter loaded — model may have failed to initialize")
+        interp.run(inputBuffer, output)
         val inferenceTimeMs = (System.nanoTime() - startTime) / 1_000_000L
 
         // Parse detections based on output format
@@ -887,7 +927,7 @@ class InferenceEngine(private val context: Context) {
         // Apply NMS
         val nmsDetections = nms(detections, iouThreshold)
 
-        return InferenceResult(
+        InferenceResult(
             detections = nmsDetections,
             letterboxParams = letterboxParams,
             inferenceTimeMs = inferenceTimeMs,
@@ -951,20 +991,24 @@ class InferenceEngine(private val context: Context) {
 
     /**
      * Non-maximum suppression to remove overlapping boxes.
+     * Uses in-place boolean masking instead of list mutation for better performance.
      */
     private fun nms(detections: List<Detection>, iouThreshold: Float): List<Detection> {
         if (detections.isEmpty()) return emptyList()
 
-        val sorted = detections.sortedByDescending { it.confidence }.toMutableList()
+        val sorted = detections.sortedByDescending { it.confidence }
+        val active = BooleanArray(sorted.size) { true }
         val selected = mutableListOf<Detection>()
 
-        while (sorted.isNotEmpty()) {
-            val best = sorted.removeAt(0)
-            selected.add(best)
-
-            sorted.removeAll { other -> iou(best, other) > iouThreshold }
+        for (i in sorted.indices) {
+            if (!active[i]) continue
+            selected.add(sorted[i])
+            for (j in i + 1 until sorted.size) {
+                if (active[j] && iou(sorted[i], sorted[j]) > iouThreshold) {
+                    active[j] = false
+                }
+            }
         }
-
         return selected
     }
 
@@ -996,6 +1040,8 @@ class InferenceEngine(private val context: Context) {
      * Parse YOLOv8 raw output format [1, 84, 8400].
      * Each of 8400 anchors has: [cx, cy, w, h, class0_score, class1_score, ..., class79_score]
      * Returns detections in model-input pixel space (before letterbox reversal).
+     *
+     * Optimized: hoists array references and letterbox params to avoid repeated dereferencing.
      */
     private fun parseRawOutput(
         output: Array<Array<FloatArray>>,
@@ -1009,22 +1055,32 @@ class InferenceEngine(private val context: Context) {
         val xScale = if (normalized) modelInputWidth.toFloat() else 1f
         val yScale = if (normalized) modelInputHeight.toFloat() else 1f
 
-        // Transpose: output[0] is [84][8400], we need to iterate 8400 anchors
-        // output[0][row][col] where row=0..83, col=0..8399
-        // For anchor j: bbox = output[0][0..3][j], class scores = output[0][4..83][j]
+        // Hoist letterbox params to avoid field access in hot loop
+        val lScale = letterboxParams.scale
+        val lPadX = letterboxParams.padX
+        val lPadY = letterboxParams.padY
+        val camW = actualCameraWidth.toFloat()
+        val camH = actualCameraHeight.toFloat()
+
+        // Hoist row references to avoid output[0] dereference per anchor
+        val rows = output[0]
+        val row0 = rows[0]  // cx
+        val row1 = rows[1]  // cy
+        val row2 = rows[2]  // w
+        val row3 = rows[3]  // h
 
         for (j in 0 until numAnchors) {
             // Extract bbox (cx, cy, w, h) in model-input pixel space
-            val cx = output[0][0][j] * xScale
-            val cy = output[0][1][j] * yScale
-            val w  = output[0][2][j] * xScale
-            val h  = output[0][3][j] * yScale
+            val cx = row0[j] * xScale
+            val cy = row1[j] * yScale
+            val w  = row2[j] * xScale
+            val h  = row3[j] * yScale
 
             // Find best class score
             var bestScore = 0f
             var bestClass = 0
             for (c in 4 until numValues) {
-                val score = output[0][c][j]
+                val score = rows[c][j]
                 if (score > bestScore) {
                     bestScore = score
                     bestClass = c - 4
@@ -1033,23 +1089,17 @@ class InferenceEngine(private val context: Context) {
 
             if (bestScore < confidenceThreshold) continue
 
-            // Convert (cx, cy, w, h) → (x1, y1, x2, y2) in model-input space
-            val modelX1 = cx - w / 2f
-            val modelY1 = cy - h / 2f
-            val modelX2 = cx + w / 2f
-            val modelY2 = cy + h / 2f
-
-            // Reverse letterbox to camera space
-            val cameraX1 = (modelX1 - letterboxParams.padX) / letterboxParams.scale
-            val cameraY1 = (modelY1 - letterboxParams.padY) / letterboxParams.scale
-            val cameraX2 = (modelX2 - letterboxParams.padX) / letterboxParams.scale
-            val cameraY2 = (modelY2 - letterboxParams.padY) / letterboxParams.scale
+            // Convert (cx, cy, w, h) → (x1, y1, x2, y2) and reverse letterbox
+            val cameraX1 = (cx - w / 2f - lPadX) / lScale
+            val cameraY1 = (cy - h / 2f - lPadY) / lScale
+            val cameraX2 = (cx + w / 2f - lPadX) / lScale
+            val cameraY2 = (cy + h / 2f - lPadY) / lScale
 
             // Clamp to camera bounds
-            val cx1 = cameraX1.coerceIn(0f, actualCameraWidth.toFloat())
-            val cy1 = cameraY1.coerceIn(0f, actualCameraHeight.toFloat())
-            val cx2 = cameraX2.coerceIn(0f, actualCameraWidth.toFloat())
-            val cy2 = cameraY2.coerceIn(0f, actualCameraHeight.toFloat())
+            val cx1 = cameraX1.coerceIn(0f, camW)
+            val cy1 = cameraY1.coerceIn(0f, camH)
+            val cx2 = cameraX2.coerceIn(0f, camW)
+            val cy2 = cameraY2.coerceIn(0f, camH)
 
             if (cx2 > cx1 && cy2 > cy1) {
                 detections.add(

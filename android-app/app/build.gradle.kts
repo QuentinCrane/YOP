@@ -10,6 +10,7 @@ val prepareLightweightAssets by tasks.registering(org.gradle.api.tasks.Sync::cla
     exclude(
         "models/yolov8s.tflite",
         "models/yolov8m.tflite",
+        "models/driving_supercombo.onnx",
     )
     into(lightweightAssetsDir)
 }
@@ -40,6 +41,12 @@ android {
 
     buildFeatures {
         compose = true
+    }
+
+    lint {
+        // lifecycle 2.9's LiveData detector crashes with this AGP/Kotlin analysis API.
+        // The app uses StateFlow exclusively, so the detector is not applicable.
+        disable += "NullSafeMutableLiveData"
     }
 
     // Keep the riding build lightweight. Larger accuracy experiments remain in the
@@ -88,6 +95,9 @@ dependencies {
     implementation("com.google.ai.edge.litert:litert-gpu:1.0.1")
     implementation("com.google.ai.edge.litert:litert-gpu-api:1.0.1")
     implementation("com.google.ai.edge.litert:litert-support:1.0.1")
+
+    // ONNX Runtime for openpilot supercombo model
+    implementation("com.microsoft.onnxruntime:onnxruntime-android:1.20.0")
 
     testImplementation("junit:junit:4.13.2")
 

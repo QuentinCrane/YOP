@@ -5,6 +5,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
@@ -13,8 +14,8 @@ import androidx.compose.ui.graphics.drawscope.DrawScope
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.nativeCanvas
 import androidx.compose.ui.platform.LocalDensity
-import com.nightroadvision.app.FileLogger
 import com.nightroadvision.app.inference.InferenceEngine
+import java.util.Locale
 
 private enum class TargetProximity(val label: String) {
     FAR("远"),
@@ -25,27 +26,22 @@ private enum class TargetProximity(val label: String) {
 /**
  * DetectionOverlay renders detection boxes on top of the camera preview.
  *
- * Coordinate mapping strategy:
- *   - Detections from InferenceEngine are in CAMERA SENSOR coordinate space.
- *   - The camera sensor is typically landscape (e.g. 1280x720 or 2448x2448).
- *   - PreviewView rotates the preview by [sensorRotationDegrees] for portrait display.
- *   - This overlay applies the SAME rotation to detection coordinates,
- *     then uses FILL_CENTER to match the visible preview content.
+ * CameraManager rotates model input into the target display orientation. Detections
+ * therefore already use upright frame coordinates; this layer only mirrors
+ * PreviewView.ScaleType.FILL_CENTER scaling and cropping.
  *
  * @param detections List of detections in camera sensor coordinate space
- * @param cameraWidth Width of the camera sensor frame (before rotation)
- * @param cameraHeight Height of the camera sensor frame (before rotation)
- * @param sensorRotationDegrees Camera sensor rotation (0, 90, 180, or 270)
+ * @param cameraWidth Width of the upright model source frame
+ * @param cameraHeight Height of the upright model source frame
  * @param modifier Modifier for the Canvas
  */
 @Composable
 fun DetectionOverlay(
     detections: List<InferenceEngine.Detection>,
+    modifier: Modifier = Modifier,
     highlightedTrackId: Int? = null,
     cameraWidth: Int = InferenceEngine.DEFAULT_CAMERA_WIDTH,
     cameraHeight: Int = InferenceEngine.DEFAULT_CAMERA_HEIGHT,
-    sensorRotationDegrees: Int = 90,
-    modifier: Modifier = Modifier
 ) {
     val density = LocalDensity.current.density
 
@@ -55,6 +51,7 @@ fun DetectionOverlay(
             color = android.graphics.Color.argb(165, 0, 0, 0)
             isAntiAlias = true
             textSize = 10f * density
+            typeface = android.graphics.Typeface.DEFAULT_BOLD
         }
     }
     val textPaint = remember(density) {
@@ -69,21 +66,12 @@ fun DetectionOverlay(
         val overlayWidth = size.width
         val overlayHeight = size.height
 
-        // Guard: skip if canvas has zero size (first layout pass)
-        if (overlayWidth <= 0f || overlayHeight <= 0f) {
-            FileLogger.w("DetectionOverlay", "Canvas has zero size, skipping")
+        if (overlayWidth <= 0f || overlayHeight <= 0f || cameraWidth <= 0 || cameraHeight <= 0) {
             return@Canvas
         }
 
-        // After rotation, the effective camera dimensions change:
-        // 90° or 270°: width and height swap
-        // 0° or 180°: same
-        val isRotated = (sensorRotationDegrees == 90 || sensorRotationDegrees == 270)
-        val effectiveCamWidth = if (isRotated) cameraHeight else cameraWidth
-        val effectiveCamHeight = if (isRotated) cameraWidth else cameraHeight
-
         // FILL_CENTER logic: scale to fill, crop excess
-        val cameraAspect = effectiveCamWidth.toFloat() / effectiveCamHeight.toFloat()
+        val cameraAspect = cameraWidth.toFloat() / cameraHeight.toFloat()
         val overlayAspect = overlayWidth / overlayHeight
 
         val scale: Float
@@ -91,45 +79,19 @@ fun DetectionOverlay(
         val offsetY: Float
 
         if (cameraAspect > overlayAspect) {
-            scale = overlayHeight / effectiveCamHeight
-            offsetX = (overlayWidth - effectiveCamWidth * scale) / 2f
+            scale = overlayHeight / cameraHeight
+            offsetX = (overlayWidth - cameraWidth * scale) / 2f
             offsetY = 0f
         } else {
-            scale = overlayWidth / effectiveCamWidth
+            scale = overlayWidth / cameraWidth
             offsetX = 0f
-            offsetY = (overlayHeight - effectiveCamHeight * scale) / 2f
-        }
-
-        // Log pipeline state every time (throttled by frame rate anyway)
-        FileLogger.d("DetectionOverlay", "Pipeline: detections=${detections.size}, " +
-            "canvas=${overlayWidth}x${overlayHeight}, " +
-            "sensor=${cameraWidth}x${cameraHeight}@${sensorRotationDegrees}°, " +
-            "effective=${effectiveCamWidth}x${effectiveCamHeight}, " +
-            "scale=$scale, offset=($offsetX, $offsetY), " +
-            "cameraAspect=$cameraAspect, overlayAspect=$overlayAspect")
-
-        if (detections.isNotEmpty()) {
-            val d = detections[0]
-            // Apply rotation to first detection for logging
-            val (rx1, ry1, rx2, ry2) = rotateCoords(
-                d.x1, d.y1, d.x2, d.y2,
-                sensorRotationDegrees, cameraWidth, cameraHeight
-            )
-            val sx1 = rx1 * scale + offsetX
-            val sy1 = ry1 * scale + offsetY
-            val sx2 = rx2 * scale + offsetX
-            val sy2 = ry2 * scale + offsetY
-            FileLogger.d("DetectionOverlay", "First detection: " +
-                "cam=(${d.x1.toInt()},${d.y1.toInt()})-(${d.x2.toInt()},${d.y2.toInt()}) " +
-                "rotated=(${rx1.toInt()},${ry1.toInt()})-(${rx2.toInt()},${ry2.toInt()}) " +
-                "screen=(${sx1.toInt()},${sy1.toInt()})-(${sx2.toInt()},${sy2.toInt()})")
+            offsetY = (overlayHeight - cameraHeight * scale) / 2f
         }
 
         for (detection in detections) {
             drawDetectionBox(
                 detection = detection,
                 highlighted = detection.trackId != null && detection.trackId == highlightedTrackId,
-                sensorRotationDegrees = sensorRotationDegrees,
                 cameraWidth = cameraWidth,
                 cameraHeight = cameraHeight,
                 scale = scale,
@@ -146,45 +108,11 @@ fun DetectionOverlay(
 }
 
 /**
- * Rotate camera sensor coordinates to display coordinates.
- *
- * Camera sensor is typically landscape. PreviewView rotates the preview
- * by [degrees] for portrait display. We must apply the same rotation
- * to detection coordinates so boxes align with the preview.
- *
- * @return Rotated (x1, y1, x2, y2) in display coordinate space
- */
-private fun rotateCoords(
-    x1: Float, y1: Float, x2: Float, y2: Float,
-    degrees: Int, camWidth: Int, camHeight: Int
-): FloatArray {
-    return when (degrees) {
-        90 -> {
-            // 90° CW: (x,y) → (y, W-x), effective space is (H, W)
-            floatArrayOf(y1, camWidth - x2, y2, camWidth - x1)
-        }
-        180 -> {
-            // 180°: (x,y) → (W-x, H-y)
-            floatArrayOf(camWidth - x2, camHeight - y2, camWidth - x1, camHeight - y1)
-        }
-        270 -> {
-            // 270° CW = 90° CCW: (x,y) → (H-y, x), effective space is (H, W)
-            floatArrayOf(camHeight - y2, x1, camHeight - y1, x2)
-        }
-        else -> {
-            // 0°: no rotation
-            floatArrayOf(x1, y1, x2, y2)
-        }
-    }
-}
-
-/**
  * Draw a single detection box mapped from camera coordinates to screen coordinates.
  */
 private fun DrawScope.drawDetectionBox(
     detection: InferenceEngine.Detection,
     highlighted: Boolean,
-    sensorRotationDegrees: Int,
     cameraWidth: Int,
     cameraHeight: Int,
     scale: Float,
@@ -196,18 +124,12 @@ private fun DrawScope.drawDetectionBox(
     bgPaint: android.graphics.Paint,
     textPaint: android.graphics.Paint
 ) {
-    // Rotate camera coordinates to display coordinates
-    val (rx1, ry1, rx2, ry2) = rotateCoords(
-        detection.x1, detection.y1, detection.x2, detection.y2,
-        sensorRotationDegrees, cameraWidth, cameraHeight
-    )
-
-    // Map rotated coordinates to screen/overlay coordinates. FILL_CENTER crops the
+    // Map upright coordinates to screen/overlay coordinates. FILL_CENTER crops the
     // preview, so valid camera coordinates can legitimately land outside the canvas.
-    val rawLeft = minOf(rx1, rx2) * scale + offsetX
-    val rawTop = minOf(ry1, ry2) * scale + offsetY
-    val rawRight = maxOf(rx1, rx2) * scale + offsetX
-    val rawBottom = maxOf(ry1, ry2) * scale + offsetY
+    val rawLeft = minOf(detection.x1, detection.x2) * scale + offsetX
+    val rawTop = minOf(detection.y1, detection.y2) * scale + offsetY
+    val rawRight = maxOf(detection.x1, detection.x2) * scale + offsetX
+    val rawBottom = maxOf(detection.y1, detection.y2) * scale + offsetY
 
     // Do not draw targets that are completely outside the visible camera preview.
     if (rawRight <= 0f || rawBottom <= 0f ||
@@ -225,35 +147,37 @@ private fun DrawScope.drawDetectionBox(
 
     if (boxWidth < density || boxHeight < density) return
 
-    val isRotated = sensorRotationDegrees == 90 || sensorRotationDegrees == 270
-    val displayCameraWidth = if (isRotated) cameraHeight.toFloat() else cameraWidth.toFloat()
-    val displayCameraHeight = if (isRotated) cameraWidth.toFloat() else cameraHeight.toFloat()
-    val normalizedWidth = ((maxOf(rx1, rx2) - minOf(rx1, rx2)) / displayCameraWidth).coerceAtLeast(0f)
-    val normalizedHeight = ((maxOf(ry1, ry2) - minOf(ry1, ry2)) / displayCameraHeight).coerceAtLeast(0f)
+    val displayCameraWidth = cameraWidth.toFloat()
+    val displayCameraHeight = cameraHeight.toFloat()
+    val normalizedWidth = (kotlin.math.abs(detection.x2 - detection.x1) / displayCameraWidth).coerceAtLeast(0f)
+    val normalizedHeight = (kotlin.math.abs(detection.y2 - detection.y1) / displayCameraHeight).coerceAtLeast(0f)
     val proximity = estimateProximity(normalizedWidth, normalizedHeight)
-    val centerX = (rx1 + rx2) / 2f / displayCameraWidth
-    val centerY = (ry1 + ry2) / 2f / displayCameraHeight
+    val centerX = (detection.x1 + detection.x2) / 2f / displayCameraWidth
+    val centerY = (detection.y1 + detection.y2) / 2f / displayCameraHeight
     val inRidingAttentionZone = centerX in 0.22f..0.78f && centerY in 0.35f..1f
 
     val boxColor = getClassColor(
         className = detection.className,
         proximity = proximity,
         inAttentionZone = inRidingAttentionZone,
+        distanceMeters = detection.distanceMeters,
     )
 
-    // A low-opacity interior and thin outline are easier to read while driving than
-    // the previous heavy multi-colour rectangles.
-    drawRect(
-        color = boxColor.copy(alpha = if (highlighted) 0.09f else 0.025f),
-        topLeft = Offset(screenX1, screenY1),
-        size = Size(boxWidth, boxHeight),
-    )
-    drawRect(
-        color = boxColor.copy(alpha = if (highlighted) 0.96f else 0.62f),
-        topLeft = Offset(screenX1, screenY1),
-        size = Size(boxWidth, boxHeight),
-        style = Stroke(width = if (highlighted) 1.8f * density else 0.8f * density),
-    )
+    if (highlighted) {
+        drawRoundRect(
+            color = boxColor.copy(alpha = 0.08f),
+            topLeft = Offset(screenX1, screenY1),
+            size = Size(boxWidth, boxHeight),
+            cornerRadius = CornerRadius(5f * density),
+        )
+        drawRoundRect(
+            color = boxColor.copy(alpha = 0.88f),
+            topLeft = Offset(screenX1, screenY1),
+            size = Size(boxWidth, boxHeight),
+            cornerRadius = CornerRadius(5f * density),
+            style = Stroke(width = 1.4f * density),
+        )
+    }
 
     // Openpilot-inspired corner brackets keep the target clear without covering it.
     val corner = minOf(22f * density, boxWidth * 0.24f, boxHeight * 0.24f)
@@ -277,8 +201,15 @@ private fun DrawScope.drawDetectionBox(
     }
 
     // Draw label background
-    val trackLabel = detection.trackId?.let { "#$it " }.orEmpty()
-    val label = "$trackLabel${detection.className} ${(detection.confidence * 100).toInt()}% · ${proximity.label}"
+    val shouldDrawLabel = highlighted || proximity != TargetProximity.FAR ||
+        (boxWidth >= 56f * density && boxHeight >= 40f * density)
+    if (!shouldDrawLabel) return
+
+    val distanceLabel = detection.distanceMeters
+        ?.let { "  ${String.format(Locale.US, "%.0f", it)}m" }
+        .orEmpty()
+    val label = "${detection.className.uppercase(Locale.ROOT)}  " +
+        "${(detection.confidence * 100).toInt()}%$distanceLabel"
     val textWidth = bgPaint.measureText(label)
     val textHeight = bgPaint.textSize
     val labelPadding = 4f * density
@@ -295,12 +226,11 @@ private fun DrawScope.drawDetectionBox(
     val labelTop = preferredTop.coerceIn(0f, (overlayHeight - labelHeight).coerceAtLeast(0f))
     val labelBottom = labelTop + labelHeight
 
-    drawContext.canvas.nativeCanvas.drawRect(
-        labelLeft,
-        labelTop,
-        labelLeft + labelWidth,
-        labelBottom,
-        bgPaint
+    drawRoundRect(
+        color = Color.Black.copy(alpha = 0.68f),
+        topLeft = Offset(labelLeft, labelTop),
+        size = Size(labelWidth, labelHeight),
+        cornerRadius = CornerRadius(4f * density),
     )
 
     // Draw label text
@@ -365,7 +295,17 @@ private fun getClassColor(
     className: String,
     proximity: TargetProximity,
     inAttentionZone: Boolean,
+    distanceMeters: Float? = null,
 ): Color {
+    // If we have real distance from supercombo, use it for color coding
+    if (distanceMeters != null) {
+        return when {
+            distanceMeters < 10f -> Color(0xFFFF4D5E)   // red: very close
+            distanceMeters < 30f -> Color(0xFFFFC857)   // yellow: moderate
+            else -> Color(0xFF53FF8A)                     // green: far
+        }
+    }
+
     if (inAttentionZone && proximity == TargetProximity.NEAR) return Color(0xFFFF4D5E)
     if (inAttentionZone && proximity == TargetProximity.MEDIUM) return Color(0xFFFFC857)
 

@@ -66,26 +66,44 @@ class RidingRiskEvaluator {
                 geometry.centerY in 0.34f..1f
             if (!inAttentionZone) continue
 
-            val isVeryNear = geometry.maxDimension >= 0.42f || geometry.areaRatio >= 0.14f
-            val isApproachingQuickly = growthRatio >= 1.32f && geometry.areaRatio >= 0.025f
-            val isCaution = geometry.maxDimension >= 0.20f || geometry.areaRatio >= 0.035f
-
             val severity: RiskSeverity
             val reason: RiskReason
-            when {
-                isVeryNear -> {
-                    severity = RiskSeverity.CRITICAL
-                    reason = RiskReason.VERY_NEAR
+
+            // Use real distance from supercombo if available
+            val dist = detection.distanceMeters
+            if (dist != null) {
+                when {
+                    dist < 5f -> {
+                        severity = RiskSeverity.CRITICAL
+                        reason = RiskReason.VERY_NEAR
+                    }
+                    dist < 15f -> {
+                        severity = RiskSeverity.CAUTION
+                        reason = RiskReason.IN_ATTENTION_ZONE
+                    }
+                    else -> continue
                 }
-                isApproachingQuickly -> {
-                    severity = RiskSeverity.CRITICAL
-                    reason = RiskReason.APPROACHING_QUICKLY
+            } else {
+                // Fallback to bbox-based heuristics
+                val isVeryNear = geometry.maxDimension >= 0.42f || geometry.areaRatio >= 0.14f
+                val isApproachingQuickly = growthRatio >= 1.32f && geometry.areaRatio >= 0.025f
+                val isCaution = geometry.maxDimension >= 0.20f || geometry.areaRatio >= 0.035f
+
+                when {
+                    isVeryNear -> {
+                        severity = RiskSeverity.CRITICAL
+                        reason = RiskReason.VERY_NEAR
+                    }
+                    isApproachingQuickly -> {
+                        severity = RiskSeverity.CRITICAL
+                        reason = RiskReason.APPROACHING_QUICKLY
+                    }
+                    isCaution -> {
+                        severity = RiskSeverity.CAUTION
+                        reason = RiskReason.IN_ATTENTION_ZONE
+                    }
+                    else -> continue
                 }
-                isCaution -> {
-                    severity = RiskSeverity.CAUTION
-                    reason = RiskReason.IN_ATTENTION_ZONE
-                }
-                else -> continue
             }
 
             val score = severity.ordinal * 10f + geometry.maxDimension + geometry.areaRatio
