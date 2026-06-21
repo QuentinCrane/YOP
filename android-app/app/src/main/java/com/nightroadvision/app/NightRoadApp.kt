@@ -28,6 +28,9 @@ class NightRoadApp : Application() {
         // 初始化崩溃日志记录器
         CrashLogger.init(this)
 
+        // 初始化文件日志（路径: /sdcard/Android/data/com.nightroadvision.app/files/NightRoadVision/app_log.txt）
+        FileLogger.init(this)
+
         // ------------------------------------------------------------------
         // App-wide initialisation goes here. For example:
         //

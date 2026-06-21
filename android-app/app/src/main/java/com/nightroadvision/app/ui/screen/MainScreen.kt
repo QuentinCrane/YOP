@@ -10,6 +10,8 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
@@ -33,7 +35,6 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.camera.view.PreviewView
-import com.nightroadvision.app.inference.InferenceEngine
 import com.nightroadvision.app.model.ModelManager
 import com.nightroadvision.app.ui.overlay.DetectionOverlay
 
@@ -97,12 +98,26 @@ enum class DetectionMode(val label: String, val description: String) {
 // Data classes used by ViewModel (defined here for same-package access)
 // ──────────────────────────────────────────────────────────────────────────────
 
+enum class BackendPreference(val label: String) {
+    AUTO("Auto"),
+    GPU("GPU"),
+    NNAPI("NNAPI"),
+    CPU("CPU")
+}
+
+enum class GpuPrecision(val label: String) {
+    FP16("FP16 (Fast)"),
+    FP32("FP32 (Precise)")
+}
+
 data class InferenceSettings(
     val confidenceThreshold: Float = 0.25f,
     val iouThreshold: Float = 0.45f,
     val detectionMode: DetectionMode = DetectionMode.BALANCED,
     val frameSkip: Int = 1,
-    val selectedModelId: String = "yolov8n"
+    val selectedModelId: String = "yolov8n",
+    val backendPreference: BackendPreference = BackendPreference.AUTO,
+    val gpuPrecision: GpuPrecision = GpuPrecision.FP16
 )
 
 data class PerformanceMetrics(
@@ -322,6 +337,7 @@ fun SettingsDialog(
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
+                    .verticalScroll(rememberScrollState())
                     .padding(vertical = 4.dp),
                 verticalArrangement = Arrangement.spacedBy(20.dp)
             ) {
@@ -575,6 +591,114 @@ fun SettingsDialog(
                         }
                     }
                 }
+
+                // ── Backend Selection ──
+                SettingsSection(label = "BACKEND") {
+                    Column {
+                        Text(
+                            text = "Inference delegate (Auto = GPU → NNAPI → CPU fallback)",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = NightVisionColors.TextSecondary
+                        )
+                        Spacer(modifier = Modifier.height(8.dp))
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            BackendPreference.entries.forEach { backend ->
+                                val isSelected = settings.backendPreference == backend
+                                val chipColor = if (isSelected) {
+                                    NightVisionColors.Accent.copy(alpha = 0.15f)
+                                } else {
+                                    NightVisionColors.Background
+                                }
+                                val chipBorder = if (isSelected) {
+                                    NightVisionColors.Accent
+                                } else {
+                                    NightVisionColors.Border
+                                }
+
+                                Surface(
+                                    modifier = Modifier
+                                        .weight(1f)
+                                        .clickable {
+                                            onSettingsChanged(settings.copy(backendPreference = backend))
+                                        },
+                                    shape = RoundedCornerShape(8.dp),
+                                    color = chipColor,
+                                    border = BorderStroke(1.dp, chipBorder)
+                                ) {
+                                    Column(
+                                        modifier = Modifier.padding(vertical = 10.dp, horizontal = 4.dp),
+                                        horizontalAlignment = Alignment.CenterHorizontally
+                                    ) {
+                                        Text(
+                                            text = backend.label,
+                                            style = MaterialTheme.typography.labelMedium,
+                                            fontWeight = FontWeight.Bold,
+                                            color = if (isSelected) NightVisionColors.Accent
+                                                    else NightVisionColors.TextSecondary
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // ── GPU Precision ──
+                SettingsSection(label = "GPU PRECISION") {
+                    Column {
+                        Text(
+                            text = "FP16 is 2x faster on Adreno 750; FP32 is more accurate",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = NightVisionColors.TextSecondary
+                        )
+                        Spacer(modifier = Modifier.height(8.dp))
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            GpuPrecision.entries.forEach { precision ->
+                                val isSelected = settings.gpuPrecision == precision
+                                val chipColor = if (isSelected) {
+                                    NightVisionColors.Accent.copy(alpha = 0.15f)
+                                } else {
+                                    NightVisionColors.Background
+                                }
+                                val chipBorder = if (isSelected) {
+                                    NightVisionColors.Accent
+                                } else {
+                                    NightVisionColors.Border
+                                }
+
+                                Surface(
+                                    modifier = Modifier
+                                        .weight(1f)
+                                        .clickable {
+                                            onSettingsChanged(settings.copy(gpuPrecision = precision))
+                                        },
+                                    shape = RoundedCornerShape(8.dp),
+                                    color = chipColor,
+                                    border = BorderStroke(1.dp, chipBorder)
+                                ) {
+                                    Column(
+                                        modifier = Modifier.padding(vertical = 10.dp, horizontal = 4.dp),
+                                        horizontalAlignment = Alignment.CenterHorizontally
+                                    ) {
+                                        Text(
+                                            text = precision.label,
+                                            style = MaterialTheme.typography.labelMedium,
+                                            fontWeight = FontWeight.Bold,
+                                            color = if (isSelected) NightVisionColors.Accent
+                                                    else NightVisionColors.TextSecondary
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             }
         },
         confirmButton = {
@@ -782,6 +906,8 @@ fun MainScreen(
     val metrics by viewModel.performanceMetrics.collectAsState()
     val settings by viewModel.settings.collectAsState()
     val currentModelName by viewModel.currentModelName.collectAsState()
+    val errorMessage by viewModel.errorMessage.collectAsState()
+    val activeDelegate by viewModel.activeDelegate.collectAsState()
 
     // Local UI state
     var showSettingsDialog by remember { mutableStateOf(false) }
@@ -812,8 +938,11 @@ fun MainScreen(
             AndroidView(
                 factory = { ctx ->
                     PreviewView(ctx).apply {
+                        // PERFORMANCE may select SurfaceView, whose separate surface can be
+                        // composed above the Compose Canvas on some devices. Use TextureView so
+                        // the detection overlay is guaranteed to stay visible over the preview.
                         implementationMode = PreviewView.ImplementationMode.COMPATIBLE
-                        scaleType = PreviewView.ScaleType.FIT_CENTER
+                        scaleType = PreviewView.ScaleType.FILL_CENTER
                     }
                 },
                 update = { previewView ->
@@ -828,8 +957,9 @@ fun MainScreen(
             // ── Detection overlay ──
             DetectionOverlay(
                 detections = detections,
-                cameraWidth = InferenceEngine.CAMERA_WIDTH,
-                cameraHeight = InferenceEngine.CAMERA_HEIGHT,
+                cameraWidth = viewModel.getCameraFrameWidth(),
+                cameraHeight = viewModel.getCameraFrameHeight(),
+                sensorRotationDegrees = viewModel.getSensorRotationDegrees(),
                 modifier = Modifier.fillMaxSize()
             )
 
@@ -921,6 +1051,30 @@ fun MainScreen(
                         )
                     }
                 )
+            }
+
+            // ── Error Snackbar ──
+            errorMessage?.let { error ->
+                Snackbar(
+                    modifier = Modifier
+                        .align(Alignment.BottomCenter)
+                        .navigationBarsPadding()
+                        .padding(bottom = 80.dp, start = 16.dp, end = 16.dp),
+                    containerColor = NightVisionColors.Danger.copy(alpha = 0.9f),
+                    contentColor = NightVisionColors.Text,
+                    dismissAction = {
+                        TextButton(onClick = { viewModel.clearError() }) {
+                            Text("DISMISS", color = NightVisionColors.Accent, fontWeight = FontWeight.Bold)
+                        }
+                    },
+                    action = {
+                        TextButton(onClick = { viewModel.clearError() }) {
+                            Text("OK", color = NightVisionColors.Accent, fontWeight = FontWeight.Bold)
+                        }
+                    }
+                ) {
+                    Text(text = error, style = MaterialTheme.typography.bodySmall)
+                }
             }
         }
 

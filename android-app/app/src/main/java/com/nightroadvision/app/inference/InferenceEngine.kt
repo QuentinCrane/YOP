@@ -2,6 +2,7 @@ package com.nightroadvision.app.inference
 
 import android.content.Context
 import android.util.Log
+import com.nightroadvision.app.FileLogger
 import org.tensorflow.lite.Interpreter
 import org.tensorflow.lite.gpu.GpuDelegate
 import org.tensorflow.lite.nnapi.NnApiDelegate
@@ -41,13 +42,13 @@ class InferenceEngine(private val context: Context) {
     companion object {
         private const val TAG = "InferenceEngine"
 
-        // Model input dimensions (height x width)
-        const val MODEL_INPUT_HEIGHT = 320
-        const val MODEL_INPUT_WIDTH = 512
+        // Default model input dimensions (overridden after model load)
+        const val DEFAULT_MODEL_INPUT_HEIGHT = 320
+        const val DEFAULT_MODEL_INPUT_WIDTH = 512
 
-        // Camera frame dimensions (width x height)
-        const val CAMERA_WIDTH = 1280
-        const val CAMERA_HEIGHT = 720
+        // Default camera frame dimensions (overridden when first frame arrives)
+        const val DEFAULT_CAMERA_WIDTH = 1280
+        const val DEFAULT_CAMERA_HEIGHT = 720
 
         // Model output dimensions
         const val NUM_DETECTIONS = 300
@@ -56,6 +57,10 @@ class InferenceEngine(private val context: Context) {
         // Detection thresholds
         const val DEFAULT_CONFIDENCE_THRESHOLD = 0.5f
         const val DEFAULT_NMS_IOU_THRESHOLD = 0.45f
+
+        // Exported YOLO TFLite models commonly emit box coordinates normalized to [0, 1].
+        // Allow a little headroom because unconstrained predictions can extend past the image.
+        private const val NORMALIZED_COORDINATE_LIMIT = 2f
 
         // Detection presets
         val ECO_PRESET = DetectionPreset(0.6f, 0.5f, 3)
@@ -154,8 +159,23 @@ class InferenceEngine(private val context: Context) {
     private var gpuConfig: GpuConfig = GpuConfig()
     private val lock = Any()
 
-    // Cache letterbox params since camera dimensions are constants
-    private val cachedLetterboxParams: LetterboxParams = calculateLetterboxParams()
+    // Dynamic model input dimensions (read from TFLite after load)
+    @Volatile var modelInputWidth: Int = DEFAULT_MODEL_INPUT_WIDTH; private set
+    @Volatile var modelInputHeight: Int = DEFAULT_MODEL_INPUT_HEIGHT; private set
+
+    // Dynamic output tensor shape (read from TFLite after load)
+    // YOLO26n: [1, 300, 6] (post-NMS), YOLOv8: [1, 84, 8400] (raw)
+    @Volatile private var numOutputRows: Int = NUM_DETECTIONS  // 300 or 84
+    @Volatile private var outputCols: Int = DETECTION_SIZE     // 6 or 8400
+    @Volatile var isRawFormat: Boolean = false; private set
+    @Volatile private var outputCoordinatesNormalized: Boolean? = null
+
+    // Dynamic camera frame dimensions (set when first frame arrives)
+    @Volatile var actualCameraWidth: Int = DEFAULT_CAMERA_WIDTH; private set
+    @Volatile var actualCameraHeight: Int = DEFAULT_CAMERA_HEIGHT; private set
+
+    // Letterbox params -- recomputed when model or camera dimensions change
+    @Volatile private var cachedLetterboxParams: LetterboxParams = calculateLetterboxParams()
 
     init {
         // Do not auto-load -- let the ViewModel control model selection
@@ -171,10 +191,21 @@ class InferenceEngine(private val context: Context) {
      */
     fun loadModel(assetPath: String) {
         synchronized(lock) {
-            if (assetPath == currentModelPath && interpreter != null) return
+            if (assetPath == currentModelPath && interpreter != null) return@synchronized
             closeDelegates()
             currentModelPath = assetPath
+            outputCoordinatesNormalized = null
             createInterpreterWithFallback(assetPath)
+
+            // Read actual model input dimensions from TFLite
+            readModelInputDimensions()
+
+            // Recompute letterbox params with new model dimensions
+            cachedLetterboxParams = calculateLetterboxParams()
+            FileLogger.i(TAG, "Model loaded: $assetPath, input=${modelInputWidth}x${modelInputHeight}, " +
+                "camera=${actualCameraWidth}x${actualCameraHeight}, " +
+                "letterbox: scale=${cachedLetterboxParams.scale}, " +
+                "padX=${cachedLetterboxParams.padX}, padY=${cachedLetterboxParams.padY}")
         }
     }
 
@@ -189,13 +220,15 @@ class InferenceEngine(private val context: Context) {
      */
     fun selectBackend(preferred: DelegateType, fallbackIfFail: Boolean = true) {
         synchronized(lock) {
-            if (currentModelPath.isEmpty()) return
+            if (currentModelPath.isEmpty()) return@synchronized
             closeDelegates()
             if (fallbackIfFail) {
                 createInterpreterWithFallback(currentModelPath, preferred)
             } else {
                 createInterpreterForced(currentModelPath, preferred)
             }
+            readModelInputDimensions()
+            cachedLetterboxParams = calculateLetterboxParams()
         }
     }
 
@@ -261,7 +294,7 @@ class InferenceEngine(private val context: Context) {
             val interp = interpreter ?: return
             try {
                 val input = createInputBuffer()
-                val output = Array(1) { Array(NUM_DETECTIONS) { FloatArray(DETECTION_SIZE) } }
+                val output = createOutputBuffer()
                 interp.run(input, output)
                 Log.d(TAG, "Warm-up complete (delegate=$activeDelegate)")
             } catch (e: Exception) {
@@ -499,9 +532,8 @@ class InferenceEngine(private val context: Context) {
         val results = mutableListOf<BenchmarkResult>()
         val modelBuffer = loadModelFile(context, currentModelPath)
 
-        // Output buffer: (1, 300, 6)
-        fun createOutput(): Array<Array<FloatArray>> =
-            Array(1) { Array(NUM_DETECTIONS) { FloatArray(DETECTION_SIZE) } }
+        // Output buffer matching model's output tensor shape
+        fun createOutput(): Array<Array<FloatArray>> = createOutputBuffer()
 
         // -- Benchmark GPU --
         results.add(benchmarkGpu(modelBuffer, inputBuffer, { createOutput() }, warmupRuns, timedRuns))
@@ -687,33 +719,97 @@ class InferenceEngine(private val context: Context) {
         val scale: Float,
         val padX: Float, // horizontal padding (left offset in model input)
         val padY: Float, // vertical padding (top offset in model input)
-        val modelInputWidth: Int = MODEL_INPUT_WIDTH,
-        val modelInputHeight: Int = MODEL_INPUT_HEIGHT,
-        val cameraWidth: Int = CAMERA_WIDTH,
-        val cameraHeight: Int = CAMERA_HEIGHT,
+        val modelInputWidth: Int = DEFAULT_MODEL_INPUT_WIDTH,
+        val modelInputHeight: Int = DEFAULT_MODEL_INPUT_HEIGHT,
+        val cameraWidth: Int = DEFAULT_CAMERA_WIDTH,
+        val cameraHeight: Int = DEFAULT_CAMERA_HEIGHT,
     )
+
+    /**
+     * Read model input dimensions from the loaded TFLite interpreter.
+     * Updates [modelInputWidth] and [modelInputHeight].
+     */
+    private fun readModelInputDimensions() {
+        try {
+            val interp = interpreter ?: return
+            val inputTensor = interp.getInputTensor(0)
+            val shape = inputTensor.shape() // e.g. [1, 640, 640, 3] or [1, 320, 512, 3]
+            if (shape.size >= 4) {
+                // shape = [batch, height, width, channels]
+                modelInputHeight = shape[1]
+                modelInputWidth = shape[2]
+                FileLogger.i(TAG, "Model input tensor: ${shape.joinToString("x")} " +
+                    "(height=$modelInputHeight, width=$modelInputWidth)")
+            }
+
+            // Read output tensor shape to detect format
+            val outputTensor = interp.getOutputTensor(0)
+            val outShape = outputTensor.shape() // [1, 300, 6] or [1, 84, 8400]
+            FileLogger.i(TAG, "Model output tensor: ${outShape.joinToString("x")}")
+            if (outShape.size >= 3) {
+                numOutputRows = outShape[1]
+                outputCols = outShape[2]
+                // YOLO26n: [1, 300, 6] — post-processed with NMS
+                // YOLOv8:  [1, 84, 8400] — raw predictions (84 = 4 bbox + 80 classes)
+                isRawFormat = (numOutputRows < outputCols) // 84 < 8400 → raw format
+                FileLogger.i(TAG, "Output format: ${if (isRawFormat) "RAW (YOLOv8-style)" else "POST_PROCESSED (YOLO26n-style)"}, " +
+                    "rows=$numOutputRows, cols=$outputCols")
+            }
+        } catch (e: Exception) {
+            FileLogger.e(TAG, "Failed to read model dimensions: ${e.message}", e)
+            // Keep defaults
+        }
+    }
+
+    /**
+     * Update the actual camera frame dimensions and recompute letterbox params.
+     * Called by ViewModel when first camera frame arrives or camera dimensions change.
+     */
+    fun setActualCameraDimensions(width: Int, height: Int) {
+        actualCameraWidth = width
+        actualCameraHeight = height
+        cachedLetterboxParams = calculateLetterboxParams()
+        FileLogger.i(TAG, "Camera dimensions updated: ${width}x${height}, " +
+            "letterbox: scale=${cachedLetterboxParams.scale}, " +
+            "padX=${cachedLetterboxParams.padX}, padY=${cachedLetterboxParams.padY}")
+    }
+
+    /**
+     * Update model input dimensions (e.g., when CameraManager needs to know
+     * what size to letterbox to). Also recomputes letterbox params.
+     */
+    fun setModelInputDimensions(width: Int, height: Int) {
+        modelInputWidth = width
+        modelInputHeight = height
+        cachedLetterboxParams = calculateLetterboxParams()
+        FileLogger.i(TAG, "Model input dimensions set: ${width}x${height}")
+    }
 
     /**
      * Calculate letterbox parameters for mapping between camera frame and model input.
      *
-     * The camera frame (1280x720) is resized to fit into the model input (512x320)
+     * The camera frame is resized to fit into the model input
      * while preserving aspect ratio, with padding added to fill remaining space.
      */
     fun calculateLetterboxParams(): LetterboxParams {
-        val scaleX = MODEL_INPUT_WIDTH.toFloat() / CAMERA_WIDTH.toFloat()
-        val scaleY = MODEL_INPUT_HEIGHT.toFloat() / CAMERA_HEIGHT.toFloat()
+        val scaleX = modelInputWidth.toFloat() / actualCameraWidth.toFloat()
+        val scaleY = modelInputHeight.toFloat() / actualCameraHeight.toFloat()
         val scale = minOf(scaleX, scaleY)
 
-        val scaledWidth = CAMERA_WIDTH * scale
-        val scaledHeight = CAMERA_HEIGHT * scale
+        val scaledWidth = actualCameraWidth * scale
+        val scaledHeight = actualCameraHeight * scale
 
-        val padX = (MODEL_INPUT_WIDTH - scaledWidth) / 2f
-        val padY = (MODEL_INPUT_HEIGHT - scaledHeight) / 2f
+        val padX = (modelInputWidth - scaledWidth) / 2f
+        val padY = (modelInputHeight - scaledHeight) / 2f
 
         return LetterboxParams(
             scale = scale,
             padX = padX,
             padY = padY,
+            modelInputWidth = modelInputWidth,
+            modelInputHeight = modelInputHeight,
+            cameraWidth = actualCameraWidth,
+            cameraHeight = actualCameraHeight,
         )
     }
 
@@ -730,8 +826,8 @@ class InferenceEngine(private val context: Context) {
         val confidence: Float,
         val classId: Int,
         val className: String = CLASS_NAMES.getOrElse(classId) { "unknown" },
-        val cameraWidth: Int = CAMERA_WIDTH,
-        val cameraHeight: Int = CAMERA_HEIGHT,
+        val cameraWidth: Int = DEFAULT_CAMERA_WIDTH,
+        val cameraHeight: Int = DEFAULT_CAMERA_HEIGHT,
     ) {
         val centerX: Float get() = (x1 + x2) / 2f
         val centerY: Float get() = (y1 + y2) / 2f
@@ -749,8 +845,8 @@ class InferenceEngine(private val context: Context) {
         val preprocessTimeMs: Long = 0L,
         val postprocessTimeMs: Long = 0L,
         val delegateUsed: DelegateType = DelegateType.CPU,
-        val cameraWidth: Int = CAMERA_WIDTH,
-        val cameraHeight: Int = CAMERA_HEIGHT,
+        val cameraWidth: Int = DEFAULT_CAMERA_WIDTH,
+        val cameraHeight: Int = DEFAULT_CAMERA_HEIGHT,
     )
 
     // -- Inference ------------------------------------------------------------
@@ -770,8 +866,7 @@ class InferenceEngine(private val context: Context) {
     ): InferenceResult {
         val letterboxParams = cachedLetterboxParams
 
-        // Output buffer: (1, 300, 6)
-        val output = Array(1) { Array(NUM_DETECTIONS) { FloatArray(DETECTION_SIZE) } }
+        val output = createOutputBuffer()
 
         val startTime = System.nanoTime()
         synchronized(lock) {
@@ -781,46 +876,11 @@ class InferenceEngine(private val context: Context) {
         }
         val inferenceTimeMs = (System.nanoTime() - startTime) / 1_000_000L
 
-        val detections = mutableListOf<Detection>()
-        val raw = output[0]
-
-        for (i in 0 until NUM_DETECTIONS) {
-            val conf = raw[i][4]
-            if (conf < confidenceThreshold) continue
-
-            // Model output coordinates are in model-input pixel space (512x320).
-            // Map them back to camera frame coordinates by reversing the letterbox.
-            val modelX1 = raw[i][0]
-            val modelY1 = raw[i][1]
-            val modelX2 = raw[i][2]
-            val modelY2 = raw[i][3]
-
-            val cameraX1 = (modelX1 - letterboxParams.padX) / letterboxParams.scale
-            val cameraY1 = (modelY1 - letterboxParams.padY) / letterboxParams.scale
-            val cameraX2 = (modelX2 - letterboxParams.padX) / letterboxParams.scale
-            val cameraY2 = (modelY2 - letterboxParams.padY) / letterboxParams.scale
-
-            // Clamp to camera bounds
-            val clampedX1 = cameraX1.coerceIn(0f, CAMERA_WIDTH.toFloat())
-            val clampedY1 = cameraY1.coerceIn(0f, CAMERA_HEIGHT.toFloat())
-            val clampedX2 = cameraX2.coerceIn(0f, CAMERA_WIDTH.toFloat())
-            val clampedY2 = cameraY2.coerceIn(0f, CAMERA_HEIGHT.toFloat())
-
-            val classId = raw[i][5].toInt()
-
-            detections.add(
-                Detection(
-                    x1 = clampedX1,
-                    y1 = clampedY1,
-                    x2 = clampedX2,
-                    y2 = clampedY2,
-                    confidence = conf,
-                    classId = classId,
-                    className = CLASS_NAMES.getOrElse(classId) { "unknown" },
-                    cameraWidth = CAMERA_WIDTH,
-                    cameraHeight = CAMERA_HEIGHT,
-                ),
-            )
+        // Parse detections based on output format
+        val detections = if (isRawFormat) {
+            parseRawOutput(output, letterboxParams, confidenceThreshold)
+        } else {
+            parsePostProcessedOutput(output, letterboxParams, confidenceThreshold)
         }
 
         // Apply NMS
@@ -830,12 +890,62 @@ class InferenceEngine(private val context: Context) {
             detections = nmsDetections,
             letterboxParams = letterboxParams,
             inferenceTimeMs = inferenceTimeMs,
-            preprocessTimeMs = 0L, // Set by caller if needed
-            postprocessTimeMs = 0L, // Set by caller if needed
+            preprocessTimeMs = 0L,
+            postprocessTimeMs = 0L,
             delegateUsed = activeDelegate,
-            cameraWidth = CAMERA_WIDTH,
-            cameraHeight = CAMERA_HEIGHT,
+            cameraWidth = actualCameraWidth,
+            cameraHeight = actualCameraHeight,
         )
+    }
+
+    /**
+     * Parse YOLO26n post-processed output [1, 300, 6].
+     * Each row: [x1, y1, x2, y2, confidence, class_id] in model-input pixel space.
+     */
+    private fun parsePostProcessedOutput(
+        output: Array<Array<FloatArray>>,
+        letterboxParams: LetterboxParams,
+        confidenceThreshold: Float,
+    ): List<Detection> {
+        val detections = mutableListOf<Detection>()
+        val raw = output[0]
+        val normalized = detectNormalizedCoordinates(output)
+        val xScale = if (normalized) modelInputWidth.toFloat() else 1f
+        val yScale = if (normalized) modelInputHeight.toFloat() else 1f
+
+        for (i in 0 until numOutputRows) {
+            val conf = raw[i][4]
+            if (conf < confidenceThreshold) continue
+
+            val modelX1 = raw[i][0] * xScale
+            val modelY1 = raw[i][1] * yScale
+            val modelX2 = raw[i][2] * xScale
+            val modelY2 = raw[i][3] * yScale
+
+            val cameraX1 = (modelX1 - letterboxParams.padX) / letterboxParams.scale
+            val cameraY1 = (modelY1 - letterboxParams.padY) / letterboxParams.scale
+            val cameraX2 = (modelX2 - letterboxParams.padX) / letterboxParams.scale
+            val cameraY2 = (modelY2 - letterboxParams.padY) / letterboxParams.scale
+
+            val cx1 = cameraX1.coerceIn(0f, actualCameraWidth.toFloat())
+            val cy1 = cameraY1.coerceIn(0f, actualCameraHeight.toFloat())
+            val cx2 = cameraX2.coerceIn(0f, actualCameraWidth.toFloat())
+            val cy2 = cameraY2.coerceIn(0f, actualCameraHeight.toFloat())
+
+            val classId = raw[i][5].toInt()
+
+            detections.add(
+                Detection(
+                    x1 = cx1, y1 = cy1, x2 = cx2, y2 = cy2,
+                    confidence = conf,
+                    classId = classId,
+                    className = CLASS_NAMES.getOrElse(classId) { "unknown" },
+                    cameraWidth = actualCameraWidth,
+                    cameraHeight = actualCameraHeight,
+                ),
+            )
+        }
+        return detections
     }
 
     /**
@@ -875,11 +985,131 @@ class InferenceEngine(private val context: Context) {
     }
 
     /**
+     * Create output buffer matching the model's output tensor shape.
+     */
+    private fun createOutputBuffer(): Array<Array<FloatArray>> {
+        return Array(1) { Array(numOutputRows) { FloatArray(outputCols) } }
+    }
+
+    /**
+     * Parse YOLOv8 raw output format [1, 84, 8400].
+     * Each of 8400 anchors has: [cx, cy, w, h, class0_score, class1_score, ..., class79_score]
+     * Returns detections in model-input pixel space (before letterbox reversal).
+     */
+    private fun parseRawOutput(
+        output: Array<Array<FloatArray>>,
+        letterboxParams: LetterboxParams,
+        confidenceThreshold: Float,
+    ): List<Detection> {
+        val detections = mutableListOf<Detection>()
+        val numAnchors = outputCols    // 8400
+        val numValues = numOutputRows  // 84
+        val normalized = detectNormalizedCoordinates(output)
+        val xScale = if (normalized) modelInputWidth.toFloat() else 1f
+        val yScale = if (normalized) modelInputHeight.toFloat() else 1f
+
+        // Transpose: output[0] is [84][8400], we need to iterate 8400 anchors
+        // output[0][row][col] where row=0..83, col=0..8399
+        // For anchor j: bbox = output[0][0..3][j], class scores = output[0][4..83][j]
+
+        for (j in 0 until numAnchors) {
+            // Extract bbox (cx, cy, w, h) in model-input pixel space
+            val cx = output[0][0][j] * xScale
+            val cy = output[0][1][j] * yScale
+            val w  = output[0][2][j] * xScale
+            val h  = output[0][3][j] * yScale
+
+            // Find best class score
+            var bestScore = 0f
+            var bestClass = 0
+            for (c in 4 until numValues) {
+                val score = output[0][c][j]
+                if (score > bestScore) {
+                    bestScore = score
+                    bestClass = c - 4
+                }
+            }
+
+            if (bestScore < confidenceThreshold) continue
+
+            // Convert (cx, cy, w, h) → (x1, y1, x2, y2) in model-input space
+            val modelX1 = cx - w / 2f
+            val modelY1 = cy - h / 2f
+            val modelX2 = cx + w / 2f
+            val modelY2 = cy + h / 2f
+
+            // Reverse letterbox to camera space
+            val cameraX1 = (modelX1 - letterboxParams.padX) / letterboxParams.scale
+            val cameraY1 = (modelY1 - letterboxParams.padY) / letterboxParams.scale
+            val cameraX2 = (modelX2 - letterboxParams.padX) / letterboxParams.scale
+            val cameraY2 = (modelY2 - letterboxParams.padY) / letterboxParams.scale
+
+            // Clamp to camera bounds
+            val cx1 = cameraX1.coerceIn(0f, actualCameraWidth.toFloat())
+            val cy1 = cameraY1.coerceIn(0f, actualCameraHeight.toFloat())
+            val cx2 = cameraX2.coerceIn(0f, actualCameraWidth.toFloat())
+            val cy2 = cameraY2.coerceIn(0f, actualCameraHeight.toFloat())
+
+            if (cx2 > cx1 && cy2 > cy1) {
+                detections.add(
+                    Detection(
+                        x1 = cx1, y1 = cy1, x2 = cx2, y2 = cy2,
+                        confidence = bestScore,
+                        classId = bestClass,
+                        className = CLASS_NAMES.getOrElse(bestClass) { "unknown" },
+                        cameraWidth = actualCameraWidth,
+                        cameraHeight = actualCameraHeight,
+                    )
+                )
+            }
+        }
+        return detections
+    }
+
+    /**
+     * Detect whether the model emits normalized or pixel-space box coordinates.
+     *
+     * The bundled YOLOv8 and YOLO26 exports use normalized coordinates even though
+     * their output tensor shapes match the traditional pixel-space variants. Treating
+     * values such as 0.72 as pixels makes the reverse-letterbox step collapse every box.
+     */
+    private fun detectNormalizedCoordinates(output: Array<Array<FloatArray>>): Boolean {
+        outputCoordinatesNormalized?.let { return it }
+
+        val maxCoordinate = if (isRawFormat) {
+            var maxValue = 0f
+            for (coordinateIndex in 0 until minOf(4, output[0].size)) {
+                for (value in output[0][coordinateIndex]) {
+                    maxValue = maxOf(maxValue, kotlin.math.abs(value))
+                }
+            }
+            maxValue
+        } else {
+            var maxValue = 0f
+            for (row in output[0]) {
+                for (coordinateIndex in 0 until minOf(4, row.size)) {
+                    maxValue = maxOf(maxValue, kotlin.math.abs(row[coordinateIndex]))
+                }
+            }
+            maxValue
+        }
+
+        val normalized = maxCoordinate <= NORMALIZED_COORDINATE_LIMIT
+        outputCoordinatesNormalized = normalized
+        FileLogger.i(
+            TAG,
+            "Output coordinate space: ${if (normalized) "NORMALIZED" else "PIXELS"} " +
+                "(maxBoxCoordinate=$maxCoordinate)",
+        )
+        return normalized
+    }
+
+    /**
      * Create an empty input ByteBuffer for benchmarking or testing.
-     * Buffer shape: (1, 320, 512, 3) in float32 format with native byte order.
+     * Buffer shape: (1, modelInputHeight, modelInputWidth, 3) in float32 format with native byte order.
      */
     fun createInputBuffer(): ByteBuffer {
-        val buffer = ByteBuffer.allocateDirect(1 * MODEL_INPUT_HEIGHT * MODEL_INPUT_WIDTH * 3 * 4)
+        val buffer = ByteBuffer.allocateDirect(1 * modelInputHeight * modelInputWidth * 3 * 4)
         buffer.order(ByteOrder.nativeOrder())
         return buffer
     }

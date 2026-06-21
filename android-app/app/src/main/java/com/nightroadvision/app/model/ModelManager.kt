@@ -82,8 +82,8 @@ class ModelManager(private val context: Context) {
             sizeBytes = 6_476_225L,
             description = "Nano -- fastest inference, lowest accuracy. Best for real-time on low-end devices.",
             parameterCount = "3.2M",
-            inputWidth = 512,
-            inputHeight = 320,
+            inputWidth = 640,
+            inputHeight = 640,
             numClasses = 80,
         ),
         ModelInfo(
@@ -94,8 +94,8 @@ class ModelManager(private val context: Context) {
             sizeBytes = 22_485_506L,
             description = "Small -- good balance of speed and accuracy. Recommended for most devices.",
             parameterCount = "11.2M",
-            inputWidth = 512,
-            inputHeight = 320,
+            inputWidth = 640,
+            inputHeight = 640,
             numClasses = 80,
         ),
         ModelInfo(
@@ -106,8 +106,8 @@ class ModelManager(private val context: Context) {
             sizeBytes = 51_963_355L,
             description = "Medium -- higher accuracy, slower inference. Best for high-end devices.",
             parameterCount = "25.9M",
-            inputWidth = 512,
-            inputHeight = 320,
+            inputWidth = 640,
+            inputHeight = 640,
             numClasses = 80,
         ),
     )

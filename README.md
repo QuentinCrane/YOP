@@ -1,6 +1,6 @@
 # Night Road Vision
 
-Real-time night-time road object detection for Android, powered by a custom-trained YOLO26n model exported to TFLite with GPU delegate support.
+Real-time night-time road object detection for Android, powered by custom-trained YOLO models exported to TFLite with GPU delegate support.
 
 ## Project Overview
 
@@ -12,26 +12,29 @@ Night Road Vision is an Android application that provides real-time object detec
 night-road-vision/
   android-app/          # Jetpack Compose Android application
     app/src/main/java/com/nightroadvision/app/
-      MainActivity.kt           # Entry point, permission handling, immersive mode
-      MainViewModel.kt          # Pipeline orchestrator (camera -> inference -> tracking -> UI)
-      NightRoadApp.kt           # Application class
+      MainActivity.kt           # Entry point, permission handling
+      MainScreenViewModel.kt    # Pipeline orchestrator (camera -> inference -> UI)
+      NightRoadApp.kt           # Application class (FileLogger init)
+      CrashLogger.kt            # Uncaught exception logger
+      FileLogger.kt             # File-based logging for debugging
       camera/
-        CameraManager.kt        # CameraX lifecycle, preview, and frame analysis
+        CameraManager.kt        # CameraX pipeline, YUV->RGB, letterboxing, exposure control
       inference/
-        InferenceEngine.kt      # TFLite interpreter with GPU delegate, YUV preprocessing, NMS
+        InferenceEngine.kt      # TFLite with GPU/NNAPI/CPU fallback, NMS
+      model/
+        ModelManager.kt          # Model selection and hot-switching
       tracking/
-        ObjectTracker.kt        # ByteTrack-inspired multi-object tracker with EMA smoothing
+        ObjectTracker.kt         # ByteTrack-inspired tracker with EMA
       performance/
-        PerformanceMonitor.kt   # Real-time FPS, latency percentiles, thermal monitoring
+        PerformanceMonitor.kt    # FPS, latency, thermal monitoring
       ui/
         screen/
-          MainScreen.kt         # Primary detection screen with camera preview and overlays
+          MainScreen.kt         # Primary detection screen
+          MainScreenViewModel.kt # ViewModel for detection pipeline
         overlay/
-          DetectionOverlay.kt   # Bounding box canvas, performance HUD
+          DetectionOverlay.kt   # Bounding box rendering with rotation
         theme/
-          Color.kt              # Dark-first color palette for night use
-          Theme.kt              # Material 3 dark theme
-          Type.kt               # Typography with monospace telemetry readouts
+          Color.kt, Theme.kt, Type.kt
   training/
     configs/
       hyperparams_stage1.yaml       # Stage 1 hyperparameters (public data pre-adaptation)
@@ -44,8 +47,6 @@ night-road-vision/
       export_models.py              # Model export to TFLite FP16/INT8 and QNN
       evaluate.py                   # Evaluation: standard, slice-based, video, multi-format
       download_model.py             # Quick-start: download model, export TFLite, deploy
-  docs/                             # Documentation (placeholder)
-  evaluation/                       # Evaluation results (placeholder)
 ```
 
 ### Key Features
@@ -55,20 +56,26 @@ night-road-vision/
 - **Three performance modes**: ECO (every 3rd frame), BALANCED (every 2nd), FINE (every frame)
 - **Auto device calibration**: measures inference latency on first launch to select optimal mode
 - **ByteTrack-inspired tracking**: persistent object IDs with EMA-smoothed bounding boxes
-- **GPU delegate with CPU fallback**: TFLite GPU acceleration with automatic fallback to 4-thread CPU
+- **Multi-model support**: YOLO26n, YOLOv8n/s/m with runtime hot-switching
+- **GPU delegate with automatic fallback**: TFLite GPU -> NNAPI -> CPU fallback chain
+- **Snapdragon 8 Gen 3 / Adreno 750 optimized**: FP16, sustained-speed preference, GPU kernel serialization
+- **Camera exposure control**: auto/manual ISO, shutter speed, and exposure compensation via Camera2Interop
+- **Per-frame rotation-aware coordinate mapping**: sensor coordinates mapped to display with per-frame rotation
+- **File-based logging**: runtime logs written to device storage for debugging without logcat
 - **Immersive fullscreen**: landscape orientation, hidden system bars, keep-screen-on
 - **Real-time performance HUD**: detection FPS, preview FPS, inference latency, thermal status
 - **Dark-first UI**: Material 3 dark theme optimized for night-vision preservation
 
 ### Model Details
 
-| Property | Value |
-|----------|-------|
-| Architecture | YOLO26n (nano) |
-| Input resolution | 512x320 (balanced) |
-| Quantization | FP16 (GPU), INT8 (CPU/NNAPI) |
-| Output format | (1, N, 6) end-to-end or (1, C, M) traditional |
-| Delegate | TFLite GPU with CPU fallback |
+| Model | Size | Parameters | Input Resolution | Description |
+|-------|------|------------|-----------------|-------------|
+| YOLO26n | ~5 MB | 2.8M | 512x320 | Custom FP16 model, fast inference |
+| YOLOv8n | ~6 MB | 3.2M | 640x640 | Nano -- fastest, lowest accuracy |
+| YOLOv8s | ~22 MB | 11.2M | 640x640 | Small -- balanced speed/accuracy |
+| YOLOv8m | ~50 MB | 25.9M | 640x640 | Medium -- highest accuracy |
+
+YOLO26n outputs [1, 300, 6] post-NMS. YOLOv8 models output raw [1, 84, 8400] (4 bbox + 80 classes); the engine applies NMS and produces the same detection format: `[x1, y1, x2, y2, confidence, class_id]`.
 
 ## Build Instructions
 
@@ -93,7 +100,7 @@ night-road-vision/
 
 2. **Open the project** in Android Studio:
    ```
-   File > Open > E:/Github Program/YLOP/night-road-vision/android-app
+   File > Open > <repo>/night-road-vision/android-app
    ```
 
 3. **Sync Gradle** and let dependencies download.
@@ -163,6 +170,16 @@ The app auto-selects the best mode based on measured inference latency:
 ### Augmentation Settings
 
 Night-scene augmentation is configured in `training/configs/augmentation_night.yaml` and includes HSV jitter, geometric transforms, mosaic, mixup, and random erasing -- all tuned for low-light road scenes.
+
+## Debugging
+
+The app writes runtime logs to device storage via `FileLogger`. Retrieve logs with:
+
+```bash
+adb pull /sdcard/Android/data/com.nightroadvision.app/files/NightRoadVision/app_log.txt
+```
+
+Crash logs are saved to the same directory as `crash_log.txt`. The app log rotates automatically at 5 MB.
 
 ## License
 

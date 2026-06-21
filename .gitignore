@@ -1,8 +1,11 @@
 # Android build artifacts
 android-app/.gradle/
+android-app/.kotlin/
 android-app/app/build/
 android-app/build/
 android-app/local.properties
+android-app/app/src/test/
+*.apk
 
 # IDE
 .idea/
@@ -17,10 +20,12 @@ Thumbs.db
 # Python / training artifacts
 *.pyc
 __pycache__/
+training/scripts/__pycache__/
 *.egg-info/
 training/runs/
 training/raw_datasets/
 *.npy
+calibration_*.npy
 *.pt
 *.onnx
 *_saved_model/
