@@ -15,9 +15,9 @@ import com.nightroadvision.app.camera.CameraManager
 import com.nightroadvision.app.camera.FrameGeometry
 import com.nightroadvision.app.inference.InferenceEngine
 import com.nightroadvision.app.inference.LeadVehicleMerger
-import com.nightroadvision.app.inference.SupercomboConstants
 import com.nightroadvision.app.inference.SupercomboEngine
 import com.nightroadvision.app.inference.SupercomboPreprocessor
+import com.nightroadvision.app.ui.overlay.RoutePoint
 import com.nightroadvision.app.model.ModelManager
 import com.nightroadvision.app.model.ModelQuantization
 import com.nightroadvision.app.performance.PerformanceMonitor
@@ -29,6 +29,8 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import java.nio.ByteBuffer
 
 /**
@@ -70,6 +72,9 @@ class MainScreenViewModel(application: Application) : AndroidViewModel(applicati
     private val _supercomboLatencyMs = MutableStateFlow(0L)
     val supercomboLatencyMs: StateFlow<Long> = _supercomboLatencyMs.asStateFlow()
 
+    private val _supercomboAvailable = MutableStateFlow(false)
+    val supercomboAvailable: StateFlow<Boolean> = _supercomboAvailable.asStateFlow()
+
     @Volatile
     private var supercomboReady = false
 
@@ -90,6 +95,9 @@ class MainScreenViewModel(application: Application) : AndroidViewModel(applicati
 
     private val _ridingRisk = MutableStateFlow(RidingRisk())
     val ridingRisk: StateFlow<RidingRisk> = _ridingRisk.asStateFlow()
+
+    private val _routePoints = MutableStateFlow<List<RoutePoint>>(emptyList())
+    val routePoints: StateFlow<List<RoutePoint>> = _routePoints.asStateFlow()
 
     // -- Settings (driven by UI's InferenceSettings data class) ----------------
 
@@ -130,6 +138,8 @@ class MainScreenViewModel(application: Application) : AndroidViewModel(applicati
 
     private var frameSkipCounter = 0
     private var errorCount = 0
+    private val engineUpdateMutex = Mutex()
+    @Volatile private var pipelineUpdating = false
 
     // -- Initialization -------------------------------------------------------
 
@@ -148,13 +158,19 @@ class MainScreenViewModel(application: Application) : AndroidViewModel(applicati
             initialSettings.urgentDistanceM,
             initialSettings.cautionDistanceM,
         )
+        alertSoundPlayer.setEnabled(initialSettings.soundAlertsEnabled)
+        alertSoundPlayer.setStyle(initialSettings.alertSoundStyle)
+        alertSoundPlayer.prewarm()
+        pipelineUpdating = true
         viewModelScope.launch(Dispatchers.Default) {
-            try {
+            engineUpdateMutex.withLock {
+                pipelineUpdating = true
+                try {
                 val savedModel = modelManager.getCurrentModel()
                 FileLogger.i(TAG, "Loading model: ${savedModel.name} (${savedModel.path})")
                 inferenceEngine.loadModel(savedModel.path)
 
-                when (initialSettings.backendPreference) {
+                when (_settings.value.backendPreference) {
                     BackendPreference.AUTO -> Unit
                     BackendPreference.GPU -> inferenceEngine.selectBackend(InferenceEngine.DelegateType.GPU)
                     BackendPreference.NNAPI -> inferenceEngine.selectBackend(InferenceEngine.DelegateType.NNAPI)
@@ -171,8 +187,10 @@ class MainScreenViewModel(application: Application) : AndroidViewModel(applicati
 
                     // Update CameraManager with actual model dimensions
                     cameraManager?.let { cm ->
-                        cm.targetModelWidth = inferenceEngine.modelInputWidth
-                        cm.targetModelHeight = inferenceEngine.modelInputHeight
+                        cm.updateTargetModelDimensions(
+                            inferenceEngine.modelInputWidth,
+                            inferenceEngine.modelInputHeight,
+                        )
                         FileLogger.i(TAG, "CameraManager updated: target=${inferenceEngine.modelInputWidth}x${inferenceEngine.modelInputHeight}")
                     }
 
@@ -185,12 +203,15 @@ class MainScreenViewModel(application: Application) : AndroidViewModel(applicati
                     try {
                         val scPath = "models/driving_supercombo.onnx"
                         supercomboReady = supercomboEngine.loadModel(scPath)
+                        _supercomboAvailable.value = supercomboReady
                         if (supercomboReady) {
                             FileLogger.i(TAG, "Supercombo model loaded OK")
                         } else {
                             FileLogger.w(TAG, "Supercombo model not found (optional)")
                         }
                     } catch (e: Exception) {
+                        supercomboReady = false
+                        _supercomboAvailable.value = false
                         FileLogger.w(TAG, "Supercombo load skipped: ${e.message}")
                     }
                 } else {
@@ -198,11 +219,14 @@ class MainScreenViewModel(application: Application) : AndroidViewModel(applicati
                     _errorMessage.value = "模型加载失败: ${savedModel.name}"
                     _performanceMetrics.update { it.copy(backend = "ERROR") }
                 }
-            } catch (e: Exception) {
+                } catch (e: Exception) {
                 Log.e(TAG, "Init failed", e)
                 FileLogger.e(TAG, "Init failed: ${e.message}", e)
                 _errorMessage.value = "初始化失败: ${e.message}"
                 _performanceMetrics.update { it.copy(backend = "ERROR") }
+                } finally {
+                    pipelineUpdating = false
+                }
             }
         }
     }
@@ -249,7 +273,7 @@ class MainScreenViewModel(application: Application) : AndroidViewModel(applicati
      */
     private fun shouldAnalyzeCameraFrame(): Boolean {
         totalFrameCount++
-        if (!inferenceEngine.isReady) return false
+        if (pipelineUpdating || !inferenceEngine.isReady) return false
         frameSkipCounter++
         val interval = _settings.value.frameSkip.coerceAtLeast(1)
         if (frameSkipCounter < interval) return false
@@ -295,8 +319,10 @@ class MainScreenViewModel(application: Application) : AndroidViewModel(applicati
             val cm = cameraManager
             if (cm != null && (cm.targetModelWidth != inferenceEngine.modelInputWidth ||
                                 cm.targetModelHeight != inferenceEngine.modelInputHeight)) {
-                cm.targetModelWidth = inferenceEngine.modelInputWidth
-                cm.targetModelHeight = inferenceEngine.modelInputHeight
+                cm.updateTargetModelDimensions(
+                    inferenceEngine.modelInputWidth,
+                    inferenceEngine.modelInputHeight,
+                )
                 FileLogger.w(TAG, "Force-synced CameraManager dimensions: " +
                     "${inferenceEngine.modelInputWidth}x${inferenceEngine.modelInputHeight}")
             }
@@ -322,17 +348,30 @@ class MainScreenViewModel(application: Application) : AndroidViewModel(applicati
             // Run supercombo if enabled and ready
             if (_supercomboEnabled.value && supercomboReady) {
                 val scInputs = supercomboPreprocessor.prepareInputs()
-                if (scInputs != null) {
-                    val scOutput = supercomboEngine.runInference(scInputs)
-                    if (scOutput != null) {
-                        _supercomboLatencyMs.value = scOutput.inferenceTimeMs
-                        // Merge YOLO detections with supercombo lead vehicles
-                        roadDetections = leadVehicleMerger.merge(
-                            roadDetections, scOutput,
-                            cameraFrameWidth, cameraFrameHeight
-                        )
+                val scOutput = scInputs?.let(supercomboEngine::runInference)
+                if (scOutput != null) {
+                    _supercomboLatencyMs.value = scOutput.inferenceTimeMs
+                    val vehicleClassIds = if (useNightRoad) setOf(4, 5, 6) else setOf(2, 5, 7)
+                    // Merge YOLO detections with supercombo lead vehicles.
+                    roadDetections = leadVehicleMerger.merge(
+                        yoloDetections = roadDetections,
+                        supercomboOutput = scOutput,
+                        cameraWidth = cameraFrameWidth,
+                        cameraHeight = cameraFrameHeight,
+                        vehicleClassIds = vehicleClassIds,
+                        syntheticVehicleClassId = if (useNightRoad) 4 else 2,
+                    )
+                    // Convert predicted path to overlay coordinates.
+                    _routePoints.value = scOutput.pathPoints.map { pt ->
+                        RoutePoint(vehicleX = pt.x, vehicleY = pt.y)
                     }
+                } else {
+                    _supercomboLatencyMs.value = 0L
+                    _routePoints.value = emptyList()
                 }
+            } else {
+                _supercomboLatencyMs.value = 0L
+                _routePoints.value = emptyList()
             }
 
             val stabilizedDetections = if (currentSettings.trackingEnabled) {
@@ -352,7 +391,6 @@ class MainScreenViewModel(application: Application) : AndroidViewModel(applicati
                 risk = ridingRisk,
                 enabled = currentSettings.vibrationAlertsEnabled,
             )
-            alertSoundPlayer.setEnabled(currentSettings.soundAlertsEnabled)
             alertSoundPlayer.onRiskChanged(ridingRisk)
             _activeDelegate.value = result.delegateUsed
             errorCount = 0 // reset on success
@@ -392,6 +430,18 @@ class MainScreenViewModel(application: Application) : AndroidViewModel(applicati
             sanitized.urgentDistanceM,
             sanitized.cautionDistanceM,
         )
+        if (oldSettings.soundAlertsEnabled != sanitized.soundAlertsEnabled) {
+            alertSoundPlayer.setEnabled(sanitized.soundAlertsEnabled)
+        }
+        if (oldSettings.alertSoundStyle != sanitized.alertSoundStyle) {
+            alertSoundPlayer.setStyle(sanitized.alertSoundStyle)
+            FileLogger.d(TAG, "Alert sound style changed: ${sanitized.alertSoundStyle.label}")
+        }
+        if (oldSettings.trackingEnabled != sanitized.trackingEnabled) {
+            synchronized(objectTracker) { objectTracker.reset() }
+            ridingRiskEvaluator.reset()
+            _ridingRisk.value = RidingRisk()
+        }
         FileLogger.d(TAG, "Settings updated: conf=${newSettings.confidenceThreshold}, " +
             "iou=${newSettings.iouThreshold}, mode=${newSettings.detectionMode}, " +
             "skip=${newSettings.frameSkip}, backend=${newSettings.backendPreference}, " +
@@ -403,30 +453,36 @@ class MainScreenViewModel(application: Application) : AndroidViewModel(applicati
                 oldSettings.cpuThreads != sanitized.cpuThreads
         if (engineConfigurationChanged) {
             viewModelScope.launch(Dispatchers.Default) {
-                try {
-                    if (oldSettings.cpuThreads != sanitized.cpuThreads) {
-                        inferenceEngine.updateCpuThreadCount(sanitized.cpuThreads)
-                    }
-                    if (oldSettings.gpuPrecision != sanitized.gpuPrecision) {
-                        inferenceEngine.updateGpuConfig(
-                            InferenceEngine.GpuConfig(
-                                precisionLossAllowed = sanitized.gpuPrecision == GpuPrecision.FP16,
+                engineUpdateMutex.withLock {
+                    val latest = _settings.value
+                    val requestIsCurrent = latest.backendPreference == sanitized.backendPreference &&
+                        latest.gpuPrecision == sanitized.gpuPrecision &&
+                        latest.cpuThreads == sanitized.cpuThreads
+                    if (!requestIsCurrent) return@withLock
+
+                    pipelineUpdating = true
+                    try {
+                        if (oldSettings.cpuThreads != sanitized.cpuThreads) {
+                            inferenceEngine.updateCpuThreadCount(sanitized.cpuThreads)
+                        }
+                        if (oldSettings.gpuPrecision != sanitized.gpuPrecision) {
+                            inferenceEngine.updateGpuConfig(
+                                InferenceEngine.GpuConfig(
+                                    precisionLossAllowed = sanitized.gpuPrecision == GpuPrecision.FP16,
+                                )
                             )
-                        )
+                        }
+                        applyBackendPreference(sanitized.backendPreference)
+                        _activeDelegate.value = inferenceEngine.getActiveDelegate()
+                        _performanceMetrics.update { it.copy(backend = delegateLabel()) }
+                        FileLogger.i(TAG, "Engine settings applied: backend=${inferenceEngine.getActiveDelegate()}, " +
+                            "precision=${sanitized.gpuPrecision}, threads=${sanitized.cpuThreads}")
+                    } catch (e: Exception) {
+                        FileLogger.e(TAG, "Engine settings failed: ${e.message}", e)
+                        _errorMessage.value = "推理设置应用失败: ${e.message}"
+                    } finally {
+                        pipelineUpdating = false
                     }
-                    when (sanitized.backendPreference) {
-                        BackendPreference.AUTO -> inferenceEngine.selectAutomaticBackend()
-                        BackendPreference.GPU -> inferenceEngine.selectBackend(InferenceEngine.DelegateType.GPU)
-                        BackendPreference.NNAPI -> inferenceEngine.selectBackend(InferenceEngine.DelegateType.NNAPI)
-                        BackendPreference.CPU -> inferenceEngine.selectBackend(InferenceEngine.DelegateType.CPU)
-                    }
-                    _activeDelegate.value = inferenceEngine.getActiveDelegate()
-                    _performanceMetrics.update { it.copy(backend = delegateLabel()) }
-                    FileLogger.i(TAG, "Engine settings applied: backend=${inferenceEngine.getActiveDelegate()}, " +
-                        "precision=${sanitized.gpuPrecision}, threads=${sanitized.cpuThreads}")
-                } catch (e: Exception) {
-                    FileLogger.e(TAG, "Engine settings failed: ${e.message}", e)
-                    _errorMessage.value = "推理设置应用失败: ${e.message}"
                 }
             }
         }
@@ -461,13 +517,27 @@ class MainScreenViewModel(application: Application) : AndroidViewModel(applicati
         _errorMessage.value = null
     }
 
+    // -- Public API: alert preview --------------------------------------------
+
+    fun previewAlertSound(severity: com.nightroadvision.app.alert.RiskSeverity) {
+        alertSoundPlayer.previewPlay(severity)
+    }
+
     // -- Public API: supercombo toggle -----------------------------------------
 
     fun setSupercomboEnabled(enabled: Boolean) {
+        if (enabled && !supercomboReady) {
+            _supercomboEnabled.value = false
+            _routePoints.value = emptyList()
+            _supercomboLatencyMs.value = 0L
+            _errorMessage.value = "Supercombo 模型未包含在当前应用中"
+            return
+        }
         _supercomboEnabled.value = enabled
         if (!enabled) {
             supercomboPreprocessor.reset()
             _supercomboLatencyMs.value = 0L
+            _routePoints.value = emptyList()
         }
         FileLogger.i(TAG, "Supercombo ${if (enabled) "enabled" else "disabled"}")
     }
@@ -475,11 +545,15 @@ class MainScreenViewModel(application: Application) : AndroidViewModel(applicati
     // -- Public API: camera switching ------------------------------------------
 
     fun cycleCamera(): CameraManager.LensOption? {
-        val selected = cameraManager?.cycleCamera() ?: return null
+        val manager = cameraManager ?: return null
+        if (manager.isTorchEnabled()) manager.setTorchEnabled(false)
+        val selected = manager.cycleCamera() ?: return null
         synchronized(objectTracker) { objectTracker.reset() }
         ridingRiskEvaluator.reset()
+        supercomboPreprocessor.reset()
         _ridingRisk.value = RidingRisk()
         _detections.value = emptyList()
+        _routePoints.value = emptyList()
         return selected
     }
 
@@ -512,28 +586,33 @@ class MainScreenViewModel(application: Application) : AndroidViewModel(applicati
 
     fun switchModel(model: ModelManager.ModelInfo) {
         viewModelScope.launch(Dispatchers.Default) {
-            try {
-                FileLogger.i(TAG, "Switching model: ${model.name} (${model.path})")
-                _performanceMetrics.update { it.copy(backend = "Loading...") }
+            engineUpdateMutex.withLock {
+                val previousModel = modelManager.getCurrentModel()
+                var selectionCommitted = false
+                pipelineUpdating = true
+                try {
+                    FileLogger.i(TAG, "Switching model: ${model.name} (${model.path})")
+                    _performanceMetrics.update { it.copy(backend = "Loading...") }
 
-                modelManager.switchModel(model)
-                inferenceEngine.loadModel(model.path)
-                when (_settings.value.backendPreference) {
-                    BackendPreference.AUTO -> Unit
-                    BackendPreference.GPU -> inferenceEngine.selectBackend(InferenceEngine.DelegateType.GPU)
-                    BackendPreference.NNAPI -> inferenceEngine.selectBackend(InferenceEngine.DelegateType.NNAPI)
-                    BackendPreference.CPU -> inferenceEngine.selectBackend(InferenceEngine.DelegateType.CPU)
-                }
-                synchronized(objectTracker) {
-                    objectTracker.reset()
-                }
-                ridingRiskEvaluator.reset()
-                ridingVibrationController.reset()
-                _ridingRisk.value = RidingRisk()
-                _detections.value = emptyList()
-
-                if (inferenceEngine.isReady) {
+                    inferenceEngine.loadModel(model.path)
+                    check(inferenceEngine.isReady) { "模型解释器初始化失败" }
+                    if (_settings.value.backendPreference != BackendPreference.AUTO) {
+                        applyBackendPreference(_settings.value.backendPreference)
+                    }
+                    check(inferenceEngine.isReady) { "推理后端初始化失败" }
                     inferenceEngine.warmUp()
+
+                    // Persist only after the new interpreter is usable. Persisting first
+                    // made one bad asset selection break every subsequent app launch.
+                    modelManager.switchModel(model)
+                    selectionCommitted = true
+                    synchronized(objectTracker) { objectTracker.reset() }
+                    ridingRiskEvaluator.reset()
+                    ridingVibrationController.reset()
+                    supercomboPreprocessor.reset()
+                    _ridingRisk.value = RidingRisk()
+                    _detections.value = emptyList()
+                    _routePoints.value = emptyList()
                     _currentModelName.value = model.name
                     _activeDelegate.value = inferenceEngine.getActiveDelegate()
                     _settings.update { current ->
@@ -552,24 +631,41 @@ class MainScreenViewModel(application: Application) : AndroidViewModel(applicati
 
                     // Update CameraManager letterboxing to match new model dimensions
                     cameraManager?.let { cm ->
-                        cm.targetModelWidth = inferenceEngine.modelInputWidth
-                        cm.targetModelHeight = inferenceEngine.modelInputHeight
+                        cm.updateTargetModelDimensions(
+                            inferenceEngine.modelInputWidth,
+                            inferenceEngine.modelInputHeight,
+                        )
                         FileLogger.i(TAG, "CameraManager updated: target=${inferenceEngine.modelInputWidth}x${inferenceEngine.modelInputHeight}")
                     }
 
                     FileLogger.i(TAG, "Model switched OK: ${model.name}, " +
                         "input=${inferenceEngine.modelInputWidth}x${inferenceEngine.modelInputHeight}, " +
                         "delegate: ${inferenceEngine.getActiveDelegate()}")
-                } else {
-                    FileLogger.e(TAG, "Model switch failed: ${model.name} — interpreter is null after loadModel")
-                    _errorMessage.value = "模型加载失败: ${model.name}"
-                    _performanceMetrics.update { it.copy(backend = "ERROR") }
+                } catch (e: Exception) {
+                    Log.e(TAG, "Failed to switch model: ${model.name}", e)
+                    FileLogger.e(TAG, "Failed to switch model: ${model.name}: ${e.message}", e)
+                    if (selectionCommitted) {
+                        runCatching { modelManager.switchModel(previousModel) }
+                    }
+                    val restored = restoreModel(previousModel)
+                    _currentModelName.value = previousModel.name
+                    _settings.update { current ->
+                        current.copy(
+                            selectedModelId = previousModel.id,
+                            quantizationPreference = if (current.quantizationPreference == ModelQuantization.AUTO) {
+                                ModelQuantization.AUTO
+                            } else {
+                                previousModel.quantization
+                            },
+                        ).also(settingsStore::save)
+                    }
+                    _errorMessage.value = "模型切换失败: ${e.message}"
+                    _performanceMetrics.update {
+                        it.copy(backend = if (restored) delegateLabel() else "ERROR")
+                    }
+                } finally {
+                    pipelineUpdating = false
                 }
-            } catch (e: Exception) {
-                Log.e(TAG, "Failed to switch model: ${model.name}", e)
-                FileLogger.e(TAG, "Failed to switch model: ${model.name}: ${e.message}", e)
-                _errorMessage.value = "模型切换失败: ${e.message}"
-                _performanceMetrics.update { it.copy(backend = "ERROR") }
             }
         }
     }
@@ -578,15 +674,20 @@ class MainScreenViewModel(application: Application) : AndroidViewModel(applicati
 
     fun selectBackend(delegate: InferenceEngine.DelegateType) {
         viewModelScope.launch(Dispatchers.Default) {
-            try {
-                FileLogger.i(TAG, "Selecting backend: $delegate")
-                inferenceEngine.selectBackend(delegate)
-                _activeDelegate.value = inferenceEngine.getActiveDelegate()
-                _performanceMetrics.update { it.copy(backend = delegateLabel()) }
-                FileLogger.i(TAG, "Backend selected: ${inferenceEngine.getActiveDelegate()}")
-            } catch (e: Exception) {
-                FileLogger.e(TAG, "Backend selection failed: ${e.message}", e)
-                _errorMessage.value = "后端切换失败: ${e.message}"
+            engineUpdateMutex.withLock {
+                pipelineUpdating = true
+                try {
+                    FileLogger.i(TAG, "Selecting backend: $delegate")
+                    inferenceEngine.selectBackend(delegate)
+                    _activeDelegate.value = inferenceEngine.getActiveDelegate()
+                    _performanceMetrics.update { it.copy(backend = delegateLabel()) }
+                    FileLogger.i(TAG, "Backend selected: ${inferenceEngine.getActiveDelegate()}")
+                } catch (e: Exception) {
+                    FileLogger.e(TAG, "Backend selection failed: ${e.message}", e)
+                    _errorMessage.value = "后端切换失败: ${e.message}"
+                } finally {
+                    pipelineUpdating = false
+                }
             }
         }
     }
@@ -597,11 +698,13 @@ class MainScreenViewModel(application: Application) : AndroidViewModel(applicati
      * Toggle flashlight on/off. Returns the new torch state (true=on, false=off).
      */
     fun toggleFlashlight(): Boolean {
-        val currentlyOn = cameraManager?.isTorchEnabled() == true
+        val manager = cameraManager ?: return false
+        val currentlyOn = manager.isTorchEnabled()
         val newState = !currentlyOn
-        cameraManager?.setTorchEnabled(newState)
-        FileLogger.d(TAG, "Flashlight toggled: $newState")
-        return newState
+        val accepted = manager.setTorchEnabled(newState)
+        val reportedState = if (accepted) newState else currentlyOn
+        FileLogger.d(TAG, "Flashlight toggled: requested=$newState accepted=$accepted")
+        return reportedState
     }
 
     // -- Public API: camera dimensions ----------------------------------------
@@ -626,6 +729,34 @@ class MainScreenViewModel(application: Application) : AndroidViewModel(applicati
     }
 
     // -- Internals ------------------------------------------------------------
+
+    private fun applyBackendPreference(preference: BackendPreference) {
+        when (preference) {
+            BackendPreference.AUTO -> inferenceEngine.selectAutomaticBackend()
+            BackendPreference.GPU -> inferenceEngine.selectBackend(InferenceEngine.DelegateType.GPU)
+            BackendPreference.NNAPI -> inferenceEngine.selectBackend(InferenceEngine.DelegateType.NNAPI)
+            BackendPreference.CPU -> inferenceEngine.selectBackend(InferenceEngine.DelegateType.CPU)
+        }
+    }
+
+    private fun restoreModel(model: ModelManager.ModelInfo): Boolean = runCatching {
+        inferenceEngine.loadModel(model.path)
+        check(inferenceEngine.isReady) { "旧模型恢复失败" }
+        if (_settings.value.backendPreference != BackendPreference.AUTO) {
+            applyBackendPreference(_settings.value.backendPreference)
+        }
+        check(inferenceEngine.isReady) { "旧模型后端恢复失败" }
+        inferenceEngine.warmUp()
+        cameraManager?.updateTargetModelDimensions(
+            inferenceEngine.modelInputWidth,
+            inferenceEngine.modelInputHeight,
+        )
+        _activeDelegate.value = inferenceEngine.getActiveDelegate()
+        true
+    }.getOrElse { error ->
+        FileLogger.e(TAG, "Failed to restore ${model.name}: ${error.message}", error)
+        false
+    }
 
     private fun applyTrackerConfig(settings: InferenceSettings) {
         synchronized(objectTracker) {

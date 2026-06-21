@@ -24,7 +24,9 @@ class LeadVehicleMerger {
         yoloDetections: List<InferenceEngine.Detection>,
         supercomboOutput: SupercomboEngine.SupercomboOutput?,
         cameraWidth: Int,
-        cameraHeight: Int
+        cameraHeight: Int,
+        vehicleClassIds: Set<Int> = setOf(2, 5, 7),
+        syntheticVehicleClassId: Int = 2,
     ): List<InferenceEngine.Detection> {
         if (supercomboOutput == null || supercomboOutput.leads.isEmpty()) {
             return yoloDetections
@@ -36,6 +38,7 @@ class LeadVehicleMerger {
         // For each YOLO detection, try to match with a supercombo lead
         for (i in merged.indices) {
             val det = merged[i]
+            if (det.classId !in vehicleClassIds) continue
             val detCenterNorm = Pair(
                 det.centerX / cameraWidth,
                 det.centerY / cameraHeight
@@ -92,7 +95,7 @@ class LeadVehicleMerger {
                     x2 = (cx + bw / 2).coerceIn(0f, cameraWidth.toFloat()),
                     y2 = (cy + bh / 2).coerceIn(0f, cameraHeight.toFloat()),
                     confidence = lead.probability,
-                    classId = 2,  // "car" class ID in COCO
+                    classId = syntheticVehicleClassId,
                     className = "car",
                     cameraWidth = cameraWidth,
                     cameraHeight = cameraHeight,

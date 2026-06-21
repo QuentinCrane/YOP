@@ -2,7 +2,6 @@ package com.nightroadvision.app.inference
 
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
-import java.nio.FloatBuffer
 
 /**
  * Converts camera YUV frames into the openpilot supercombo model input format.
@@ -36,6 +35,7 @@ class SupercomboPreprocessor {
      * Feed a raw NV21 frame from the camera.
      * Call this for every camera frame before [prepareInputs].
      */
+    @Synchronized
     fun feedFrame(nv21Data: ByteArray, width: Int, height: Int) {
         if (frameWidth != width || frameHeight != height) {
             frameWidth = width
@@ -61,6 +61,7 @@ class SupercomboPreprocessor {
      * Prepare all model inputs from the buffered frames.
      * Returns null if not enough frames have been buffered yet.
      */
+    @Synchronized
     fun prepareInputs(): ModelInputs? {
         val f0 = frame0 ?: return null
         // If only one frame available, use it for both
@@ -79,6 +80,7 @@ class SupercomboPreprocessor {
     /**
      * Update the hidden state from model output after inference.
      */
+    @Synchronized
     fun updateHiddenState(newState: FloatArray) {
         if (newState.size == SupercomboConstants.FEATURE_LEN) {
             System.arraycopy(newState, 0, hiddenState, 0, SupercomboConstants.FEATURE_LEN)
@@ -88,6 +90,7 @@ class SupercomboPreprocessor {
     /**
      * Reset all internal state (e.g., when camera restarts).
      */
+    @Synchronized
     fun reset() {
         frame0 = null
         frame1 = null

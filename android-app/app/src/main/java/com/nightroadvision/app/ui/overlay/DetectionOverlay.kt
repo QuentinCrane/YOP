@@ -11,11 +11,22 @@ import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.drawscope.DrawScope
+import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.StrokeJoin
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.nativeCanvas
 import androidx.compose.ui.platform.LocalDensity
 import com.nightroadvision.app.inference.InferenceEngine
 import java.util.Locale
+
+/**
+ * A point on the predicted driving path in vehicle frame.
+ * vehicleX = forward distance (m), vehicleY = lateral offset (m).
+ */
+data class RoutePoint(
+    val vehicleX: Float,
+    val vehicleY: Float,
+)
 
 private enum class TargetProximity(val label: String) {
     FAR("远"),
@@ -45,6 +56,7 @@ fun DetectionOverlay(
     showLabels: Boolean = true,
     showConfidence: Boolean = true,
     showTrackIds: Boolean = false,
+    routePoints: List<RoutePoint> = emptyList(),
 ) {
     val density = LocalDensity.current.density
 
@@ -89,6 +101,16 @@ fun DetectionOverlay(
             scale = overlayWidth / cameraWidth
             offsetX = 0f
             offsetY = (overlayHeight - cameraHeight * scale) / 2f
+        }
+
+        // ── Draw predicted driving route ──
+        if (routePoints.size >= 2) {
+            drawRoutePath(
+                routePoints = routePoints,
+                overlayWidth = overlayWidth,
+                overlayHeight = overlayHeight,
+                density = density,
+            )
         }
 
         for (detection in detections) {
@@ -293,6 +315,67 @@ private fun DrawScope.drawLeadChevron(
         Color(0xFFDA6F25)
     }
     drawPath(chevron, fillColor.copy(alpha = if (proximity == TargetProximity.FAR) 0.48f else 0.92f))
+}
+
+/**
+ * Draw the predicted driving path as a glowing curve.
+ *
+ * Vehicle frame → screen mapping:
+ *   vehicleX (forward, m) → moves up on screen (toward horizon)
+ *   vehicleY (lateral, m) → moves left/right on screen
+ *
+ * The path starts at the bottom-center of the screen and curves upward,
+ * simulating the driver's forward perspective.
+ */
+private fun DrawScope.drawRoutePath(
+    routePoints: List<RoutePoint>,
+    overlayWidth: Float,
+    overlayHeight: Float,
+    density: Float,
+) {
+    // Path starts from bottom-center (ego vehicle position)
+    val startX = overlayWidth / 2f
+    val startY = overlayHeight * 0.92f
+
+    // Scale: map meters to screen pixels. ~30m ahead ≈ top of screen
+    val forwardScale = overlayHeight * 0.65f / 30f   // pixels per meter forward
+    val lateralScale = overlayWidth * 0.45f / 10f     // pixels per meter lateral
+
+    val path = Path()
+    path.moveTo(startX, startY)
+
+    for (pt in routePoints) {
+        // Skip very distant points to avoid visual noise
+        if (pt.vehicleX > 80f || pt.vehicleX < 0.5f) continue
+
+        val depthFraction = (pt.vehicleX / 80f).coerceIn(0f, 1f)
+        // Perspective: things converge toward vanishing point as distance increases
+        val perspectiveFade = 1f - depthFraction * 0.6f
+
+        val screenX = startX + pt.vehicleY * lateralScale * perspectiveFade
+        val screenY = startY - pt.vehicleX * forwardScale * perspectiveFade
+
+        path.lineTo(screenX, screenY)
+    }
+
+    // Outer glow (wider, semi-transparent)
+    drawPath(
+        path = path,
+        color = Color(0xFF00FF41).copy(alpha = 0.18f),
+        style = Stroke(width = 8f * density, cap = StrokeCap.Round, join = StrokeJoin.Round),
+    )
+    // Inner bright line
+    drawPath(
+        path = path,
+        color = Color(0xFF00FF41).copy(alpha = 0.65f),
+        style = Stroke(width = 2.5f * density, cap = StrokeCap.Round, join = StrokeJoin.Round),
+    )
+    // Center bright core
+    drawPath(
+        path = path,
+        color = Color(0xFFAAFFCC).copy(alpha = 0.90f),
+        style = Stroke(width = 1.2f * density, cap = StrokeCap.Round, join = StrokeJoin.Round),
+    )
 }
 
 private fun estimateProximity(widthRatio: Float, heightRatio: Float): TargetProximity {

@@ -13,6 +13,7 @@ import java.nio.ByteOrder
 import java.nio.MappedByteBuffer
 import java.nio.channels.FileChannel
 import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.roundToInt
 
 /**
@@ -166,6 +167,7 @@ class InferenceEngine(private val context: Context) {
         Thread(runnable, "NightRoadInference")
     }
     @Volatile private var inferenceThread: Thread? = null
+    private val closed = AtomicBoolean(false)
 
     // Dynamic model input dimensions (read from TFLite after load)
     @Volatile var modelInputWidth: Int = DEFAULT_MODEL_INPUT_WIDTH; private set
@@ -388,9 +390,10 @@ class InferenceEngine(private val context: Context) {
             when (delegate) {
                 DelegateType.GPU -> {
                     try {
-                        gpuDelegate = createGpuDelegate()
+                        val delegate = createGpuDelegate()
+                        gpuDelegate = delegate
                         val options = Interpreter.Options()
-                            .addDelegate(gpuDelegate!!)
+                            .addDelegate(delegate)
                             .setNumThreads(cpuThreadCount)
                         interpreter = Interpreter(modelBuffer, options)
                         activeDelegate = DelegateType.GPU
@@ -410,9 +413,10 @@ class InferenceEngine(private val context: Context) {
 
                 DelegateType.NNAPI -> {
                     try {
-                        nnApiDelegate = NnApiDelegate()
+                        val delegate = NnApiDelegate()
+                        nnApiDelegate = delegate
                         val options = Interpreter.Options()
-                            .addDelegate(nnApiDelegate!!)
+                            .addDelegate(delegate)
                             .setNumThreads(cpuThreadCount)
                         interpreter = Interpreter(modelBuffer, options)
                         activeDelegate = DelegateType.NNAPI
@@ -452,33 +456,40 @@ class InferenceEngine(private val context: Context) {
     private fun createInterpreterForced(assetPath: String, delegate: DelegateType) {
         val modelBuffer = loadModelFile(context, assetPath)
 
-        when (delegate) {
-            DelegateType.GPU -> {
-                gpuDelegate = createGpuDelegate()
-                val options = Interpreter.Options()
-                    .addDelegate(gpuDelegate!!)
-                    .setNumThreads(cpuThreadCount)
-                interpreter = Interpreter(modelBuffer, options)
-                activeDelegate = DelegateType.GPU
-                Log.i(TAG, "Forced GPU delegate")
-            }
+        try {
+            when (delegate) {
+                DelegateType.GPU -> {
+                    val gpu = createGpuDelegate()
+                    gpuDelegate = gpu
+                    val options = Interpreter.Options()
+                        .addDelegate(gpu)
+                        .setNumThreads(cpuThreadCount)
+                    interpreter = Interpreter(modelBuffer, options)
+                    activeDelegate = DelegateType.GPU
+                    Log.i(TAG, "Forced GPU delegate")
+                }
 
-            DelegateType.NNAPI -> {
-                nnApiDelegate = NnApiDelegate()
-                val options = Interpreter.Options()
-                    .addDelegate(nnApiDelegate!!)
-                    .setNumThreads(cpuThreadCount)
-                interpreter = Interpreter(modelBuffer, options)
-                activeDelegate = DelegateType.NNAPI
-                Log.i(TAG, "Forced NNAPI delegate")
-            }
+                DelegateType.NNAPI -> {
+                    val nnapi = NnApiDelegate()
+                    nnApiDelegate = nnapi
+                    val options = Interpreter.Options()
+                        .addDelegate(nnapi)
+                        .setNumThreads(cpuThreadCount)
+                    interpreter = Interpreter(modelBuffer, options)
+                    activeDelegate = DelegateType.NNAPI
+                    Log.i(TAG, "Forced NNAPI delegate")
+                }
 
-            DelegateType.CPU -> {
-                val options = Interpreter.Options().setNumThreads(cpuThreadCount)
-                interpreter = Interpreter(modelBuffer, options)
-                activeDelegate = DelegateType.CPU
-                Log.i(TAG, "Forced CPU inference")
+                DelegateType.CPU -> {
+                    val options = Interpreter.Options().setNumThreads(cpuThreadCount)
+                    interpreter = Interpreter(modelBuffer, options)
+                    activeDelegate = DelegateType.CPU
+                    Log.i(TAG, "Forced CPU inference")
+                }
             }
+        } catch (e: Exception) {
+            closeDelegates()
+            throw e
         }
     }
 
@@ -522,23 +533,30 @@ class InferenceEngine(private val context: Context) {
     }
 
     private fun closeDelegates() {
-        interpreter?.close()
+        val oldInterpreter = interpreter
         interpreter = null
-        gpuDelegate?.close()
+        val oldGpuDelegate = gpuDelegate
         gpuDelegate = null
-        nnApiDelegate?.close()
+        val oldNnApiDelegate = nnApiDelegate
         nnApiDelegate = null
+        runCatching { oldInterpreter?.close() }
+            .onFailure { Log.w(TAG, "Interpreter close failed: ${it.message}") }
+        runCatching { oldGpuDelegate?.close() }
+            .onFailure { Log.w(TAG, "GPU delegate close failed: ${it.message}") }
+        runCatching { oldNnApiDelegate?.close() }
+            .onFailure { Log.w(TAG, "NNAPI delegate close failed: ${it.message}") }
     }
 
     private fun loadModelFile(context: Context, assetPath: String): MappedByteBuffer {
-        val fileDescriptor = context.assets.openFd(assetPath)
-        FileInputStream(fileDescriptor.fileDescriptor).use { inputStream ->
-            val fileChannel = inputStream.channel
-            return fileChannel.map(
-                FileChannel.MapMode.READ_ONLY,
-                fileDescriptor.startOffset,
-                fileDescriptor.declaredLength,
-            )
+        return context.assets.openFd(assetPath).use { fileDescriptor ->
+            FileInputStream(fileDescriptor.fileDescriptor).use { inputStream ->
+                val fileChannel = inputStream.channel
+                fileChannel.map(
+                    FileChannel.MapMode.READ_ONLY,
+                    fileDescriptor.startOffset,
+                    fileDescriptor.declaredLength,
+                )
+            }
         }
     }
 
@@ -582,24 +600,34 @@ class InferenceEngine(private val context: Context) {
         timedRuns: Int = 20,
     ): List<BenchmarkResult> = runOnInferenceThread {
         synchronized(lock) {
+        check(currentModelPath.isNotEmpty()) { "No model loaded for benchmark" }
         val results = mutableListOf<BenchmarkResult>()
-        val modelBuffer = loadModelFile(context, currentModelPath)
-
-        // Output buffer matching model's output tensor shape
-        fun createOutput(): Array<Array<FloatArray>> = createOutputBuffer()
-
-        // -- Benchmark GPU --
-        results.add(benchmarkGpu(modelBuffer, inputBuffer, { createOutput() }, warmupRuns, timedRuns))
-
-        // -- Benchmark NNAPI --
-        results.add(benchmarkNnApi(modelBuffer, inputBuffer, { createOutput() }, warmupRuns, timedRuns))
-
-        // -- Benchmark CPU --
-        results.add(benchmarkCpu(modelBuffer, inputBuffer, { createOutput() }, warmupRuns, timedRuns))
-
-        // Restore the best delegate
+        val modelPath = currentModelPath
+        val previousDelegate = activeDelegate
+        val safeWarmupRuns = warmupRuns.coerceAtLeast(0)
+        val safeTimedRuns = timedRuns.coerceAtLeast(1)
         closeDelegates()
-        createInterpreterWithFallback(currentModelPath)
+
+        try {
+            val modelBuffer = loadModelFile(context, modelPath)
+
+            // Output buffer matching model's output tensor shape
+            fun createOutput(): Array<Array<FloatArray>> = createOutputBuffer()
+
+            // -- Benchmark GPU --
+            results.add(benchmarkGpu(modelBuffer, inputBuffer, { createOutput() }, safeWarmupRuns, safeTimedRuns))
+
+            // -- Benchmark NNAPI --
+            results.add(benchmarkNnApi(modelBuffer, inputBuffer, { createOutput() }, safeWarmupRuns, safeTimedRuns))
+
+            // -- Benchmark CPU --
+            results.add(benchmarkCpu(modelBuffer, inputBuffer, { createOutput() }, safeWarmupRuns, safeTimedRuns))
+        } finally {
+            // Benchmarking must not silently change the user's selected backend.
+            closeDelegates()
+            createInterpreterWithFallback(modelPath, previousDelegate)
+            readModelInputDimensions()
+        }
 
         results
         }
@@ -613,17 +641,18 @@ class InferenceEngine(private val context: Context) {
         timedRuns: Int,
     ): BenchmarkResult {
         var gpuDel: GpuDelegate? = null
+        var interp: Interpreter? = null
         return try {
             gpuDel = createGpuDelegate()
             val interpOptions = Interpreter.Options()
                 .addDelegate(gpuDel)
                 .setNumThreads(cpuThreadCount)
-            val interp = Interpreter(modelBuffer, interpOptions)
+            interp = Interpreter(modelBuffer, interpOptions)
 
             // Warm up
             for (i in 0 until warmupRuns) {
                 val out = outputFactory()
-                runInterpreter(interp, inputBuffer, out)
+                runInterpreter(checkNotNull(interp), inputBuffer, out)
             }
 
             // Timed runs
@@ -631,11 +660,10 @@ class InferenceEngine(private val context: Context) {
             for (i in 0 until timedRuns) {
                 val out = outputFactory()
                 val start = System.nanoTime()
-                runInterpreter(interp, inputBuffer, out)
+                runInterpreter(checkNotNull(interp), inputBuffer, out)
                 timings.add((System.nanoTime() - start) / 1_000_000L)
             }
 
-            interp.close()
             BenchmarkResult(
                 delegate = DelegateType.GPU,
                 avgInferenceMs = timings.average().toFloat(),
@@ -657,7 +685,8 @@ class InferenceEngine(private val context: Context) {
                 errorMessage = e.message,
             )
         } finally {
-            gpuDel?.close()
+            runCatching { interp?.close() }
+            runCatching { gpuDel?.close() }
         }
     }
 
@@ -669,27 +698,27 @@ class InferenceEngine(private val context: Context) {
         timedRuns: Int,
     ): BenchmarkResult {
         var nnDel: NnApiDelegate? = null
+        var interp: Interpreter? = null
         return try {
             nnDel = NnApiDelegate()
             val interpOptions = Interpreter.Options()
                 .addDelegate(nnDel)
                 .setNumThreads(cpuThreadCount)
-            val interp = Interpreter(modelBuffer, interpOptions)
+            interp = Interpreter(modelBuffer, interpOptions)
 
             for (i in 0 until warmupRuns) {
                 val out = outputFactory()
-                runInterpreter(interp, inputBuffer, out)
+                runInterpreter(checkNotNull(interp), inputBuffer, out)
             }
 
             val timings = mutableListOf<Long>()
             for (i in 0 until timedRuns) {
                 val out = outputFactory()
                 val start = System.nanoTime()
-                runInterpreter(interp, inputBuffer, out)
+                runInterpreter(checkNotNull(interp), inputBuffer, out)
                 timings.add((System.nanoTime() - start) / 1_000_000L)
             }
 
-            interp.close()
             BenchmarkResult(
                 delegate = DelegateType.NNAPI,
                 avgInferenceMs = timings.average().toFloat(),
@@ -711,7 +740,8 @@ class InferenceEngine(private val context: Context) {
                 errorMessage = e.message,
             )
         } finally {
-            nnDel?.close()
+            runCatching { interp?.close() }
+            runCatching { nnDel?.close() }
         }
     }
 
@@ -722,24 +752,24 @@ class InferenceEngine(private val context: Context) {
         warmupRuns: Int,
         timedRuns: Int,
     ): BenchmarkResult {
+        var interp: Interpreter? = null
         return try {
             val interpOptions = Interpreter.Options().setNumThreads(cpuThreadCount)
-            val interp = Interpreter(modelBuffer, interpOptions)
+            interp = Interpreter(modelBuffer, interpOptions)
 
             for (i in 0 until warmupRuns) {
                 val out = outputFactory()
-                runInterpreter(interp, inputBuffer, out)
+                runInterpreter(checkNotNull(interp), inputBuffer, out)
             }
 
             val timings = mutableListOf<Long>()
             for (i in 0 until timedRuns) {
                 val out = outputFactory()
                 val start = System.nanoTime()
-                runInterpreter(interp, inputBuffer, out)
+                runInterpreter(checkNotNull(interp), inputBuffer, out)
                 timings.add((System.nanoTime() - start) / 1_000_000L)
             }
 
-            interp.close()
             BenchmarkResult(
                 delegate = DelegateType.CPU,
                 avgInferenceMs = timings.average().toFloat(),
@@ -986,6 +1016,8 @@ class InferenceEngine(private val context: Context) {
             parseRawOutput(output, letterboxParams, confidenceThreshold, classConfidenceThresholds)
         } else {
             parsePostProcessedOutput(output, letterboxParams, confidenceThreshold, classConfidenceThresholds)
+        } finally {
+            runCatching { interp?.close() }
         }
 
         val nmsDetections = nms(
@@ -1276,7 +1308,7 @@ class InferenceEngine(private val context: Context) {
             var maxValue = 0f
             for (coordinateIndex in 0 until minOf(4, output[0].size)) {
                 for (value in output[0][coordinateIndex]) {
-                    maxValue = maxOf(maxValue, kotlin.math.abs(value))
+                    if (value.isFinite()) maxValue = maxOf(maxValue, kotlin.math.abs(value))
                 }
             }
             maxValue
@@ -1284,11 +1316,17 @@ class InferenceEngine(private val context: Context) {
             var maxValue = 0f
             for (row in output[0]) {
                 for (coordinateIndex in 0 until minOf(4, row.size)) {
-                    maxValue = maxOf(maxValue, kotlin.math.abs(row[coordinateIndex]))
+                    val value = row[coordinateIndex]
+                    if (value.isFinite()) maxValue = maxOf(maxValue, kotlin.math.abs(value))
                 }
             }
             maxValue
         }
+
+        // An empty post-NMS tensor is all zeros. Do not permanently classify the
+        // model from that frame; a later frame with a real box can still reveal
+        // whether coordinates are normalized or pixel based.
+        if (maxCoordinate <= 1e-6f) return true
 
         val normalized = maxCoordinate <= NORMALIZED_COORDINATE_LIMIT
         outputCoordinatesNormalized = normalized
@@ -1312,6 +1350,7 @@ class InferenceEngine(private val context: Context) {
 
     /** GPU delegates require initialization and invocation on the same thread. */
     private fun <T> runOnInferenceThread(block: () -> T): T {
+        check(!closed.get()) { "InferenceEngine is closed" }
         if (Thread.currentThread() === inferenceThread) return block()
         return inferenceExecutor.submit<T> {
             inferenceThread = Thread.currentThread()
@@ -1320,11 +1359,19 @@ class InferenceEngine(private val context: Context) {
     }
 
     fun close() {
-        runOnInferenceThread {
+        if (!closed.compareAndSet(false, true)) return
+        val closeAction = Runnable {
             synchronized(lock) {
                 closeDelegates()
                 cachedOutputBuffer = null
             }
+        }
+        if (Thread.currentThread() === inferenceThread) {
+            closeAction.run()
+        } else {
+            // Queue cleanup after any in-flight inference without blocking the main
+            // thread during ViewModel teardown.
+            inferenceExecutor.execute(closeAction)
         }
         inferenceExecutor.shutdown()
     }

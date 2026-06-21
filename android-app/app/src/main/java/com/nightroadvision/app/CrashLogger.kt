@@ -29,7 +29,8 @@ class CrashLogger(private val context: Context) : Thread.UncaughtExceptionHandle
         try {
             // 使用 app 外部目录，不需要存储权限
             // 路径: /sdcard/Android/data/com.nightroadvision.app/files/NightRoadVision/
-            val logDir = File(context.getExternalFilesDir(null), DIR_NAME)
+            val baseDir = context.getExternalFilesDir(null) ?: context.filesDir
+            val logDir = File(baseDir, DIR_NAME)
             if (!logDir.exists()) logDir.mkdirs()
 
             val logFile = File(logDir, FILE_NAME)

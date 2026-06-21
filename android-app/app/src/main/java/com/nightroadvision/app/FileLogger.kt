@@ -21,9 +21,11 @@ object FileLogger {
 
     @Volatile
     private var logDir: File? = null
+    private val writeLock = Any()
 
     fun init(context: Context) {
-        logDir = File(context.getExternalFilesDir(null), DIR_NAME)
+        val baseDir = context.getExternalFilesDir(null) ?: context.filesDir
+        logDir = File(baseDir, DIR_NAME)
         logDir?.mkdirs()
         i(TAG, "FileLogger initialized, log dir: ${logDir?.absolutePath}")
     }
@@ -55,21 +57,25 @@ object FileLogger {
 
     private fun append(level: String, tag: String, message: String) {
         try {
-            val dir = logDir ?: return
-            val file = File(dir, FILE_NAME)
+            synchronized(writeLock) {
+                val dir = logDir ?: return
+                val file = File(dir, FILE_NAME)
 
-            // Rotate if too large
-            if (file.exists() && file.length() > MAX_FILE_SIZE) {
-                val backup = File(dir, "app_log_prev.txt")
-                file.renameTo(backup)
+                // Rotate if too large. Remove the previous generation first because
+                // File.renameTo does not replace an existing destination on Android.
+                if (file.exists() && file.length() > MAX_FILE_SIZE) {
+                    val backup = File(dir, "app_log_prev.txt")
+                    if (backup.exists()) backup.delete()
+                    file.renameTo(backup)
+                }
+
+                val timestamp = SimpleDateFormat("HH:mm:ss.SSS", Locale.getDefault()).format(Date())
+                file.appendText("[$timestamp] $level/$tag: $message\n")
             }
-
-            val timestamp = SimpleDateFormat("HH:mm:ss.SSS", Locale.getDefault()).format(Date())
-            file.appendText("[$timestamp] $level/$tag: $message\n")
         } catch (_: Exception) {
             // 写日志失败不能影响主逻辑
         }
     }
 
-    fun getLogFilePath(): String = File(logDir, FILE_NAME).absolutePath
+    fun getLogFilePath(): String = logDir?.let { File(it, FILE_NAME).absolutePath } ?: FILE_NAME
 }

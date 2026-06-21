@@ -3,6 +3,7 @@ package com.nightroadvision.app.model
 import android.content.Context
 import android.content.SharedPreferences
 import android.util.Log
+import com.nightroadvision.app.inference.InferenceEngine
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -174,7 +175,7 @@ class ModelManager(private val context: Context) {
 
     // -- Public API -----------------------------------------------------------
 
-    fun getAvailableModels(): List<ModelInfo> = _installedModels.value.ifEmpty { allModels }
+    fun getAvailableModels(): List<ModelInfo> = _installedModels.value
 
     fun getInstalledModels(): List<ModelInfo> = _installedModels.value
 
@@ -270,28 +271,13 @@ class ModelManager(private val context: Context) {
                 BufferedReader(InputStreamReader(stream)).readLines()
                     .map { it.trim() }
                     .filter { it.isNotEmpty() }
-            }
+            }.ifEmpty { InferenceEngine.CLASS_NAMES }
         } catch (_: Exception) {
             Log.w(TAG, "labels.txt not found in assets, using hardcoded COCO classes")
-            cocoClassNames
+            InferenceEngine.CLASS_NAMES
         }
     }
 
     private fun ModelInfo.fileName(): String = path.substringAfterLast('/')
 
-    /** COCO 80 class names as fallback. */
-    private val cocoClassNames = listOf(
-        "person", "bicycle", "car", "motorcycle", "airplane", "bus", "train", "truck",
-        "boat", "traffic light", "fire hydrant", "stop sign", "parking meter", "bench",
-        "bird", "cat", "dog", "horse", "sheep", "cow", "elephant", "bear", "zebra",
-        "giraffe", "backpack", "umbrella", "handbag", "tie", "suitcase", "frisbee",
-        "skis", "snowboard", "sports ball", "kite", "baseball bat", "baseball glove",
-        "skateboard", "surfboard", "tennis racket", "bottle", "wine glass", "cup",
-        "fork", "knife", "spoon", "bowl", "banana", "apple", "sandwich", "orange",
-        "broccoli", "carrot", "hot dog", "pizza", "donut", "cake", "chair", "couch",
-        "potted plant", "bed", "dining table", "toilet", "tv", "laptop", "mouse",
-        "remote", "keyboard", "cell phone", "microwave", "oven", "toaster", "sink",
-        "refrigerator", "book", "clock", "vase", "scissors", "teddy bear", "hair drier",
-        "toothbrush"
-    )
 }

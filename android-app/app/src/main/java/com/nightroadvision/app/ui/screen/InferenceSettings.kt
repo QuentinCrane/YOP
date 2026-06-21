@@ -1,6 +1,7 @@
 package com.nightroadvision.app.ui.screen
 
 import android.content.Context
+import com.nightroadvision.app.alert.AlertSoundStyle
 import com.nightroadvision.app.model.ModelQuantization
 
 enum class DetectionMode(val label: String, val description: String) {
@@ -61,6 +62,8 @@ data class InferenceSettings(
     val showTrackIds: Boolean = false,
     val vibrationAlertsEnabled: Boolean = true,
     val soundAlertsEnabled: Boolean = true,
+    val alertSoundStyle: AlertSoundStyle = AlertSoundStyle.TESLA,
+    val showRoutePrediction: Boolean = true,
     val dangerDistanceM: Float = 8f,
     val urgentDistanceM: Float = 18f,
     val cautionDistanceM: Float = 35f,
@@ -84,20 +87,21 @@ fun InferenceSettings.withPreset(mode: DetectionMode): InferenceSettings = when 
         detectionMode = mode,
     )
 
-    DetectionMode.BALANCED -> InferenceSettings(
+    DetectionMode.BALANCED -> copy(
+        confidenceThreshold = 0.25f,
+        vulnerableUserConfidence = 0.18f,
+        vehicleConfidence = 0.23f,
+        iouThreshold = 0.45f,
         frameSkip = 2,
         maxDetections = 40,
         cpuThreads = 4,
+        trackerIouThreshold = 0.15f,
+        trackerConfirmFrames = 1,
+        trackerMaxMissedFrames = 15,
+        boxSmoothing = 0.50f,
+        digitalZoomRatio = 1.0f,
         analysisResolution = AnalysisResolution.PERFORMANCE,
-        selectedModelId = selectedModelId,
-        backendPreference = backendPreference,
-        gpuPrecision = gpuPrecision,
-        quantizationPreference = quantizationPreference,
-        vibrationAlertsEnabled = vibrationAlertsEnabled,
-        soundAlertsEnabled = soundAlertsEnabled,
-        showLabels = showLabels,
-        showConfidence = showConfidence,
-        showTrackIds = showTrackIds,
+        detectionMode = mode,
     )
 
     DetectionMode.FINE -> copy(
@@ -136,24 +140,29 @@ fun InferenceSettings.withPreset(mode: DetectionMode): InferenceSettings = when 
     DetectionMode.CUSTOM -> copy(detectionMode = mode)
 }
 
-fun InferenceSettings.sanitized(): InferenceSettings = copy(
-    confidenceThreshold = confidenceThreshold.coerceIn(0.05f, 0.90f),
-    vulnerableUserConfidence = vulnerableUserConfidence.coerceIn(0.05f, 0.90f),
-    vehicleConfidence = vehicleConfidence.coerceIn(0.05f, 0.90f),
-    iouThreshold = iouThreshold.coerceIn(0.10f, 0.90f),
-    maxDetections = maxDetections.coerceIn(10, 300),
-    frameSkip = frameSkip.coerceIn(1, 6),
-    cpuThreads = cpuThreads.coerceIn(1, 8),
-    trackerIouThreshold = trackerIouThreshold.coerceIn(0.05f, 0.80f),
-    trackerConfirmFrames = trackerConfirmFrames.coerceIn(1, 5),
-    trackerMaxMissedFrames = trackerMaxMissedFrames.coerceIn(1, 30),
-    boxSmoothing = boxSmoothing.coerceIn(0.05f, 1.0f),
-    digitalZoomRatio = digitalZoomRatio.coerceIn(1.0f, 3.0f),
-    exposureCompensation = exposureCompensation.coerceIn(-6, 6),
-    dangerDistanceM = dangerDistanceM.coerceIn(2f, 30f),
-    urgentDistanceM = urgentDistanceM.coerceIn(5f, 60f),
-    cautionDistanceM = cautionDistanceM.coerceIn(10f, 100f),
-)
+fun InferenceSettings.sanitized(): InferenceSettings {
+    val danger = dangerDistanceM.coerceIn(1f, 50f)
+    val urgent = urgentDistanceM.coerceIn(3f, 80f).coerceAtLeast(danger)
+    val caution = cautionDistanceM.coerceIn(5f, 150f).coerceAtLeast(urgent)
+    return copy(
+        confidenceThreshold = confidenceThreshold.coerceIn(0.05f, 0.90f),
+        vulnerableUserConfidence = vulnerableUserConfidence.coerceIn(0.05f, 0.90f),
+        vehicleConfidence = vehicleConfidence.coerceIn(0.05f, 0.90f),
+        iouThreshold = iouThreshold.coerceIn(0.10f, 0.90f),
+        maxDetections = maxDetections.coerceIn(10, 300),
+        frameSkip = frameSkip.coerceIn(1, 6),
+        cpuThreads = cpuThreads.coerceIn(1, 8),
+        trackerIouThreshold = trackerIouThreshold.coerceIn(0.05f, 0.80f),
+        trackerConfirmFrames = trackerConfirmFrames.coerceIn(1, 5),
+        trackerMaxMissedFrames = trackerMaxMissedFrames.coerceIn(1, 30),
+        boxSmoothing = boxSmoothing.coerceIn(0.05f, 1.0f),
+        digitalZoomRatio = digitalZoomRatio.coerceIn(1.0f, 3.0f),
+        exposureCompensation = exposureCompensation.coerceIn(-6, 6),
+        dangerDistanceM = danger,
+        urgentDistanceM = urgent,
+        cautionDistanceM = caution,
+    )
+}
 
 /** Persists advanced controls without tying the ViewModel to UI lifecycle state. */
 class InferenceSettingsStore(context: Context) {
@@ -188,6 +197,8 @@ class InferenceSettingsStore(context: Context) {
             showTrackIds = preferences.getBoolean("show_track_ids", defaults.showTrackIds),
             vibrationAlertsEnabled = preferences.getBoolean("vibration", defaults.vibrationAlertsEnabled),
             soundAlertsEnabled = preferences.getBoolean("sound", defaults.soundAlertsEnabled),
+            alertSoundStyle = enumValue("alert_sound_style", defaults.alertSoundStyle),
+            showRoutePrediction = preferences.getBoolean("show_route", defaults.showRoutePrediction),
             dangerDistanceM = preferences.getFloat("danger_dist", defaults.dangerDistanceM),
             urgentDistanceM = preferences.getFloat("urgent_dist", defaults.urgentDistanceM),
             cautionDistanceM = preferences.getFloat("caution_dist", defaults.cautionDistanceM),
@@ -223,6 +234,8 @@ class InferenceSettingsStore(context: Context) {
             .putBoolean("show_track_ids", value.showTrackIds)
             .putBoolean("vibration", value.vibrationAlertsEnabled)
             .putBoolean("sound", value.soundAlertsEnabled)
+            .putString("alert_sound_style", value.alertSoundStyle.name)
+            .putBoolean("show_route", value.showRoutePrediction)
             .putFloat("danger_dist", value.dangerDistanceM)
             .putFloat("urgent_dist", value.urgentDistanceM)
             .putFloat("caution_dist", value.cautionDistanceM)

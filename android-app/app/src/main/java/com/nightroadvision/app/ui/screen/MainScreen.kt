@@ -15,8 +15,6 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
@@ -44,7 +42,6 @@ import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.camera.view.PreviewView
 import com.nightroadvision.app.model.ModelManager
-import com.nightroadvision.app.model.ModelQuantization
 import com.nightroadvision.app.alert.RidingRisk
 import com.nightroadvision.app.alert.RiskReason
 import com.nightroadvision.app.alert.RiskSeverity
@@ -426,9 +423,11 @@ private fun CircleIconButton(
 @Composable
 private fun VisionStatusChip(
     modelName: String,
+    onClick: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     Surface(
+        onClick = onClick,
         modifier = modifier,
         shape = RoundedCornerShape(18.dp),
         color = Color.Black.copy(alpha = 0.48f),
@@ -662,8 +661,10 @@ fun MainScreen(
     val errorMessage by viewModel.errorMessage.collectAsState()
     val activeDelegate by viewModel.activeDelegate.collectAsState()
     val ridingRisk by viewModel.ridingRisk.collectAsState()
+    val routePoints by viewModel.routePoints.collectAsState()
     val supercomboEnabled by viewModel.supercomboEnabled.collectAsState()
     val supercomboLatencyMs by viewModel.supercomboLatencyMs.collectAsState()
+    val supercomboAvailable by viewModel.supercomboAvailable.collectAsState()
 
     // Local UI state
     var showSettingsPage by remember { mutableStateOf(false) }
@@ -672,15 +673,15 @@ fun MainScreen(
     var flashlightOn by remember { mutableStateOf(false) }
 
     // Camera setup - runs once on first composition
-    val cameraManager = remember {
+    val cameraManager = remember(viewModel, lifecycleOwner) {
         viewModel.createCameraManager(lifecycleOwner)
     }
-    var cameraStarted by remember { mutableStateOf(false) }
+    var cameraStarted by remember(cameraManager) { mutableStateOf(false) }
     val availableLenses by cameraManager.availableLenses.collectAsState()
     val selectedLens by cameraManager.currentLens.collectAsState()
 
     // Cleanup camera when composable leaves composition
-    DisposableEffect(Unit) {
+    DisposableEffect(cameraManager) {
         onDispose {
             cameraManager.release()
         }
@@ -759,17 +760,24 @@ fun MainScreen(
                 showLabels = settings.showLabels,
                 showConfidence = settings.showConfidence,
                 showTrackIds = settings.showTrackIds,
+                routePoints = if (settings.showRoutePrediction) routePoints else emptyList(),
                 modifier = Modifier.fillMaxSize()
             )
 
-            // Like openpilot's state border, this remains peripheral and changes only
-            // when a tracked person or vehicle occupies a large part of the frame.
-            // Uses thick borders with a soft outer glow for high visibility.
-            val riskBorderColor = when (ridingRisk.severity) {
+            // Animated gradient glow border — openpilot-style warning frame.
+            // Uses a rotating sweep gradient with pulsing intensity for a
+            // living, breathing effect instead of a flat solid border.
+            val riskBorderColor1 = when (ridingRisk.severity) {
                 RiskSeverity.DANGER -> Color(0xFFC92231)
                 RiskSeverity.URGENT -> Color(0xFFE8530E)
                 RiskSeverity.CAUTION -> Color(0xFFDA6F25)
                 RiskSeverity.NONE -> NightVisionColors.Accent
+            }
+            val riskBorderColor2 = when (ridingRisk.severity) {
+                RiskSeverity.DANGER -> Color(0xFFFF2266)
+                RiskSeverity.URGENT -> Color(0xFFFFAA00)
+                RiskSeverity.CAUTION -> Color(0xFFFFCC44)
+                RiskSeverity.NONE -> NightVisionColors.AccentDim
             }
             val riskBorderWidth = when (ridingRisk.severity) {
                 RiskSeverity.DANGER -> 10.dp
@@ -778,57 +786,73 @@ fun MainScreen(
                 RiskSeverity.NONE -> 1.dp
             }
             val glowWidth = when (ridingRisk.severity) {
-                RiskSeverity.DANGER -> 24.dp
-                RiskSeverity.URGENT -> 14.dp
-                RiskSeverity.CAUTION -> 6.dp
+                RiskSeverity.DANGER -> 28.dp
+                RiskSeverity.URGENT -> 16.dp
+                RiskSeverity.CAUTION -> 8.dp
                 RiskSeverity.NONE -> 0.dp
             }
 
-            // Pulsing animation for DANGER (always created to satisfy Compose rules)
+            // Pulsing animation for gradient glow
             val infiniteTransition = rememberInfiniteTransition(label = "risk_pulse")
             val pulseRaw by infiniteTransition.animateFloat(
-                initialValue = 0.25f,
-                targetValue = 0.65f,
+                initialValue = 0.20f,
+                targetValue = 0.70f,
                 animationSpec = infiniteRepeatable(
-                    animation = tween(durationMillis = 500),
+                    animation = tween(durationMillis = if (ridingRisk.severity == RiskSeverity.DANGER) 400 else 800),
                     repeatMode = RepeatMode.Reverse,
                 ),
                 label = "danger_pulse",
             )
-            val pulseAlpha = if (ridingRisk.severity == RiskSeverity.DANGER) pulseRaw else 0.35f
+            val pulseAlpha = if (ridingRisk.severity != RiskSeverity.NONE) pulseRaw else 0.18f
 
             if (ridingRisk.severity != RiskSeverity.NONE) {
-                // Outer glow layer — wider, semi-transparent
-                Box(
-                    modifier = Modifier
-                        .fillMaxSize()
-                        .border(
-                            width = glowWidth,
-                            color = riskBorderColor.copy(alpha = pulseAlpha * 0.5f),
-                        ),
+                // Outer gradient glow — sweep gradient rotates for a living shimmer
+                val outerGlowBrush = Brush.sweepGradient(
+                    colors = listOf(
+                        riskBorderColor1.copy(alpha = pulseAlpha * 0.45f),
+                        riskBorderColor2.copy(alpha = pulseAlpha * 0.25f),
+                        riskBorderColor1.copy(alpha = pulseAlpha * 0.50f),
+                        riskBorderColor2.copy(alpha = pulseAlpha * 0.20f),
+                        riskBorderColor1.copy(alpha = pulseAlpha * 0.45f),
+                    ),
+                    center = androidx.compose.ui.geometry.Offset.Unspecified,
                 )
-                // Inner solid border — crisp, high-contrast
                 Box(
                     modifier = Modifier
                         .fillMaxSize()
-                        .border(
-                            width = riskBorderWidth,
-                            color = riskBorderColor.copy(alpha = 0.90f),
-                        ),
+                        .border(width = glowWidth, brush = outerGlowBrush, shape = RoundedCornerShape(0.dp)),
+                )
+                // Inner gradient border — crisp with color shift
+                val innerBrush = Brush.sweepGradient(
+                    colors = listOf(
+                        riskBorderColor1.copy(alpha = 0.92f),
+                        riskBorderColor2.copy(alpha = 0.78f),
+                        riskBorderColor1.copy(alpha = 0.92f),
+                        riskBorderColor2.copy(alpha = 0.78f),
+                        riskBorderColor1.copy(alpha = 0.92f),
+                    ),
+                    center = androidx.compose.ui.geometry.Offset.Unspecified,
+                )
+                Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .border(width = riskBorderWidth, brush = innerBrush, shape = RoundedCornerShape(0.dp)),
                 )
             } else {
+                // Subtle idle border
                 Box(
                     modifier = Modifier
                         .fillMaxSize()
                         .border(
                             width = 1.dp,
-                            color = riskBorderColor.copy(alpha = 0.20f),
+                            color = NightVisionColors.Accent.copy(alpha = 0.15f),
                         ),
                 )
             }
 
             VisionStatusChip(
                 modelName = currentModelName,
+                onClick = { showModelSelector = true },
                 modifier = Modifier
                     .align(Alignment.TopStart)
                     .statusBarsPadding()
@@ -926,18 +950,21 @@ fun MainScreen(
                     viewModel.updateSettings(newSettings)
                 },
                 onResetSettings = viewModel::resetSettings,
+                onSelectModel = { showModelSelector = true },
                 int8Available = viewModel.isInt8Available(),
                 onQuantizationSelected = viewModel::selectQuantization,
                 onDismiss = { showSettingsPage = false },
                 supercomboEnabled = supercomboEnabled,
+                supercomboAvailable = supercomboAvailable,
                 onSupercomboToggle = { viewModel.setSupercomboEnabled(it) },
                 supercomboLatencyMs = supercomboLatencyMs,
+                onPreviewAlert = { severity -> viewModel.previewAlertSound(severity) },
             )
         }
 
         // ── Model Selector Bottom Sheet ──
         if (showModelSelector) {
-            val availableModels = remember { viewModel.getAvailableModels() }
+            val availableModels = remember(viewModel) { viewModel.getAvailableModels() }
             ModelSelectorBottomSheet(
                 models = availableModels,
                 currentModelId = settings.selectedModelId,

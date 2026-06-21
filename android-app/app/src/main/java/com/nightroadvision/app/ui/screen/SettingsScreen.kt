@@ -8,8 +8,8 @@ import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
@@ -26,10 +26,11 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.platform.LocalConfiguration
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import com.nightroadvision.app.model.ModelManager
 import com.nightroadvision.app.model.ModelQuantization
 import java.util.Locale
 
@@ -41,13 +42,10 @@ private enum class SettingsCategory(
     val label: String,
     val icon: ImageVector,
 ) {
-    MODEL("模型", Icons.Filled.Memory),
-    DETECTION("检测", Icons.Filled.Visibility),
-    TRACKING("跟踪", Icons.Filled.TrackChanges),
-    CAMERA("相机", Icons.Filled.CameraAlt),
-    BACKEND("后端", Icons.Filled.DeveloperBoard),
     ALERTS("警报", Icons.Filled.NotificationsActive),
-    DISPLAY("显示", Icons.Filled.Palette),
+    DETECTION("检测与跟踪", Icons.Filled.Visibility),
+    CAMERA("相机与显示", Icons.Filled.CameraAlt),
+    MODEL("模型与后端", Icons.Filled.Memory),
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -60,19 +58,21 @@ fun SettingsScreen(
     currentModelName: String,
     onSettingsChanged: (InferenceSettings) -> Unit,
     onResetSettings: () -> Unit,
+    onSelectModel: () -> Unit,
     int8Available: Boolean,
     onQuantizationSelected: (ModelQuantization) -> Unit,
     onDismiss: () -> Unit,
     supercomboEnabled: Boolean,
+    supercomboAvailable: Boolean,
     onSupercomboToggle: (Boolean) -> Unit,
     supercomboLatencyMs: Long,
+    onPreviewAlert: (com.nightroadvision.app.alert.RiskSeverity) -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
-    var selectedCategory by remember { mutableStateOf(SettingsCategory.MODEL) }
+    var selectedCategory by remember { mutableStateOf(SettingsCategory.ALERTS) }
     val configuration = LocalConfiguration.current
     val isLandscape = configuration.orientation == android.content.res.Configuration.ORIENTATION_LANDSCAPE
-    val sidebarWidth = if (isLandscape) 200.dp else 160.dp
-    val contentPadding = if (isLandscape) 32.dp else 20.dp
+    val contentPadding = if (isLandscape) 32.dp else 16.dp
 
     Surface(
         modifier = modifier.fillMaxSize(),
@@ -91,30 +91,66 @@ fun SettingsScreen(
                 thickness = 0.5.dp,
             )
 
-            // ── Body: sidebar + content ──
-            Row(modifier = Modifier.fillMaxSize()) {
-                // Sidebar
-                SettingsSidebar(
+            if (isLandscape) {
+                // Landscape: sidebar + content side by side
+                Row(modifier = Modifier.fillMaxSize()) {
+                    SettingsSidebar(
+                        selected = selectedCategory,
+                        onSelect = { selectedCategory = it },
+                        modifier = Modifier
+                            .width(200.dp)
+                            .fillMaxHeight()
+                            .background(NightVisionColors.Surface),
+                    )
+
+                    VerticalDivider(
+                        color = NightVisionColors.Border,
+                        thickness = 0.5.dp,
+                    )
+
+                    AnimatedContent(
+                        targetState = selectedCategory,
+                        transitionSpec = { fadeIn() togetherWith fadeOut() },
+                        modifier = Modifier
+                            .weight(1f)
+                            .fillMaxHeight(),
+                        label = "settings_content",
+                    ) { category ->
+                        SettingsContent(
+                            category = category,
+                            settings = settings,
+                            currentModelName = currentModelName,
+                            onSettingsChanged = onSettingsChanged,
+                            onSelectModel = onSelectModel,
+                            int8Available = int8Available,
+                            onQuantizationSelected = onQuantizationSelected,
+                            supercomboEnabled = supercomboEnabled,
+                            supercomboAvailable = supercomboAvailable,
+                            onSupercomboToggle = onSupercomboToggle,
+                            supercomboLatencyMs = supercomboLatencyMs,
+                            onPreviewAlert = onPreviewAlert,
+                            horizontalPadding = contentPadding,
+                        )
+                    }
+                }
+            } else {
+                // Portrait: horizontal tab bar + content stacked vertically
+                SettingsTabBar(
                     selected = selectedCategory,
                     onSelect = { selectedCategory = it },
-                    modifier = Modifier
-                        .width(sidebarWidth)
-                        .fillMaxHeight()
-                        .background(NightVisionColors.Surface),
                 )
 
-                VerticalDivider(
+                HorizontalDivider(
                     color = NightVisionColors.Border,
                     thickness = 0.5.dp,
                 )
 
-                // Content
                 AnimatedContent(
                     targetState = selectedCategory,
                     transitionSpec = { fadeIn() togetherWith fadeOut() },
                     modifier = Modifier
                         .weight(1f)
-                        .fillMaxHeight(),
+                        .fillMaxWidth(),
                     label = "settings_content",
                 ) { category ->
                     SettingsContent(
@@ -122,14 +158,68 @@ fun SettingsScreen(
                         settings = settings,
                         currentModelName = currentModelName,
                         onSettingsChanged = onSettingsChanged,
+                        onSelectModel = onSelectModel,
                         int8Available = int8Available,
                         onQuantizationSelected = onQuantizationSelected,
                         supercomboEnabled = supercomboEnabled,
+                        supercomboAvailable = supercomboAvailable,
                         onSupercomboToggle = onSupercomboToggle,
                         supercomboLatencyMs = supercomboLatencyMs,
+                        onPreviewAlert = onPreviewAlert,
                         horizontalPadding = contentPadding,
                     )
                 }
+            }
+        }
+    }
+}
+
+@Composable
+private fun SettingsTabBar(
+    selected: SettingsCategory,
+    onSelect: (SettingsCategory) -> Unit,
+) {
+    val scrollState = rememberScrollState()
+
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .background(NightVisionColors.Surface)
+            .horizontalScroll(scrollState)
+            .padding(horizontal = 8.dp, vertical = 6.dp),
+        horizontalArrangement = Arrangement.spacedBy(4.dp),
+    ) {
+        SettingsCategory.entries.forEach { category ->
+            val isSelected = category == selected
+            val background = if (isSelected) {
+                NightVisionColors.Accent.copy(alpha = 0.14f)
+            } else {
+                Color.Transparent
+            }
+            val textColor = if (isSelected) NightVisionColors.Accent else NightVisionColors.TextSecondary
+            val iconColor = if (isSelected) NightVisionColors.Accent else NightVisionColors.TextMuted
+
+            Row(
+                modifier = Modifier
+                    .clip(RoundedCornerShape(8.dp))
+                    .background(background)
+                    .clickable { onSelect(category) }
+                    .padding(horizontal = 10.dp, vertical = 8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Icon(
+                    imageVector = category.icon,
+                    contentDescription = null,
+                    tint = iconColor,
+                    modifier = Modifier.size(16.dp),
+                )
+                Spacer(Modifier.width(6.dp))
+                Text(
+                    text = category.label,
+                    style = MaterialTheme.typography.labelMedium,
+                    fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal,
+                    color = textColor,
+                )
             }
         }
     }
@@ -209,7 +299,7 @@ private fun SettingsSidebar(
                     .clip(RoundedCornerShape(10.dp))
                     .background(background)
                     .clickable { onSelect(category) }
-                    .padding(horizontal = 14.dp, vertical = 14.dp),
+                    .padding(horizontal = 14.dp, vertical = 16.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 Icon(
@@ -240,11 +330,14 @@ private fun SettingsContent(
     settings: InferenceSettings,
     currentModelName: String,
     onSettingsChanged: (InferenceSettings) -> Unit,
+    onSelectModel: () -> Unit,
     int8Available: Boolean,
     onQuantizationSelected: (ModelQuantization) -> Unit,
     supercomboEnabled: Boolean,
+    supercomboAvailable: Boolean,
     onSupercomboToggle: (Boolean) -> Unit,
     supercomboLatencyMs: Long,
+    onPreviewAlert: (com.nightroadvision.app.alert.RiskSeverity) -> Unit = {},
     horizontalPadding: Dp = 20.dp,
 ) {
     Column(
@@ -255,38 +348,30 @@ private fun SettingsContent(
         verticalArrangement = Arrangement.spacedBy(24.dp),
     ) {
         when (category) {
-            SettingsCategory.MODEL -> ModelSection(
+            SettingsCategory.MODEL -> ModelBackendSection(
                 settings = settings,
                 currentModelName = currentModelName,
+                onSelectModel = onSelectModel,
                 int8Available = int8Available,
                 onQuantizationSelected = onQuantizationSelected,
-            )
-            SettingsCategory.DETECTION -> DetectionSection(
-                settings = settings,
-                onSettingsChanged = onSettingsChanged,
-            )
-            SettingsCategory.TRACKING -> TrackingSection(
-                settings = settings,
-                onSettingsChanged = onSettingsChanged,
-            )
-            SettingsCategory.CAMERA -> CameraSection(
-                settings = settings,
-                onSettingsChanged = onSettingsChanged,
-            )
-            SettingsCategory.BACKEND -> BackendSection(
-                settings = settings,
                 onSettingsChanged = onSettingsChanged,
                 supercomboEnabled = supercomboEnabled,
+                supercomboAvailable = supercomboAvailable,
                 onSupercomboToggle = onSupercomboToggle,
                 supercomboLatencyMs = supercomboLatencyMs,
+            )
+            SettingsCategory.DETECTION -> DetectionTrackingSection(
+                settings = settings,
+                onSettingsChanged = onSettingsChanged,
+            )
+            SettingsCategory.CAMERA -> CameraDisplaySection(
+                settings = settings,
+                onSettingsChanged = onSettingsChanged,
             )
             SettingsCategory.ALERTS -> AlertSection(
                 settings = settings,
                 onSettingsChanged = onSettingsChanged,
-            )
-            SettingsCategory.DISPLAY -> DisplaySection(
-                settings = settings,
-                onSettingsChanged = onSettingsChanged,
+                onPreviewAlert = onPreviewAlert,
             )
         }
     }
@@ -389,7 +474,7 @@ private fun ChoiceChipRow(
                 ),
             ) {
                 Column(
-                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 12.dp),
+                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 14.dp),
                     horizontalAlignment = Alignment.CenterHorizontally,
                 ) {
                     Text(
@@ -463,6 +548,7 @@ private fun ToggleSetting(
     description: String? = null,
     checked: Boolean,
     onCheckedChange: (Boolean) -> Unit,
+    enabled: Boolean = true,
 ) {
     Row(
         modifier = Modifier.fillMaxWidth(),
@@ -472,7 +558,7 @@ private fun ToggleSetting(
             Text(
                 text = label,
                 style = MaterialTheme.typography.bodyMedium,
-                color = NightVisionColors.Text,
+                color = if (enabled) NightVisionColors.Text else NightVisionColors.TextMuted,
             )
             description?.let {
                 Text(
@@ -485,6 +571,7 @@ private fun ToggleSetting(
         Switch(
             checked = checked,
             onCheckedChange = onCheckedChange,
+            enabled = enabled,
             colors = SwitchDefaults.colors(
                 checkedThumbColor = NightVisionColors.Background,
                 checkedTrackColor = NightVisionColors.Accent,
@@ -496,30 +583,47 @@ private fun ToggleSetting(
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// MODEL section
+// MODEL + BACKEND merged section
 // ──────────────────────────────────────────────────────────────────────────────
 
 @Composable
-private fun ModelSection(
+private fun ModelBackendSection(
     settings: InferenceSettings,
     currentModelName: String,
+    onSelectModel: () -> Unit,
     int8Available: Boolean,
     onQuantizationSelected: (ModelQuantization) -> Unit,
+    onSettingsChanged: (InferenceSettings) -> Unit,
+    supercomboEnabled: Boolean,
+    supercomboAvailable: Boolean,
+    onSupercomboToggle: (Boolean) -> Unit,
+    supercomboLatencyMs: Long,
 ) {
-    SectionHeader("模型设置")
+    SectionHeader("模型与后端")
 
     SectionCard(title = "当前模型") {
-        Text(
-            text = currentModelName,
-            style = MaterialTheme.typography.titleMedium,
-            fontWeight = FontWeight.Bold,
-            color = NightVisionColors.Accent,
-        )
-        Text(
-            text = "在推理设置主页可切换模型",
-            style = MaterialTheme.typography.labelSmall,
-            color = NightVisionColors.TextMuted,
-        )
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = currentModelName,
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.Bold,
+                    color = NightVisionColors.Accent,
+                )
+                Text(
+                    text = "仅显示已打包到应用的模型",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = NightVisionColors.TextMuted,
+                )
+            }
+            TextButton(onClick = onSelectModel) {
+                Text("切换模型", color = NightVisionColors.Accent)
+            }
+        }
     }
 
     SectionCard(title = "量化模式") {
@@ -552,18 +656,118 @@ private fun ModelSection(
             color = NightVisionColors.TextMuted,
         )
     }
+
+    SectionCard(title = "推理后端") {
+        Text(
+            text = "推理代理（自动 = GPU → NNAPI → CPU 回退）",
+            style = MaterialTheme.typography.labelSmall,
+            color = NightVisionColors.TextMuted,
+        )
+        ChoiceChipRow(
+            options = BackendPreference.entries.map { it.label to "" },
+            selectedIndex = settings.backendPreference.ordinal,
+            onSelect = { index ->
+                onSettingsChanged(settings.copy(
+                    backendPreference = BackendPreference.entries[index],
+                ))
+            },
+        )
+    }
+
+    SectionCard(title = "GPU 精度") {
+        Text(
+            text = "FP16 在 Adreno 750 上快 2 倍；FP32 更精确",
+            style = MaterialTheme.typography.labelSmall,
+            color = NightVisionColors.TextMuted,
+        )
+        ChoiceChipRow(
+            options = GpuPrecision.entries.map { it.label to "" },
+            selectedIndex = settings.gpuPrecision.ordinal,
+            onSelect = { index ->
+                onSettingsChanged(settings.copy(
+                    gpuPrecision = GpuPrecision.entries[index],
+                ))
+            },
+        )
+    }
+
+    SectionCard(title = "CPU 回退线程") {
+        Text(
+            text = "CPU 和不支持的代理操作使用；线程数越多不一定越快",
+            style = MaterialTheme.typography.labelSmall,
+            color = NightVisionColors.TextMuted,
+        )
+        ChoiceChipRow(
+            options = listOf("1" to "", "2" to "", "4" to "", "6" to ""),
+            selectedIndex = when (settings.cpuThreads) {
+                1 -> 0; 2 -> 1; 4 -> 2; 6 -> 3
+                else -> 2
+            },
+            onSelect = { index ->
+                val count = listOf(1, 2, 4, 6)[index]
+                onSettingsChanged(settings.copy(cpuThreads = count))
+            },
+        )
+    }
+
+    SectionCard(title = "超级组合") {
+        Text(
+            text = if (supercomboAvailable) {
+                "openpilot 前车检测 + 真实距离"
+            } else {
+                "当前轻量安装包未包含 supercombo 模型"
+            },
+            style = MaterialTheme.typography.labelSmall,
+            color = NightVisionColors.TextMuted,
+        )
+        ToggleSetting(
+            label = "启用 Supercombo",
+            checked = supercomboEnabled,
+            onCheckedChange = onSupercomboToggle,
+            enabled = supercomboAvailable,
+        )
+        if (supercomboEnabled && supercomboLatencyMs > 0) {
+            Text(
+                text = "延迟: ${supercomboLatencyMs}ms",
+                style = MaterialTheme.typography.labelSmall,
+                color = NightVisionColors.TextMuted,
+            )
+        }
+    }
+
+    SectionCard(title = "跳帧") {
+        Text(
+            text = "每 N 帧处理一次（值越大越省电，检测越少）",
+            style = MaterialTheme.typography.labelSmall,
+            color = NightVisionColors.TextMuted,
+        )
+        ChoiceChipRow(
+            options = listOf(
+                "1/1" to "每帧",
+                "1/2" to "隔一帧",
+                "1/3" to "隔两帧",
+            ),
+            selectedIndex = settings.frameSkip - 1,
+            onSelect = { index ->
+                onSettingsChanged(settings.copy(
+                    frameSkip = index + 1,
+                    detectionMode = DetectionMode.CUSTOM,
+                ))
+            },
+        )
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// DETECTION section
+// DETECTION + TRACKING merged section
 // ──────────────────────────────────────────────────────────────────────────────
 
 @Composable
-private fun DetectionSection(
+private fun DetectionTrackingSection(
     settings: InferenceSettings,
     onSettingsChanged: (InferenceSettings) -> Unit,
 ) {
-    SectionHeader("检测设置")
+    SectionHeader("检测与跟踪")
 
     SectionCard(title = "检测模式") {
         ChoiceChipRow(
@@ -678,19 +882,8 @@ private fun DetectionSection(
             },
         )
     }
-}
 
-// ──────────────────────────────────────────────────────────────────────────────
-// TRACKING section
-// ──────────────────────────────────────────────────────────────────────────────
-
-@Composable
-private fun TrackingSection(
-    settings: InferenceSettings,
-    onSettingsChanged: (InferenceSettings) -> Unit,
-) {
-    SectionHeader("跟踪设置")
-
+    // ── Tracking subsection ──
     SectionCard(title = "目标跟踪") {
         ToggleSetting(
             label = "时序跟踪",
@@ -765,15 +958,15 @@ private fun TrackingSection(
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// CAMERA section
+// CAMERA + DISPLAY merged section
 // ──────────────────────────────────────────────────────────────────────────────
 
 @Composable
-private fun CameraSection(
+private fun CameraDisplaySection(
     settings: InferenceSettings,
     onSettingsChanged: (InferenceSettings) -> Unit,
 ) {
-    SectionHeader("相机设置")
+    SectionHeader("相机与显示")
 
     SectionCard(title = "分析源质量") {
         ChoiceChipRow(
@@ -821,194 +1014,8 @@ private fun CameraSection(
             color = NightVisionColors.TextMuted,
         )
     }
-}
 
-// ──────────────────────────────────────────────────────────────────────────────
-// BACKEND section
-// ──────────────────────────────────────────────────────────────────────────────
-
-@Composable
-private fun BackendSection(
-    settings: InferenceSettings,
-    onSettingsChanged: (InferenceSettings) -> Unit,
-    supercomboEnabled: Boolean,
-    onSupercomboToggle: (Boolean) -> Unit,
-    supercomboLatencyMs: Long,
-) {
-    SectionHeader("后端设置")
-
-    SectionCard(title = "推理后端") {
-        Text(
-            text = "推理代理（自动 = GPU → NNAPI → CPU 回退）",
-            style = MaterialTheme.typography.labelSmall,
-            color = NightVisionColors.TextMuted,
-        )
-        ChoiceChipRow(
-            options = BackendPreference.entries.map { it.label to "" },
-            selectedIndex = settings.backendPreference.ordinal,
-            onSelect = { index ->
-                onSettingsChanged(settings.copy(
-                    backendPreference = BackendPreference.entries[index],
-                ))
-            },
-        )
-    }
-
-    SectionCard(title = "GPU 精度") {
-        Text(
-            text = "FP16 在 Adreno 750 上快 2 倍；FP32 更精确",
-            style = MaterialTheme.typography.labelSmall,
-            color = NightVisionColors.TextMuted,
-        )
-        ChoiceChipRow(
-            options = GpuPrecision.entries.map { it.label to "" },
-            selectedIndex = settings.gpuPrecision.ordinal,
-            onSelect = { index ->
-                onSettingsChanged(settings.copy(
-                    gpuPrecision = GpuPrecision.entries[index],
-                ))
-            },
-        )
-    }
-
-    SectionCard(title = "CPU 回退线程") {
-        Text(
-            text = "CPU 和不支持的代理操作使用；线程数越多不一定越快",
-            style = MaterialTheme.typography.labelSmall,
-            color = NightVisionColors.TextMuted,
-        )
-        ChoiceChipRow(
-            options = listOf("1" to "", "2" to "", "4" to "", "6" to ""),
-            selectedIndex = when (settings.cpuThreads) {
-                1 -> 0; 2 -> 1; 4 -> 2; 6 -> 3
-                else -> 2
-            },
-            onSelect = { index ->
-                val count = listOf(1, 2, 4, 6)[index]
-                onSettingsChanged(settings.copy(cpuThreads = count))
-            },
-        )
-    }
-
-    SectionCard(title = "超级组合") {
-        Text(
-            text = "openpilot 前车检测 + 真实距离 (需要 supercombo 模型文件)",
-            style = MaterialTheme.typography.labelSmall,
-            color = NightVisionColors.TextMuted,
-        )
-        ToggleSetting(
-            label = "启用 Supercombo",
-            checked = supercomboEnabled,
-            onCheckedChange = onSupercomboToggle,
-        )
-        if (supercomboEnabled && supercomboLatencyMs > 0) {
-            Text(
-                text = "延迟: ${supercomboLatencyMs}ms",
-                style = MaterialTheme.typography.labelSmall,
-                color = NightVisionColors.TextMuted,
-            )
-        }
-    }
-
-    SectionCard(title = "跳帧") {
-        Text(
-            text = "每 N 帧处理一次（值越大越省电，检测越少）",
-            style = MaterialTheme.typography.labelSmall,
-            color = NightVisionColors.TextMuted,
-        )
-        ChoiceChipRow(
-            options = listOf(
-                "1/1" to "每帧",
-                "1/2" to "隔一帧",
-                "1/3" to "隔两帧",
-            ),
-            selectedIndex = settings.frameSkip - 1,
-            onSelect = { index ->
-                onSettingsChanged(settings.copy(
-                    frameSkip = index + 1,
-                    detectionMode = DetectionMode.CUSTOM,
-                ))
-            },
-        )
-    }
-}
-
-// ──────────────────────────────────────────────────────────────────────────────
-// ALERTS section
-// ──────────────────────────────────────────────────────────────────────────────
-
-@Composable
-private fun AlertSection(
-    settings: InferenceSettings,
-    onSettingsChanged: (InferenceSettings) -> Unit,
-) {
-    SectionHeader("警报设置")
-
-    SectionCard(title = "骑行警报") {
-        ToggleSetting(
-            label = "接近目标震动提醒",
-            description = "仅对已确认、进入中央注意区域的目标触发",
-            checked = settings.vibrationAlertsEnabled,
-            onCheckedChange = { onSettingsChanged(settings.copy(vibrationAlertsEnabled = it)) },
-        )
-        HorizontalDivider(
-            color = NightVisionColors.Border,
-            thickness = 0.5.dp,
-            modifier = Modifier.padding(vertical = 4.dp),
-        )
-        ToggleSetting(
-            label = "接近目标声音提醒",
-            description = "注意/紧急/危险 三级不同警示音",
-            checked = settings.soundAlertsEnabled,
-            onCheckedChange = { onSettingsChanged(settings.copy(soundAlertsEnabled = it)) },
-        )
-    }
-
-    SectionCard(title = "报警距离 (米)") {
-        SliderWithValue(
-            label = "危险 · 立即反应",
-            value = settings.dangerDistanceM,
-            valueRange = 2f..30f,
-            steps = 27,
-            valueText = String.format(Locale.US, "%.0fm", settings.dangerDistanceM),
-            onValueChange = {
-                onSettingsChanged(settings.copy(dangerDistanceM = it))
-            },
-        )
-        SliderWithValue(
-            label = "紧急 · 减速观察",
-            value = settings.urgentDistanceM,
-            valueRange = 5f..60f,
-            steps = 54,
-            valueText = String.format(Locale.US, "%.0fm", settings.urgentDistanceM),
-            onValueChange = {
-                onSettingsChanged(settings.copy(urgentDistanceM = it))
-            },
-        )
-        SliderWithValue(
-            label = "注意 · 提前预警",
-            value = settings.cautionDistanceM,
-            valueRange = 10f..100f,
-            steps = 89,
-            valueText = String.format(Locale.US, "%.0fm", settings.cautionDistanceM),
-            onValueChange = {
-                onSettingsChanged(settings.copy(cautionDistanceM = it))
-            },
-        )
-    }
-}
-
-// ──────────────────────────────────────────────────────────────────────────────
-// DISPLAY section
-// ──────────────────────────────────────────────────────────────────────────────
-
-@Composable
-private fun DisplaySection(
-    settings: InferenceSettings,
-    onSettingsChanged: (InferenceSettings) -> Unit,
-) {
-    SectionHeader("显示设置")
-
+    // ── Display subsection ──
     SectionCard(title = "HUD 信息") {
         ToggleSetting(
             label = "类别标签",
@@ -1034,6 +1041,296 @@ private fun DisplaySection(
             label = "跟踪 ID",
             checked = settings.showTrackIds,
             onCheckedChange = { onSettingsChanged(settings.copy(showTrackIds = it)) },
+        )
+    }
+
+    SectionCard(title = "行车辅助") {
+        ToggleSetting(
+            label = "路线预测显示",
+            description = "在相机画面上叠加预测的行车轨迹 (需启用 Supercombo)",
+            checked = settings.showRoutePrediction,
+            onCheckedChange = { onSettingsChanged(settings.copy(showRoutePrediction = it)) },
+        )
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// ──────────────────────────────────────────────────────────────────────────────
+// ALERTS section
+// ──────────────────────────────────────────────────────────────────────────────
+
+@Composable
+private fun AlertSection(
+    settings: InferenceSettings,
+    onSettingsChanged: (InferenceSettings) -> Unit,
+    onPreviewAlert: (com.nightroadvision.app.alert.RiskSeverity) -> Unit = {},
+) {
+    SectionHeader("警报设置")
+
+    SectionCard(title = "骑行警报") {
+        ToggleSetting(
+            label = "接近目标震动提醒",
+            description = "仅对已确认、进入中央注意区域的目标触发",
+            checked = settings.vibrationAlertsEnabled,
+            onCheckedChange = { onSettingsChanged(settings.copy(vibrationAlertsEnabled = it)) },
+        )
+        HorizontalDivider(
+            color = NightVisionColors.Border,
+            thickness = 0.5.dp,
+            modifier = Modifier.padding(vertical = 4.dp),
+        )
+        ToggleSetting(
+            label = "接近目标声音提醒",
+            description = "注意/紧急/危险 三级不同警示音",
+            checked = settings.soundAlertsEnabled,
+            onCheckedChange = { onSettingsChanged(settings.copy(soundAlertsEnabled = it)) },
+        )
+    }
+
+    if (settings.soundAlertsEnabled) {
+        SectionCard(title = "警报音效风格") {
+            Text(
+                text = com.nightroadvision.app.alert.AlertSoundStyle.entries
+                    .first { it == settings.alertSoundStyle }.description,
+                style = MaterialTheme.typography.labelSmall,
+                color = NightVisionColors.TextMuted,
+            )
+            ChoiceChipRow(
+                options = com.nightroadvision.app.alert.AlertSoundStyle.entries
+                    .map { it.label to it.description },
+                selectedIndex = settings.alertSoundStyle.ordinal,
+                onSelect = { index ->
+                    onSettingsChanged(settings.copy(
+                        alertSoundStyle = com.nightroadvision.app.alert.AlertSoundStyle.entries[index]
+                    ))
+                },
+            )
+            // Preview buttons for each level
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                PreviewButton(
+                    label = "试听 · 注意",
+                    color = Color(0xFFDA6F25),
+                    onClick = { onPreviewAlert(com.nightroadvision.app.alert.RiskSeverity.CAUTION) },
+                    modifier = Modifier.weight(1f),
+                )
+                PreviewButton(
+                    label = "试听 · 紧急",
+                    color = Color(0xFFE8530E),
+                    onClick = { onPreviewAlert(com.nightroadvision.app.alert.RiskSeverity.URGENT) },
+                    modifier = Modifier.weight(1f),
+                )
+                PreviewButton(
+                    label = "试听 · 危险",
+                    color = Color(0xFFC92231),
+                    onClick = { onPreviewAlert(com.nightroadvision.app.alert.RiskSeverity.DANGER) },
+                    modifier = Modifier.weight(1f),
+                )
+            }
+        }
+    }
+
+    SectionCard(title = "报警距离 (米)") {
+        DistanceSliderWithPresets(
+            label = "危险 · 立即反应",
+            value = settings.dangerDistanceM,
+            valueRange = 1f..50f,
+            presets = listOf(3f, 5f, 8f, 12f, 20f),
+            onValueChange = {
+                onSettingsChanged(settings.copy(dangerDistanceM = it))
+            },
+        )
+        HorizontalDivider(
+            color = NightVisionColors.Border,
+            thickness = 0.5.dp,
+            modifier = Modifier.padding(vertical = 4.dp),
+        )
+        DistanceSliderWithPresets(
+            label = "紧急 · 减速观察",
+            value = settings.urgentDistanceM,
+            valueRange = 3f..80f,
+            presets = listOf(10f, 15f, 20f, 30f, 50f),
+            onValueChange = {
+                onSettingsChanged(settings.copy(urgentDistanceM = it))
+            },
+        )
+        HorizontalDivider(
+            color = NightVisionColors.Border,
+            thickness = 0.5.dp,
+            modifier = Modifier.padding(vertical = 4.dp),
+        )
+        DistanceSliderWithPresets(
+            label = "注意 · 提前预警",
+            value = settings.cautionDistanceM,
+            valueRange = 5f..150f,
+            presets = listOf(20f, 30f, 50f, 80f, 120f),
+            onValueChange = {
+                onSettingsChanged(settings.copy(cautionDistanceM = it))
+            },
+        )
+        Text(
+            text = "点击数值可手动输入精确距离",
+            style = MaterialTheme.typography.labelSmall,
+            color = NightVisionColors.TextMuted,
+        )
+    }
+}
+
+@Composable
+private fun PreviewButton(
+    label: String,
+    color: Color,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    Surface(
+        onClick = onClick,
+        modifier = modifier,
+        shape = RoundedCornerShape(8.dp),
+        color = color.copy(alpha = 0.12f),
+        border = BorderStroke(0.5.dp, color.copy(alpha = 0.4f)),
+    ) {
+        Row(
+            modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.Center,
+        ) {
+            Icon(
+                imageVector = Icons.Filled.PlayArrow,
+                contentDescription = null,
+                tint = color,
+                modifier = Modifier.size(16.dp),
+            )
+            Spacer(Modifier.width(4.dp))
+            Text(
+                text = label,
+                style = MaterialTheme.typography.labelSmall,
+                fontWeight = FontWeight.Medium,
+                color = color,
+            )
+        }
+    }
+}
+
+@Composable
+private fun DistanceSliderWithPresets(
+    label: String,
+    value: Float,
+    valueRange: ClosedFloatingPointRange<Float>,
+    presets: List<Float>,
+    onValueChange: (Float) -> Unit,
+) {
+    var showInputDialog by remember { mutableStateOf(false) }
+    var inputText by remember { mutableStateOf("") }
+
+    Column {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(
+                text = label,
+                style = MaterialTheme.typography.bodyMedium,
+                color = NightVisionColors.Text,
+            )
+            Text(
+                text = String.format(Locale.US, "%.0f m", value),
+                style = MaterialTheme.typography.bodyMedium,
+                fontWeight = FontWeight.Bold,
+                fontFamily = FontFamily.Monospace,
+                color = NightVisionColors.Accent,
+                modifier = Modifier.clickable {
+                    inputText = String.format(Locale.US, "%.0f", value)
+                    showInputDialog = true
+                },
+            )
+        }
+        Slider(
+            value = value,
+            onValueChange = onValueChange,
+            valueRange = valueRange,
+            colors = SliderDefaults.colors(
+                thumbColor = NightVisionColors.Accent,
+                activeTrackColor = NightVisionColors.Accent,
+                inactiveTrackColor = NightVisionColors.Border,
+            ),
+        )
+        // Preset quick-select buttons
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
+        ) {
+            presets.forEach { preset ->
+                val isSelected = kotlin.math.abs(value - preset) < 0.5f
+                Surface(
+                    modifier = Modifier
+                        .weight(1f)
+                        .clickable { onValueChange(preset) },
+                    shape = RoundedCornerShape(6.dp),
+                    color = if (isSelected) NightVisionColors.Accent.copy(alpha = 0.15f)
+                    else NightVisionColors.Background,
+                    border = BorderStroke(
+                        0.5.dp,
+                        if (isSelected) NightVisionColors.Accent else NightVisionColors.Border
+                    ),
+                ) {
+                    Text(
+                        text = "${preset.toInt()}",
+                        style = MaterialTheme.typography.labelSmall,
+                        fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal,
+                        color = if (isSelected) NightVisionColors.Accent
+                        else NightVisionColors.TextSecondary,
+                        textAlign = androidx.compose.ui.text.style.TextAlign.Center,
+                        modifier = Modifier.fillMaxWidth().padding(horizontal = 6.dp, vertical = 4.dp),
+                    )
+                }
+            }
+        }
+    }
+
+    // Numeric input dialog
+    if (showInputDialog) {
+        AlertDialog(
+            onDismissRequest = { showInputDialog = false },
+            title = {
+                Text(
+                    text = "输入距离 (米)",
+                    color = NightVisionColors.Text,
+                )
+            },
+            text = {
+                OutlinedTextField(
+                    value = inputText,
+                    onValueChange = { inputText = it.filter { c -> c.isDigit() || c == '.' } },
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                    singleLine = true,
+                    colors = OutlinedTextFieldDefaults.colors(
+                        focusedTextColor = NightVisionColors.Text,
+                        unfocusedTextColor = NightVisionColors.Text,
+                        focusedBorderColor = NightVisionColors.Accent,
+                        unfocusedBorderColor = NightVisionColors.Border,
+                    ),
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    inputText.toFloatOrNull()?.let { parsed ->
+                        onValueChange(parsed.coerceIn(valueRange))
+                    }
+                    showInputDialog = false
+                }) {
+                    Text("确定", color = NightVisionColors.Accent)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showInputDialog = false }) {
+                    Text("取消", color = NightVisionColors.TextSecondary)
+                }
+            },
+            containerColor = NightVisionColors.Surface,
         )
     }
 }

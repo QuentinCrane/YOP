@@ -2,7 +2,6 @@ package com.nightroadvision.app.alert
 
 import com.nightroadvision.app.inference.InferenceEngine
 import kotlin.math.abs
-import kotlin.math.sqrt
 
 enum class RiskSeverity {
     NONE,
@@ -42,15 +41,16 @@ class RidingRiskEvaluator {
     companion object {
         private const val CLEAR_CONFIRMATION_FRAMES = 3
 
-        // Typical real-world heights (meters) for distance estimation
-        // based on class ID (COCO classes)
+        // Typical visible heights (meters). Names work for both COCO and custom
+        // night-road class layouts, whose numeric vehicle IDs are different.
         private val CLASS_HEIGHTS = mapOf(
-            0 to 1.7f,   // person
-            1 to 1.5f,   // bicycle
-            2 to 1.5f,   // car (visible height)
-            3 to 1.4f,   // motorcycle
-            5 to 1.5f,   // bus (visible portion)
-            7 to 1.8f,   // truck (visible portion)
+            "person" to 1.7f,
+            "rider" to 1.7f,
+            "bicycle" to 1.5f,
+            "car" to 1.5f,
+            "motorcycle" to 1.4f,
+            "bus" to 1.5f,
+            "truck" to 1.8f,
         )
 
         // Default focal length factor (tunable via calibration)
@@ -72,16 +72,19 @@ class RidingRiskEvaluator {
     private var urgentThreshold = 18f
     private var cautionThreshold = 35f
 
+    @Synchronized
     fun setFocalFactor(factor: Float) {
         focalFactor = factor.coerceIn(50f, 2000f)
     }
 
+    @Synchronized
     fun getFocalFactor(): Float = focalFactor
 
+    @Synchronized
     fun setDistanceThresholds(dangerM: Float, urgentM: Float, cautionM: Float) {
-        dangerThreshold = dangerM.coerceIn(2f, 30f)
-        urgentThreshold = urgentM.coerceIn(5f, 60f)
-        cautionThreshold = cautionM.coerceIn(10f, 100f)
+        dangerThreshold = dangerM.coerceIn(1f, 50f)
+        urgentThreshold = urgentM.coerceIn(3f, 80f).coerceAtLeast(dangerThreshold)
+        cautionThreshold = cautionM.coerceIn(5f, 150f).coerceAtLeast(urgentThreshold)
     }
 
     /**
@@ -94,15 +97,17 @@ class RidingRiskEvaluator {
         detection: InferenceEngine.Detection,
         cameraHeight: Int,
     ): Float? {
-        val classHeight = CLASS_HEIGHTS[detection.classId] ?: return null
+        val classHeight = CLASS_HEIGHTS[detection.className.lowercase()] ?: return null
         val pixelHeight = abs(detection.y2 - detection.y1)
         if (pixelHeight < 1f) return null
 
         // Pinhole camera model: distance = (real_height * focal_factor) / pixel_height
-        // Detections are in camera pixel space (e.g. 1280x720 landscape sensor)
-        return (classHeight * focalFactor) / pixelHeight
+        // focalFactor is calibrated at 720px; scale it with the active analysis height.
+        val resolutionAdjustedFocal = focalFactor * cameraHeight.coerceAtLeast(1) / 720f
+        return (classHeight * resolutionAdjustedFocal) / pixelHeight
     }
 
+    @Synchronized
     fun evaluate(
         detections: List<InferenceEngine.Detection>,
         rotationDegrees: Int,
@@ -117,15 +122,15 @@ class RidingRiskEvaluator {
         var selectedScore = 0f
 
         for (detection in detections) {
-            val trackId = detection.trackId ?: continue
+            val trackId = detection.trackId
             val geometry = displayGeometry(detection, rotationDegrees, cameraWidth, cameraHeight)
-            val previousArea = previousAreaByTrack[trackId]
+            val previousArea = trackId?.let(previousAreaByTrack::get)
             val growthRatio = if (previousArea != null && previousArea > 0.002f) {
                 geometry.areaRatio / previousArea
             } else {
                 1f
             }
-            previousAreaByTrack[trackId] = geometry.areaRatio
+            if (trackId != null) previousAreaByTrack[trackId] = geometry.areaRatio
 
             val inAttentionZone = geometry.centerX in 0.22f..0.78f &&
                 geometry.centerY in 0.34f..1f
@@ -135,13 +140,13 @@ class RidingRiskEvaluator {
             val estimatedDist = estimateDistance(detection, cameraHeight)
 
             // Smooth distance with previous estimate
-            val prevDist = previousDistanceByTrack[trackId]
+            val prevDist = trackId?.let(previousDistanceByTrack::get)
             val smoothedDist = if (prevDist != null && estimatedDist != null) {
                 prevDist * 0.3f + estimatedDist * 0.7f
             } else {
                 estimatedDist
             }
-            if (smoothedDist != null) {
+            if (trackId != null && smoothedDist != null) {
                 previousDistanceByTrack[trackId] = smoothedDist
             }
 
@@ -203,7 +208,7 @@ class RidingRiskEvaluator {
                     reason = reason,
                     trackId = trackId,
                     className = detection.className,
-                    estimatedDistanceM = smoothedDist,
+                    estimatedDistanceM = dist,
                 )
             }
         }
@@ -219,6 +224,7 @@ class RidingRiskEvaluator {
         return selected
     }
 
+    @Synchronized
     fun reset() {
         previousAreaByTrack.clear()
         previousDistanceByTrack.clear()

@@ -1,7 +1,6 @@
 package com.nightroadvision.app.ui.theme
 
 import android.app.Activity
-import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.material3.lightColorScheme
@@ -117,9 +116,10 @@ fun NightRoadVisionTheme(
 
     // Ensure the system status bar and navigation bar also use dark surfaces.
     val view = LocalView.current
-    if (!view.isInEditMode) {
+    val activity = view.context as? Activity
+    if (!view.isInEditMode && activity != null) {
         SideEffect {
-            val window = (view.context as Activity).window
+            val window = activity.window
             window.statusBarColor = SurfaceDark20.toArgb()
             window.navigationBarColor = SurfaceDark20.toArgb()
             WindowCompat.getInsetsController(window, view).apply {

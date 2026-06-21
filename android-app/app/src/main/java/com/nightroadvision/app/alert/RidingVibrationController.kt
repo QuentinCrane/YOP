@@ -35,9 +35,16 @@ class RidingVibrationController(context: Context) {
     private var lastTrackId: Int? = null
     private var lastSeverity = RiskSeverity.NONE
 
+    @Synchronized
     fun update(risk: RidingRisk, enabled: Boolean) {
-        if (!enabled || risk.severity == RiskSeverity.NONE) {
-            if (risk.severity == RiskSeverity.NONE) lastSeverity = RiskSeverity.NONE
+        if (!enabled) {
+            if (lastSeverity != RiskSeverity.NONE) vibrator?.cancel()
+            lastTrackId = null
+            lastSeverity = RiskSeverity.NONE
+            return
+        }
+        if (risk.severity == RiskSeverity.NONE) {
+            lastSeverity = RiskSeverity.NONE
             return
         }
         val deviceVibrator = vibrator ?: return
@@ -83,6 +90,7 @@ class RidingVibrationController(context: Context) {
         FileLogger.i(TAG, "Haptic ${risk.severity}: track=${risk.trackId}, reason=${risk.reason}")
     }
 
+    @Synchronized
     fun reset() {
         lastAlertAtMs = 0L
         lastTrackId = null

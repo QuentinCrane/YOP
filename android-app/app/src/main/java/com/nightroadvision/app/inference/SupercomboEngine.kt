@@ -6,7 +6,6 @@ import ai.onnxruntime.OnnxTensor
 import ai.onnxruntime.OrtEnvironment
 import ai.onnxruntime.OrtSession
 import java.io.Closeable
-import java.nio.ByteBuffer
 
 /**
  * ONNX Runtime engine for the openpilot supercombo driving model.
@@ -19,39 +18,56 @@ class SupercomboEngine(private val context: Context) : Closeable {
     }
 
     private val env = OrtEnvironment.getEnvironment()
+    private val lock = Any()
     private var session: OrtSession? = null
-    private var isModelLoaded = false
+    @Volatile private var isModelLoaded = false
 
-    fun loadModel(assetPath: String): Boolean {
+    fun loadModel(assetPath: String): Boolean = synchronized(lock) {
         try {
             closeSession()
             val modelBytes = context.assets.open(assetPath).use { it.readBytes() }
             val opts = OrtSession.SessionOptions()
-            session = env.createSession(modelBytes, opts)
+            session = try {
+                env.createSession(modelBytes, opts)
+            } finally {
+                opts.close()
+            }
             isModelLoaded = true
 
             session?.let { s ->
+                val expectedInputs = setOf(
+                    SupercomboConstants.IN_IMGS,
+                    SupercomboConstants.IN_DESIRE,
+                    SupercomboConstants.IN_TRAFFIC_CONVENTION,
+                    SupercomboConstants.IN_INITIAL_STATE,
+                )
+                check(s.inputNames == expectedInputs) {
+                    "Unsupported supercombo inputs: ${s.inputNames}"
+                }
+                check(SupercomboConstants.OUT_OUTPUTS in s.outputNames) {
+                    "Missing supercombo output: ${SupercomboConstants.OUT_OUTPUTS}"
+                }
                 Log.i(TAG, "Model loaded: $assetPath")
                 Log.i(TAG, "Input names: ${s.inputNames}")
                 Log.i(TAG, "Output names: ${s.outputNames}")
             }
-            return true
+            true
         } catch (e: Exception) {
             Log.e(TAG, "Failed to load model: $assetPath", e)
-            isModelLoaded = false
-            return false
+            runCatching { closeSession() }
+            false
         }
     }
 
-    fun runInference(inputs: SupercomboPreprocessor.ModelInputs): SupercomboOutput? {
-        val s = session ?: return null
-        if (!isModelLoaded) return null
+    fun runInference(inputs: SupercomboPreprocessor.ModelInputs): SupercomboOutput? = synchronized(lock) {
+        val s = session ?: return@synchronized null
+        if (!isModelLoaded) return@synchronized null
 
         val startTime = System.nanoTime()
+        val inputTensors = mutableMapOf<String, OnnxTensor>()
+        var results: OrtSession.Result? = null
 
         try {
-            val inputTensors = mutableMapOf<String, OnnxTensor>()
-
             // Image: (1, 12, 128, 256)
             inputTensors[SupercomboConstants.IN_IMGS] = OnnxTensor.createTensor(
                 env, inputs.img, longArrayOf(
@@ -78,38 +94,39 @@ class SupercomboEngine(private val context: Context) : Closeable {
             )
 
             // Run inference
-            val results = s.run(inputTensors)
+            val inferenceResults = s.run(inputTensors)
+            results = inferenceResults
             val inferenceTimeMs = (System.nanoTime() - startTime) / 1_000_000
 
             // Extract the single flat output
-            val outputTensor = results.get(SupercomboConstants.OUT_OUTPUTS).orElse(null)
+            val outputTensor = inferenceResults.get(SupercomboConstants.OUT_OUTPUTS).orElse(null)
                 as? OnnxTensor
             if (outputTensor == null) {
                 Log.e(TAG, "Output tensor '${SupercomboConstants.OUT_OUTPUTS}' not found")
-                inputTensors.values.forEach { it.close() }
-                results.close()
-                return null
+                return@synchronized null
             }
 
             val outputArray = getFloatArray(outputTensor)
             Log.d(TAG, "Output size: ${outputArray.size}, first 10: ${outputArray.take(10).joinToString { "%.4f".format(it) }}")
             val leads = parseLeadOutput(outputArray)
+            val pathPoints = parsePlanOutput(outputArray)
 
             // Note: this ONNX model does NOT expose GRU hidden state as a separate output.
             // The recurrent state flows internally through the ONNX graph.
             // We pass zeros as initial_state; the model's internal GRU handles temporal context.
 
-            inputTensors.values.forEach { it.close() }
-            results.close()
-
-            return SupercomboOutput(
+            SupercomboOutput(
                 leads = leads,
+                pathPoints = pathPoints,
                 inferenceTimeMs = inferenceTimeMs
             )
 
         } catch (e: Exception) {
             Log.e(TAG, "Inference failed", e)
-            return null
+            null
+        } finally {
+            runCatching { results?.close() }
+            inputTensors.values.forEach { tensor -> runCatching { tensor.close() } }
         }
     }
 
@@ -195,6 +212,66 @@ class SupercomboEngine(private val context: Context) : Closeable {
         return leads
     }
 
+    /**
+     * Parse predicted driving path from the plan section of the output vector.
+     *
+     * Plan layout: 33 timesteps × 15 values × 5 MHP hypotheses (mean)
+     *            + same for std + 5 weights = 4955 floats.
+     *
+     * Each hypothesis is a candidate future trajectory. We pick the one with
+     * the highest weight and extract (x, y, z) positions at each timestep.
+     */
+    private fun parsePlanOutput(output: FloatArray): List<PathPoint> {
+        if (output.size < SupercomboConstants.PLAN_OFFSET + SupercomboConstants.PLAN_SIZE) {
+            return emptyList()
+        }
+
+        val numTimesteps = 33
+        val numValues = 15
+        val numHyp = 5
+
+        // Mean block: numTimesteps * numValues * numHyp floats
+        val meanSize = numTimesteps * numValues * numHyp  // 2475
+        // Std block: same size
+        // Weights: numHyp floats at end of plan section
+        val weightsOffset = SupercomboConstants.PLAN_OFFSET + meanSize * 2
+
+        // Find best hypothesis by weight
+        var bestHyp = 0
+        var bestWeight = Float.NEGATIVE_INFINITY
+        for (h in 0 until numHyp) {
+            val w = output[weightsOffset + h]
+            if (w > bestWeight) {
+                bestWeight = w
+                bestHyp = h
+            }
+        }
+
+        // Extract path points from best hypothesis
+        val points = mutableListOf<PathPoint>()
+        val hypOffset = SupercomboConstants.PLAN_OFFSET + bestHyp * numValues
+
+        for (t in 0 until numTimesteps) {
+            val base = hypOffset + t * numValues * numHyp
+            if (base + 2 >= output.size) break
+
+            val x = output[base + 0]  // forward distance (m)
+            val y = output[base + 1]  // lateral offset (m)
+            val z = output[base + 2]  // vertical offset (m)
+
+            // Skip points that are essentially zero (padding)
+            if (x == 0f && y == 0f) continue
+
+            points.add(PathPoint(
+                x = x, y = y, z = z,
+                timestepsFromNow = t * 0.5f,  // ~20Hz model → 0.5s per step
+            ))
+        }
+
+        Log.d(TAG, "Parsed ${points.size} path points from plan (best hyp=$bestHyp, weight=${"%.3f".format(bestWeight)})")
+        return points
+    }
+
     private fun sigmoid(x: Float): Float {
         return (1.0f / (1.0f + Math.exp(-x.toDouble()))).toFloat()
     }
@@ -209,7 +286,7 @@ class SupercomboEngine(private val context: Context) : Closeable {
         return arr
     }
 
-    val isReady: Boolean get() = isModelLoaded && session != null
+    val isReady: Boolean get() = synchronized(lock) { isModelLoaded && session != null }
 
     private fun closeSession() {
         session?.close()
@@ -218,7 +295,7 @@ class SupercomboEngine(private val context: Context) : Closeable {
     }
 
     override fun close() {
-        closeSession()
+        synchronized(lock) { closeSession() }
     }
 
     data class LeadVehicle(
@@ -230,8 +307,18 @@ class SupercomboEngine(private val context: Context) : Closeable {
         val approxBoxWidth: Float, val approxBoxHeight: Float
     )
 
+    /**
+     * A single point on the predicted driving path (vehicle frame).
+     * x = forward distance (m), y = lateral offset (m).
+     */
+    data class PathPoint(
+        val x: Float, val y: Float, val z: Float,
+        val timestepsFromNow: Float,
+    )
+
     data class SupercomboOutput(
         val leads: List<LeadVehicle>,
+        val pathPoints: List<PathPoint>,
         val inferenceTimeMs: Long
     )
 }

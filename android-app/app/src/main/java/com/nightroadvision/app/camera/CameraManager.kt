@@ -105,31 +105,40 @@ class CameraManager(
     @Volatile private var requestedAnalysisWidth = analysisWidth
     @Volatile private var requestedAnalysisHeight = analysisHeight
     @Volatile private var manualZoomRatio = 1f
-    @Volatile
-    private var analysisExecutor = Executors.newSingleThreadExecutor()
+    private val analysisExecutor = Executors.newSingleThreadExecutor()
+    @Volatile private var released = false
+    private val modelDimensionsLock = Any()
 
     // Model input dimensions for letterboxing (updatable when model changes)
     @Volatile
     var targetModelWidth = modelInputWidth
-        set(value) {
-            if (field != value) {
-                FileLogger.i(TAG, "targetModelWidth changed: $field -> $value")
-                field = value
-                cachedFloatBuffer = null  // invalidate pooled buffer
-                cachedModelRow = null
-                invalidatePixelMap()
-            }
-        }
+        private set
     @Volatile
     var targetModelHeight = modelInputHeight
-        set(value) {
-            if (field != value) {
-                FileLogger.i(TAG, "targetModelHeight changed: $field -> $value")
-                field = value
-                cachedFloatBuffer = null  // invalidate pooled buffer
-                invalidatePixelMap()
-            }
+        private set
+
+    /** Atomically updates the model tensor size used by the camera preprocessor. */
+    fun updateTargetModelDimensions(width: Int, height: Int) {
+        val sanitizedWidth = width.coerceAtLeast(1)
+        val sanitizedHeight = height.coerceAtLeast(1)
+        synchronized(modelDimensionsLock) {
+            if (targetModelWidth == sanitizedWidth && targetModelHeight == sanitizedHeight) return
+            FileLogger.i(
+                TAG,
+                "Model target changed: ${targetModelWidth}x${targetModelHeight} -> " +
+                    "${sanitizedWidth}x${sanitizedHeight}",
+            )
+            targetModelWidth = sanitizedWidth
+            targetModelHeight = sanitizedHeight
+            cachedFloatBuffer = null
+            cachedModelRow = null
+            invalidatePixelMap()
         }
+    }
+
+    private fun targetModelDimensions(): Pair<Int, Int> = synchronized(modelDimensionsLock) {
+        targetModelWidth to targetModelHeight
+    }
 
     // Actual frame dimensions from the camera (may differ from ANALYSIS_WIDTH/HEIGHT)
     @Volatile
@@ -199,12 +208,15 @@ class CameraManager(
         previewSurfaceProvider: Preview.SurfaceProvider,
         targetRotation: Int = Surface.ROTATION_0,
     ) {
+        if (released) return
         this.previewSurfaceProvider = previewSurfaceProvider
         this.targetRotation = targetRotation
         val cameraProviderFuture = ProcessCameraProvider.getInstance(context)
         cameraProviderFuture.addListener({
+            if (released) return@addListener
             try {
                 val provider = cameraProviderFuture.get()
+                if (released) return@addListener
                 cameraProvider = provider
                 discoverCameras(provider)
                 bindUseCases(provider, previewSurfaceProvider)
@@ -315,7 +327,9 @@ class CameraManager(
                 _currentLens.value = automatic
             } else {
                 _availableLenses.value = options
-                _currentLens.value = options.first()
+                _currentLens.value = options.firstOrNull {
+                    it.logicalCameraId == defaultId && it.physicalCameraId == null
+                } ?: options.first()
             }
             FileLogger.i(TAG, "Rear lens options: ${options.joinToString { "${it.label}[${it.id}]" }}")
         } catch (e: Exception) {
@@ -349,10 +363,12 @@ class CameraManager(
             }
         }
 
-        // Full camera switch — rebind use cases
-        _currentLens.value = lens
         val provider = cameraProvider ?: return false
         val surfaceProvider = previewSurfaceProvider ?: return false
+        if (released) return false
+
+        // Full camera switch — rebind use cases
+        _currentLens.value = lens
         FileLogger.i(TAG, "Switching camera to ${lens.label} (${lens.id})")
 
         if (bindUseCases(provider, surfaceProvider)) {
@@ -502,6 +518,7 @@ class CameraManager(
         provider: ProcessCameraProvider,
         previewSurfaceProvider: Preview.SurfaceProvider
     ): Boolean {
+        if (released || analysisExecutor.isShutdown) return false
         val previewResolutionSelector = ResolutionSelector.Builder()
             .setAspectRatioStrategy(AspectRatioStrategy.RATIO_16_9_FALLBACK_AUTO_STRATEGY)
             .setResolutionStrategy(
@@ -576,7 +593,7 @@ class CameraManager(
 
     private fun applySelectedZoom() {
         val ratio = if (manualZoomRatio > 1.001f) manualZoomRatio else (_currentLens.value?.zoomRatio ?: 1f)
-        runCatching { camera?.cameraControl?.setZoomRatio(ratio) }
+        setZoomRatio(ratio)
     }
 
     /** Applies a user-selected detection zoom and remembers it across camera rebinds. */
@@ -718,11 +735,8 @@ class CameraManager(
 
         // Build NV21 byte array for supercombo preprocessor (pooled)
         val nv21Size = width * height * 3 / 2
-        val nv21 = if (cachedNv21 != null && cachedNv21Size == nv21Size) {
-            cachedNv21!!
-        } else {
-            ByteArray(nv21Size).also { cachedNv21 = it; cachedNv21Size = nv21Size }
-        }
+        val nv21 = cachedNv21?.takeIf { cachedNv21Size == nv21Size }
+            ?: ByteArray(nv21Size).also { cachedNv21 = it; cachedNv21Size = nv21Size }
         var pos = 0
         // Bulk-copy Y plane when stride equals width (common case)
         if (yRowStride == width && yPixelStride == 1 && yBuffer.remaining() >= width * height) {
@@ -762,8 +776,7 @@ class CameraManager(
     ): ByteBuffer {
         val srcW = imageProxy.width
         val srcH = imageProxy.height
-        val modelW = targetModelWidth
-        val modelH = targetModelHeight
+        val (modelW, modelH) = targetModelDimensions()
         val planes = imageProxy.planes
         val yPlane = planes[0]
         val uPlane = planes[1]
@@ -800,15 +813,12 @@ class CameraManager(
 
         // Reuse pooled buffer if dimensions match, otherwise allocate new one
         val requiredSize = modelH * modelW * 3 * 4
-        val buffer = if (cachedFloatBuffer != null &&
-            cachedBufferModelW == modelW && cachedBufferModelH == modelH) {
-            cachedFloatBuffer!!
-        } else {
-            ByteBuffer.allocateDirect(requiredSize).also {
+        val buffer = cachedFloatBuffer?.takeIf {
+            cachedBufferModelW == modelW && cachedBufferModelH == modelH
+        } ?: ByteBuffer.allocateDirect(requiredSize).also {
                 cachedFloatBuffer = it
                 cachedBufferModelW = modelW
                 cachedBufferModelH = modelH
-            }
         }
         buffer.clear()
         buffer.order(ByteOrder.nativeOrder())
@@ -896,8 +906,7 @@ class CameraManager(
         outputHeight: Int,
         rotationDegrees: Int,
     ): FrameGeometry {
-        val modelW = targetModelWidth.coerceAtLeast(1)
-        val modelH = targetModelHeight.coerceAtLeast(1)
+        val (modelW, modelH) = targetModelDimensions()
         val width = outputWidth.coerceAtLeast(1)
         val height = outputHeight.coerceAtLeast(1)
         val scaleX = modelW.toFloat() / width
@@ -930,8 +939,10 @@ class CameraManager(
      * Enable or disable the camera flashlight (torch).
      */
     fun setTorchEnabled(enabled: Boolean): Boolean {
+        val activeCamera = camera ?: return false
+        if (!activeCamera.cameraInfo.hasFlashUnit()) return false
         return try {
-            camera?.cameraControl?.enableTorch(enabled)
+            activeCamera.cameraControl.enableTorch(enabled)
             true
         } catch (e: Exception) {
             Log.e(TAG, "Torch control failed", e)
@@ -1050,6 +1061,7 @@ class CameraManager(
      * Release all camera resources.
      */
     fun stopCamera() {
+        analysisUseCase?.clearAnalyzer()
         cameraProvider?.unbindAll()
         camera = null
         previewUseCase = null
@@ -1061,7 +1073,11 @@ class CameraManager(
      * Call this only when the CameraManager will never be used again.
      */
     fun release() {
+        if (released) return
+        released = true
         stopCamera()
         analysisExecutor.shutdown()
+        previewSurfaceProvider = null
+        cameraProvider = null
     }
 }
