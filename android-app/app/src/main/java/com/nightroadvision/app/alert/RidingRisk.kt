@@ -2,18 +2,21 @@ package com.nightroadvision.app.alert
 
 import com.nightroadvision.app.inference.InferenceEngine
 import kotlin.math.abs
+import kotlin.math.sqrt
 
 enum class RiskSeverity {
     NONE,
-    CAUTION,
-    CRITICAL,
+    CAUTION,   // 注意：目标进入注意区域
+    URGENT,    // 紧急：目标快速接近或较近
+    DANGER,    // 危险：目标非常近，需要立即反应
 }
 
 enum class RiskReason {
     NONE,
     IN_ATTENTION_ZONE,
-    VERY_NEAR,
     APPROACHING_QUICKLY,
+    VERY_NEAR,
+    IMMINENT,
 }
 
 data class RidingRisk(
@@ -21,23 +24,84 @@ data class RidingRisk(
     val reason: RiskReason = RiskReason.NONE,
     val trackId: Int? = null,
     val className: String = "",
+    val estimatedDistanceM: Float? = null,  // 估算距离（米）
 )
 
 /**
  * Evaluates tracked people and vehicles in display space.
  *
- * This intentionally produces qualitative risk only. Bounding-box size is not an
- * accurate physical distance, but its position and growth are useful for selecting
- * a target that deserves the rider's attention.
+ * Produces three risk levels:
+ * - CAUTION: object entered the attention zone
+ * - URGENT: object is approaching quickly or moderately close
+ * - DANGER: object is very close, immediate reaction needed
+ *
+ * Includes basic distance estimation based on bounding box size
+ * and known object class heights.
  */
 class RidingRiskEvaluator {
     companion object {
         private const val CLEAR_CONFIRMATION_FRAMES = 3
+
+        // Typical real-world heights (meters) for distance estimation
+        // based on class ID (COCO classes)
+        private val CLASS_HEIGHTS = mapOf(
+            0 to 1.7f,   // person
+            1 to 1.5f,   // bicycle
+            2 to 1.5f,   // car (visible height)
+            3 to 1.4f,   // motorcycle
+            5 to 1.5f,   // bus (visible portion)
+            7 to 1.8f,   // truck (visible portion)
+        )
+
+        // Default focal length factor (tunable via calibration)
+        // Calibrated for typical phone camera (~66° vertical FOV, 720px height)
+        // distance = (real_height * focal_factor) / pixel_height_in_camera_space
+        private const val DEFAULT_FOCAL_FACTOR = 588f
     }
 
     private val previousAreaByTrack = mutableMapOf<Int, Float>()
+    private val previousDistanceByTrack = mutableMapOf<Int, Float>()
     private var lastRisk = RidingRisk()
     private var consecutiveClearFrames = 0
+
+    // Calibration: focal length factor (adjustable)
+    private var focalFactor = DEFAULT_FOCAL_FACTOR
+
+    // Configurable distance thresholds (meters)
+    private var dangerThreshold = 8f
+    private var urgentThreshold = 18f
+    private var cautionThreshold = 35f
+
+    fun setFocalFactor(factor: Float) {
+        focalFactor = factor.coerceIn(50f, 2000f)
+    }
+
+    fun getFocalFactor(): Float = focalFactor
+
+    fun setDistanceThresholds(dangerM: Float, urgentM: Float, cautionM: Float) {
+        dangerThreshold = dangerM.coerceIn(2f, 30f)
+        urgentThreshold = urgentM.coerceIn(5f, 60f)
+        cautionThreshold = cautionM.coerceIn(10f, 100f)
+    }
+
+    /**
+     * Estimate distance to a detected object based on its bounding box size
+     * and known real-world class height.
+     *
+     * Uses the pinhole camera model: distance = (real_height * focal_factor) / pixel_height
+     */
+    private fun estimateDistance(
+        detection: InferenceEngine.Detection,
+        cameraHeight: Int,
+    ): Float? {
+        val classHeight = CLASS_HEIGHTS[detection.classId] ?: return null
+        val pixelHeight = abs(detection.y2 - detection.y1)
+        if (pixelHeight < 1f) return null
+
+        // Pinhole camera model: distance = (real_height * focal_factor) / pixel_height
+        // Detections are in camera pixel space (e.g. 1280x720 landscape sensor)
+        return (classHeight * focalFactor) / pixelHeight
+    }
 
     fun evaluate(
         detections: List<InferenceEngine.Detection>,
@@ -47,6 +111,7 @@ class RidingRiskEvaluator {
     ): RidingRisk {
         val liveTrackIds = detections.mapNotNull { it.trackId }.toSet()
         previousAreaByTrack.keys.retainAll(liveTrackIds)
+        previousDistanceByTrack.keys.retainAll(liveTrackIds)
 
         var selected = RidingRisk()
         var selectedScore = 0f
@@ -66,36 +131,60 @@ class RidingRiskEvaluator {
                 geometry.centerY in 0.34f..1f
             if (!inAttentionZone) continue
 
+            // Estimate distance
+            val estimatedDist = estimateDistance(detection, cameraHeight)
+
+            // Smooth distance with previous estimate
+            val prevDist = previousDistanceByTrack[trackId]
+            val smoothedDist = if (prevDist != null && estimatedDist != null) {
+                prevDist * 0.3f + estimatedDist * 0.7f
+            } else {
+                estimatedDist
+            }
+            if (smoothedDist != null) {
+                previousDistanceByTrack[trackId] = smoothedDist
+            }
+
             val severity: RiskSeverity
             val reason: RiskReason
 
-            // Use real distance from supercombo if available
-            val dist = detection.distanceMeters
+            // Use real distance from supercombo if available, otherwise use estimated
+            val dist = detection.distanceMeters ?: smoothedDist
+
             if (dist != null) {
                 when {
-                    dist < 5f -> {
-                        severity = RiskSeverity.CRITICAL
+                    dist < dangerThreshold -> {
+                        severity = RiskSeverity.DANGER
+                        reason = RiskReason.IMMINENT
+                    }
+                    dist < urgentThreshold -> {
+                        severity = RiskSeverity.URGENT
                         reason = RiskReason.VERY_NEAR
                     }
-                    dist < 15f -> {
+                    dist < cautionThreshold -> {
                         severity = RiskSeverity.CAUTION
                         reason = RiskReason.IN_ATTENTION_ZONE
                     }
                     else -> continue
                 }
             } else {
-                // Fallback to bbox-based heuristics
-                val isVeryNear = geometry.maxDimension >= 0.42f || geometry.areaRatio >= 0.14f
-                val isApproachingQuickly = growthRatio >= 1.32f && geometry.areaRatio >= 0.025f
-                val isCaution = geometry.maxDimension >= 0.20f || geometry.areaRatio >= 0.035f
+                // Fallback to bbox-based heuristics (no distance available)
+                val isImminent = geometry.maxDimension >= 0.50f || geometry.areaRatio >= 0.18f
+                val isVeryNear = geometry.maxDimension >= 0.38f || geometry.areaRatio >= 0.12f
+                val isApproachingQuickly = growthRatio >= 1.28f && geometry.areaRatio >= 0.02f
+                val isCaution = geometry.maxDimension >= 0.18f || geometry.areaRatio >= 0.03f
 
                 when {
+                    isImminent -> {
+                        severity = RiskSeverity.DANGER
+                        reason = RiskReason.IMMINENT
+                    }
                     isVeryNear -> {
-                        severity = RiskSeverity.CRITICAL
+                        severity = RiskSeverity.URGENT
                         reason = RiskReason.VERY_NEAR
                     }
                     isApproachingQuickly -> {
-                        severity = RiskSeverity.CRITICAL
+                        severity = RiskSeverity.URGENT
                         reason = RiskReason.APPROACHING_QUICKLY
                     }
                     isCaution -> {
@@ -114,6 +203,7 @@ class RidingRiskEvaluator {
                     reason = reason,
                     trackId = trackId,
                     className = detection.className,
+                    estimatedDistanceM = smoothedDist,
                 )
             }
         }
@@ -131,6 +221,7 @@ class RidingRiskEvaluator {
 
     fun reset() {
         previousAreaByTrack.clear()
+        previousDistanceByTrack.clear()
         lastRisk = RidingRisk()
         consecutiveClearFrames = 0
     }

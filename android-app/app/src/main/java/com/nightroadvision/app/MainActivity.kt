@@ -58,7 +58,7 @@ private fun NoPermissionScreen() {
         contentAlignment = androidx.compose.ui.Alignment.Center
     ) {
         androidx.compose.material3.Text(
-            text = "Camera permission is required for Night Road Vision.\nPlease grant the permission and restart the app.",
+            text = "夜视路况需要相机权限才能运行。\n请授予权限后重新启动应用。",
             color = androidx.compose.ui.graphics.Color.White,
             style = androidx.compose.material3.MaterialTheme.typography.bodyLarge
         )

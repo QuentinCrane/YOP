@@ -216,12 +216,14 @@ class CameraManager(
     }
 
     /**
-     * Discover available back cameras and identify the ultra-wide lens.
+     * Discover available back cameras using Camera2 API directly.
+     * Enumerates all physical cameras and groups them by focal length.
      */
     private fun discoverCameras(provider: ProcessCameraProvider) {
         try {
             val camera2Manager = context.getSystemService(Context.CAMERA_SERVICE)
                 as android.hardware.camera2.CameraManager
+
             val backInfos = provider.availableCameraInfos.filter {
                 it.lensFacing == CameraSelector.LENS_FACING_BACK
             }
@@ -231,6 +233,7 @@ class CameraManager(
                 return
             }
 
+            // Get default camera info
             val defaultInfo = CameraSelector.DEFAULT_BACK_CAMERA.filter(backInfos).firstOrNull()
                 ?: backInfos.first()
             val defaultId = cameraId(defaultInfo)
@@ -239,64 +242,81 @@ class CameraManager(
                 .get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)
                 ?.firstOrNull()
 
-            val automatic = LensOption(
-                id = "logical:$defaultId",
-                logicalCameraId = defaultId,
-                focalLengthMm = defaultFocal,
-                label = "AUTO",
-                description = "自动镜头",
-            )
+            // Enumerate ALL physical camera IDs from Camera2 API
+            val allCameraIds = camera2Manager.cameraIdList
+            val backCameraOptions = mutableListOf<LensOption>()
 
-            val physicalIds = if (android.os.Build.VERSION.SDK_INT >= 28) {
-                defaultChars.physicalCameraIds
-            } else {
-                emptySet()
-            }
-            val physicalOptions = physicalIds.mapNotNull { physicalId ->
+            for (camId in allCameraIds) {
                 runCatching {
-                    val chars = camera2Manager.getCameraCharacteristics(physicalId)
-                    if (chars.get(CameraCharacteristics.LENS_FACING) != CameraMetadata.LENS_FACING_BACK) {
-                        return@runCatching null
+                    val chars = camera2Manager.getCameraCharacteristics(camId)
+                    val facing = chars.get(CameraCharacteristics.LENS_FACING)
+                    if (facing != CameraMetadata.LENS_FACING_BACK) return@runCatching
+
+                    val focal = chars
+                        .get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)
+                        ?.firstOrNull()
+
+                    // Check if this is a physical camera within a logical multi-camera
+                    val isPhysical = defaultChars.physicalCameraIds.contains(camId)
+                    val isLogical = camId == defaultId
+
+                    if (isLogical || isPhysical) {
+                        backCameraOptions.add(
+                            LensOption(
+                                id = if (isPhysical) "physical:$defaultId:$camId" else "logical:$camId",
+                                logicalCameraId = if (isPhysical) defaultId else camId,
+                                physicalCameraId = if (isPhysical) camId else null,
+                                focalLengthMm = focal,
+                                label = lensLabel(focal, defaultFocal),
+                                description = lensDescription(focal, defaultFocal),
+                            )
+                        )
                     }
-                    val focal = chars
-                        .get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)
-                        ?.firstOrNull()
-                    LensOption(
-                        id = "physical:$defaultId:$physicalId",
-                        logicalCameraId = defaultId,
-                        physicalCameraId = physicalId,
-                        focalLengthMm = focal,
-                        label = lensLabel(focal, defaultFocal),
-                        description = lensDescription(focal, defaultFocal),
-                    )
-                }.getOrNull()
-            }.filterNotNull().distinctBy { it.id }.sortedBy { it.focalLengthMm ?: Float.MAX_VALUE }
+                }
+            }
 
-            val logicalOptions = backInfos.mapNotNull { info ->
-                runCatching {
-                    val id = cameraId(info)
-                    val chars = camera2Manager.getCameraCharacteristics(id)
-                    val focal = chars
-                        .get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)
-                        ?.firstOrNull()
-                    LensOption(
-                        id = "logical:$id",
-                        logicalCameraId = id,
-                        focalLengthMm = focal,
-                        label = lensLabel(focal, defaultFocal),
-                        description = lensDescription(focal, defaultFocal),
-                    )
-                }.getOrNull()
-            }.distinctBy { it.id }.sortedBy { it.focalLengthMm ?: Float.MAX_VALUE }
+            // If only one camera found via Camera2, try CameraX info for more details
+            if (backCameraOptions.size <= 1) {
+                for (info in backInfos) {
+                    runCatching {
+                        val id = cameraId(info)
+                        if (backCameraOptions.any { it.logicalCameraId == id }) return@runCatching
+                        val chars = camera2Manager.getCameraCharacteristics(id)
+                        val focal = chars
+                            .get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)
+                            ?.firstOrNull()
+                        backCameraOptions.add(
+                            LensOption(
+                                id = "logical:$id",
+                                logicalCameraId = id,
+                                focalLengthMm = focal,
+                                label = lensLabel(focal, defaultFocal),
+                                description = lensDescription(focal, defaultFocal),
+                            )
+                        )
+                    }
+                }
+            }
 
-            val options = if (physicalOptions.size > 1) {
-                listOf(automatic) + physicalOptions
+            val options = backCameraOptions
+                .distinctBy { it.id }
+                .sortedBy { it.focalLengthMm ?: Float.MAX_VALUE }
+
+            if (options.isEmpty()) {
+                // Fallback: single automatic option
+                val automatic = LensOption(
+                    id = "logical:$defaultId",
+                    logicalCameraId = defaultId,
+                    focalLengthMm = defaultFocal,
+                    label = "AUTO",
+                    description = "自动镜头",
+                )
+                _availableLenses.value = listOf(automatic)
+                _currentLens.value = automatic
             } else {
-                logicalOptions.ifEmpty { listOf(automatic) }
-            }.distinctBy { it.id }
-
-            _availableLenses.value = options
-            _currentLens.value = options.firstOrNull { it.id == automatic.id } ?: options.first()
+                _availableLenses.value = options
+                _currentLens.value = options.first()
+            }
             FileLogger.i(TAG, "Rear lens options: ${options.joinToString { "${it.label}[${it.id}]" }}")
         } catch (e: Exception) {
             Log.e(TAG, "Camera discovery failed", e)
@@ -304,12 +324,16 @@ class CameraManager(
         }
     }
 
-    /** Select a concrete rear lens or logical-camera zoom preset. */
+    /**
+     * Select a concrete rear lens or logical-camera zoom preset.
+     * Returns true if the switch was successful.
+     */
     fun switchCamera(lens: LensOption): Boolean {
-        if (lens !in _availableLenses.value) return false
+        // Allow switching even if not in available list (for dynamically created zoom presets)
         val previous = _currentLens.value
         if (lens.id == previous?.id) return true
 
+        // If same logical camera with zoom change, just set zoom ratio
         if (lens.logicalCameraId == previous?.logicalCameraId &&
             lens.physicalCameraId == previous.physicalCameraId &&
             lens.zoomRatio != null
@@ -317,39 +341,141 @@ class CameraManager(
             return runCatching {
                 camera?.cameraControl?.setZoomRatio(lens.zoomRatio)
                 _currentLens.value = lens
+                FileLogger.i(TAG, "Zoom changed to ${lens.label} (${lens.zoomRatio}×)")
                 true
-            }.getOrElse { false }
+            }.getOrElse {
+                FileLogger.e(TAG, "Zoom change failed: ${it.message}")
+                false
+            }
         }
 
+        // Full camera switch — rebind use cases
         _currentLens.value = lens
         val provider = cameraProvider ?: return false
         val surfaceProvider = previewSurfaceProvider ?: return false
         FileLogger.i(TAG, "Switching camera to ${lens.label} (${lens.id})")
-        if (bindUseCases(provider, surfaceProvider)) return true
 
+        if (bindUseCases(provider, surfaceProvider)) {
+            // Apply zoom if the new lens has a zoom ratio
+            lens.zoomRatio?.let { ratio ->
+                runCatching { camera?.cameraControl?.setZoomRatio(ratio) }
+            }
+            return true
+        }
+
+        // Switch failed — restore previous
+        FileLogger.w(TAG, "Camera switch failed, restoring previous")
         _currentLens.value = previous
         if (previous != null) bindUseCases(provider, surfaceProvider)
         return false
     }
 
-    /** Cycle to the next available rear camera. */
+    /**
+     * Cycle to the next available rear camera.
+     * If the switch fails, tries the next option, and so on.
+     */
     fun cycleCamera(): LensOption? {
         val options = _availableLenses.value
-        if (options.isEmpty()) return null
+        if (options.size <= 1) {
+            // Only one option — try zoom-based cycling
+            return cycleZoom()
+        }
         val currentIndex = options.indexOfFirst { it.id == _currentLens.value?.id }
-        val next = options[(currentIndex + 1) % options.size]
-        return if (switchCamera(next)) next else _currentLens.value
+        // Try each option starting from the next one
+        for (i in 1 until options.size) {
+            val nextIndex = (currentIndex + i) % options.size
+            val next = options[nextIndex]
+            if (switchCamera(next)) return next
+        }
+        return _currentLens.value
+    }
+
+    /**
+     * Cycle through zoom presets when only one logical camera is available.
+     * Many devices expose multiple physical cameras through zoom ratios.
+     */
+    private fun cycleZoom(): LensOption? {
+        val options = _availableLenses.value
+        if (options.isEmpty()) return null
+
+        // If we have zoom presets, cycle through them
+        val zoomOptions = options.filter { it.zoomRatio != null }
+        if (zoomOptions.isNotEmpty()) {
+            val currentIndex = zoomOptions.indexOfFirst { it.id == _currentLens.value?.id }
+            val next = zoomOptions[(currentIndex + 1) % zoomOptions.size]
+            return if (switchCamera(next)) next else _currentLens.value
+        }
+
+        // Otherwise, try to add zoom presets based on camera capabilities
+        val zoomState = camera?.cameraInfo?.zoomState?.value ?: return null
+        val currentZoom = _currentLens.value?.zoomRatio ?: 1f
+        val ratios = buildList {
+            if (zoomState.minZoomRatio < 0.95f) add(zoomState.minZoomRatio)
+            add(1f)
+            if (zoomState.maxZoomRatio >= 1.5f) add(1.5f)
+            if (zoomState.maxZoomRatio >= 2f) add(2f)
+            if (zoomState.maxZoomRatio >= 3f) add(3f)
+        }.distinct().filter { it in zoomState.minZoomRatio..zoomState.maxZoomRatio }
+
+        if (ratios.size <= 1) return _currentLens.value
+
+        // Find next zoom ratio
+        val currentRounded = (currentZoom * 10f).roundToInt() / 10f
+        val currentIndex = ratios.indexOfFirst { (it * 10f).roundToInt() / 10f == currentRounded }
+        val nextRatio = ratios[(currentIndex + 1) % ratios.size]
+
+        val base = options.first()
+        val rounded = (nextRatio * 10f).roundToInt() / 10f
+        val zoomOption = base.copy(
+            id = "${base.id}:zoom:$rounded",
+            zoomRatio = nextRatio,
+            label = if (rounded == 1f) "1×" else "${rounded}×",
+            description = when {
+                nextRatio < 0.85f -> "超广角"
+                nextRatio > 1.35f -> "变焦"
+                else -> "主摄"
+            },
+        )
+
+        return if (switchCamera(zoomOption)) zoomOption else _currentLens.value
     }
 
     private fun buildCameraSelector(): CameraSelector {
         val lens = _currentLens.value ?: return CameraSelector.DEFAULT_BACK_CAMERA
-        val builder = CameraSelector.Builder()
-            .requireLensFacing(CameraSelector.LENS_FACING_BACK)
-            .addCameraFilter { infos ->
-                infos.filter { info -> runCatching { cameraId(info) == lens.logicalCameraId }.getOrDefault(false) }
+
+        // If this is a physical camera within a logical multi-camera,
+        // we need to select the logical camera and set the physical camera ID.
+        if (lens.physicalCameraId != null) {
+            return try {
+                val builder = CameraSelector.Builder()
+                    .requireLensFacing(CameraSelector.LENS_FACING_BACK)
+                    .addCameraFilter { infos ->
+                        infos.filter { info ->
+                            runCatching { cameraId(info) == lens.logicalCameraId }.getOrDefault(false)
+                        }
+                    }
+                builder.setPhysicalCameraId(lens.physicalCameraId)
+                builder.build()
+            } catch (e: Exception) {
+                FileLogger.w(TAG, "Physical camera selector failed, using logical: ${e.message}")
+                CameraSelector.DEFAULT_BACK_CAMERA
             }
-        lens.physicalCameraId?.let(builder::setPhysicalCameraId)
-        return builder.build()
+        }
+
+        // For logical cameras, try to match by camera ID
+        return try {
+            CameraSelector.Builder()
+                .requireLensFacing(CameraSelector.LENS_FACING_BACK)
+                .addCameraFilter { infos ->
+                    infos.filter { info ->
+                        runCatching { cameraId(info) == lens.logicalCameraId }.getOrDefault(false)
+                    }
+                }
+                .build()
+        } catch (e: Exception) {
+            FileLogger.w(TAG, "Camera selector failed, using default: ${e.message}")
+            CameraSelector.DEFAULT_BACK_CAMERA
+        }
     }
 
     private fun cameraId(cameraInfo: CameraInfo): String =

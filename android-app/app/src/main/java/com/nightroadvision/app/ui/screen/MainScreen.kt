@@ -1,6 +1,11 @@
 package com.nightroadvision.app.ui.screen
 
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.slideInHorizontally
@@ -132,7 +137,7 @@ fun ModelSelectorBottomSheet(
                         .background(NightVisionColors.TextMuted)
                 )
                 Text(
-                    text = "SELECT MODEL",
+                    text = "选择模型",
                     style = MaterialTheme.typography.titleMedium,
                     fontWeight = FontWeight.Bold,
                     letterSpacing = 2.sp,
@@ -239,7 +244,7 @@ private fun ModelCard(
                             color = NightVisionColors.Background
                         ) {
                             Text(
-                                text = "${model.parameterCount} params",
+                                text = "${model.parameterCount} 参数",
                                 style = MaterialTheme.typography.labelSmall,
                                 color = NightVisionColors.TextMuted,
                                 modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
@@ -262,7 +267,7 @@ private fun ModelCard(
                 Spacer(modifier = Modifier.width(8.dp))
                 Icon(
                     imageVector = Icons.Filled.CheckCircle,
-                    contentDescription = "Selected",
+                    contentDescription = "已选择",
                     tint = NightVisionColors.Accent,
                     modifier = Modifier.size(24.dp)
                 )
@@ -271,892 +276,6 @@ private fun ModelCard(
     }
 }
 
-// ──────────────────────────────────────────────────────────────────────────────
-// 2. SETTINGS DIALOG
-// ──────────────────────────────────────────────────────────────────────────────
-
-@Composable
-fun SettingsDialog(
-    settings: InferenceSettings,
-    currentModelName: String,
-    onSettingsChanged: (InferenceSettings) -> Unit,
-    onOpenModelSelector: () -> Unit,
-    onResetSettings: () -> Unit,
-    int8Available: Boolean,
-    onQuantizationSelected: (ModelQuantization) -> Unit,
-    onDismiss: () -> Unit,
-    supercomboEnabled: Boolean = false,
-    onSupercomboToggle: (Boolean) -> Unit = {},
-    supercomboLatencyMs: Long = 0L,
-) {
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        containerColor = NightVisionColors.Surface,
-        titleContentColor = NightVisionColors.Accent,
-        textContentColor = NightVisionColors.Text,
-        title = {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Icon(
-                    imageVector = Icons.Filled.Settings,
-                    contentDescription = null,
-                    tint = NightVisionColors.Accent,
-                    modifier = Modifier.size(22.dp)
-                )
-                Spacer(modifier = Modifier.width(8.dp))
-                Text(
-                    text = "INFERENCE SETTINGS",
-                    fontWeight = FontWeight.Bold,
-                    letterSpacing = 1.5.sp,
-                    fontSize = 16.sp
-                )
-            }
-        },
-        text = {
-            Column(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .verticalScroll(rememberScrollState())
-                    .padding(vertical = 4.dp),
-                verticalArrangement = Arrangement.spacedBy(20.dp)
-            ) {
-                // ── Model Selection Button ──
-                SettingsSection(label = "MODEL") {
-                    Surface(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .clickable(onClick = onOpenModelSelector),
-                        shape = RoundedCornerShape(8.dp),
-                        color = NightVisionColors.Background,
-                        border = BorderStroke(1.dp, NightVisionColors.Border)
-                    ) {
-                        Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(14.dp),
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.SpaceBetween
-                        ) {
-                            Column {
-                                Text(
-                                    text = currentModelName,
-                                    style = MaterialTheme.typography.bodyMedium,
-                                    fontWeight = FontWeight.SemiBold,
-                                    color = NightVisionColors.Accent
-                                )
-                                Text(
-                                    text = "Tap to change model",
-                                    style = MaterialTheme.typography.labelSmall,
-                                    color = NightVisionColors.TextMuted
-                                )
-                            }
-                            Text(
-                                text = "\u203A",
-                                color = NightVisionColors.TextSecondary,
-                                fontWeight = FontWeight.Bold,
-                                fontSize = 18.sp
-                            )
-                        }
-                    }
-                }
-
-                SettingsSection(label = "MODEL QUANTIZATION") {
-                    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            listOf(
-                                ModelQuantization.AUTO,
-                                ModelQuantization.FP16,
-                                ModelQuantization.INT8,
-                            ).forEach { quantization ->
-                                val enabled = quantization != ModelQuantization.INT8 || int8Available
-                                SettingsChoiceChip(
-                                    label = quantization.label,
-                                    description = when (quantization) {
-                                        ModelQuantization.AUTO -> "Keep model"
-                                        ModelQuantization.FP16 -> "GPU quality"
-                                        ModelQuantization.INT8 -> if (int8Available) "NNAPI / CPU" else "Not installed"
-                                        ModelQuantization.FP32 -> "Full precision"
-                                    },
-                                    selected = settings.quantizationPreference == quantization,
-                                    enabled = enabled,
-                                    onClick = { onQuantizationSelected(quantization) },
-                                    modifier = Modifier.weight(1f),
-                                )
-                            }
-                        }
-                        Text(
-                            text = if (int8Available) {
-                                "INT8 uses a calibrated model and may reduce accuracy slightly"
-                            } else {
-                                "Export yolo26n_balanced_512x320_int8.tflite to enable INT8"
-                            },
-                            style = MaterialTheme.typography.labelSmall,
-                            color = NightVisionColors.TextMuted,
-                        )
-                    }
-                }
-
-                // ── Confidence Threshold Slider ──
-                SettingsSection(label = "CONFIDENCE THRESHOLD") {
-                    Column {
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.SpaceBetween
-                        ) {
-                            Text(
-                                text = "Min detection confidence",
-                                style = MaterialTheme.typography.bodySmall,
-                                color = NightVisionColors.TextSecondary
-                            )
-                            Text(
-                                text = String.format(Locale.US, "%.2f", settings.confidenceThreshold),
-                                style = MaterialTheme.typography.bodySmall,
-                                fontWeight = FontWeight.Bold,
-                                color = NightVisionColors.Accent,
-                                fontFamily = FontFamily.Monospace
-                            )
-                        }
-                        Spacer(modifier = Modifier.height(4.dp))
-                        Slider(
-                            value = settings.confidenceThreshold,
-                            onValueChange = {
-                                onSettingsChanged(settings.copy(
-                                    confidenceThreshold = it,
-                                    detectionMode = DetectionMode.CUSTOM,
-                                ))
-                            },
-                            valueRange = 0.1f..0.9f,
-                            steps = 7,
-                            colors = SliderDefaults.colors(
-                                thumbColor      = NightVisionColors.Accent,
-                                activeTrackColor  = NightVisionColors.Accent,
-                                inactiveTrackColor = NightVisionColors.Border,
-                                activeTickColor    = NightVisionColors.Accent.copy(alpha = 0.5f),
-                                inactiveTickColor  = NightVisionColors.TextMuted
-                            )
-                        )
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.SpaceBetween
-                        ) {
-                            Text("0.10", fontSize = 10.sp, color = NightVisionColors.TextMuted)
-                            Text("0.90", fontSize = 10.sp, color = NightVisionColors.TextMuted)
-                        }
-                    }
-                }
-
-                SettingsSection(label = "CLASS SENSITIVITY") {
-                    Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                        SettingsValueSlider(
-                            label = "Pedestrian / bicycle / motorcycle",
-                            value = settings.vulnerableUserConfidence,
-                            valueRange = 0.05f..0.60f,
-                            steps = 10,
-                            onValueChange = {
-                                onSettingsChanged(settings.copy(
-                                    vulnerableUserConfidence = it,
-                                    detectionMode = DetectionMode.CUSTOM,
-                                ))
-                            },
-                        )
-                        SettingsValueSlider(
-                            label = "Car / bus / truck",
-                            value = settings.vehicleConfidence,
-                            valueRange = 0.05f..0.70f,
-                            steps = 12,
-                            onValueChange = {
-                                onSettingsChanged(settings.copy(
-                                    vehicleConfidence = it,
-                                    detectionMode = DetectionMode.CUSTOM,
-                                ))
-                            },
-                        )
-                        Text(
-                            text = "Lower values improve distant-object recall but may increase false alarms",
-                            style = MaterialTheme.typography.labelSmall,
-                            color = NightVisionColors.TextMuted,
-                        )
-                    }
-                }
-
-                // ── IoU Threshold Slider ──
-                SettingsSection(label = "IoU THRESHOLD (NMS)") {
-                    Column {
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.SpaceBetween
-                        ) {
-                            Text(
-                                text = "Overlap suppression threshold",
-                                style = MaterialTheme.typography.bodySmall,
-                                color = NightVisionColors.TextSecondary
-                            )
-                            Text(
-                                text = String.format(Locale.US, "%.2f", settings.iouThreshold),
-                                style = MaterialTheme.typography.bodySmall,
-                                fontWeight = FontWeight.Bold,
-                                color = NightVisionColors.Accent,
-                                fontFamily = FontFamily.Monospace
-                            )
-                        }
-                        Spacer(modifier = Modifier.height(4.dp))
-                        Slider(
-                            value = settings.iouThreshold,
-                            onValueChange = {
-                                onSettingsChanged(settings.copy(
-                                    iouThreshold = it,
-                                    detectionMode = DetectionMode.CUSTOM,
-                                ))
-                            },
-                            valueRange = 0.1f..0.9f,
-                            steps = 7,
-                            colors = SliderDefaults.colors(
-                                thumbColor      = NightVisionColors.Accent,
-                                activeTrackColor  = NightVisionColors.Accent,
-                                inactiveTrackColor = NightVisionColors.Border,
-                                activeTickColor    = NightVisionColors.Accent.copy(alpha = 0.5f),
-                                inactiveTickColor  = NightVisionColors.TextMuted
-                            )
-                        )
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.SpaceBetween
-                        ) {
-                            Text("0.10", fontSize = 10.sp, color = NightVisionColors.TextMuted)
-                            Text("0.90", fontSize = 10.sp, color = NightVisionColors.TextMuted)
-                        }
-                    }
-                }
-
-                // ── Detection Mode Selector ──
-                SettingsSection(label = "DETECTION MODE") {
-                    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                        DetectionMode.entries.chunked(2).forEach { modes ->
-                            Row(
-                                modifier = Modifier.fillMaxWidth(),
-                                horizontalArrangement = Arrangement.spacedBy(8.dp),
-                            ) {
-                                modes.forEach { mode ->
-                                    SettingsChoiceChip(
-                                        label = mode.label,
-                                        description = mode.description,
-                                        selected = settings.detectionMode == mode,
-                                        onClick = { onSettingsChanged(settings.withPreset(mode)) },
-                                        modifier = Modifier.weight(1f),
-                                    )
-                                }
-                                if (modes.size == 1) Spacer(modifier = Modifier.weight(1f))
-                            }
-                        }
-                    }
-                }
-
-                SettingsSection(label = "DETECTION FILTERING") {
-                    Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                        SettingsToggleRow(
-                            title = "Class-aware overlap suppression",
-                            description = "Prevents a vehicle box from hiding an overlapping rider or pedestrian",
-                            checked = settings.classAwareNms,
-                            onCheckedChange = {
-                                onSettingsChanged(settings.copy(
-                                    classAwareNms = it,
-                                    detectionMode = DetectionMode.CUSTOM,
-                                ))
-                            },
-                        )
-                        Text("Maximum detections", style = MaterialTheme.typography.bodySmall, color = NightVisionColors.TextSecondary)
-                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            listOf(30, 60, 100, 200).forEach { count ->
-                                SettingsChoiceChip(
-                                    label = count.toString(),
-                                    selected = settings.maxDetections == count,
-                                    onClick = {
-                                        onSettingsChanged(settings.copy(
-                                            maxDetections = count,
-                                            detectionMode = DetectionMode.CUSTOM,
-                                        ))
-                                    },
-                                    modifier = Modifier.weight(1f),
-                                )
-                            }
-                        }
-                    }
-                }
-
-                SettingsSection(label = "TRACKING") {
-                    Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                        SettingsToggleRow(
-                            title = "Temporal tracking",
-                            description = "Stabilizes boxes and rejects one-frame flashes",
-                            checked = settings.trackingEnabled,
-                            onCheckedChange = { onSettingsChanged(settings.copy(trackingEnabled = it)) },
-                        )
-                        SettingsValueSlider(
-                            label = "Match IoU",
-                            value = settings.trackerIouThreshold,
-                            valueRange = 0.05f..0.60f,
-                            steps = 10,
-                            onValueChange = { onSettingsChanged(settings.copy(
-                                trackerIouThreshold = it,
-                                detectionMode = DetectionMode.CUSTOM,
-                            )) },
-                        )
-                        SettingsValueSlider(
-                            label = "Box responsiveness",
-                            value = settings.boxSmoothing,
-                            valueRange = 0.10f..1.0f,
-                            steps = 8,
-                            onValueChange = { onSettingsChanged(settings.copy(
-                                boxSmoothing = it,
-                                detectionMode = DetectionMode.CUSTOM,
-                            )) },
-                        )
-                        Text("Frames required before display", style = MaterialTheme.typography.bodySmall, color = NightVisionColors.TextSecondary)
-                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            (1..4).forEach { count ->
-                                SettingsChoiceChip(
-                                    label = count.toString(),
-                                    selected = settings.trackerConfirmFrames == count,
-                                    onClick = { onSettingsChanged(settings.copy(
-                                        trackerConfirmFrames = count,
-                                        detectionMode = DetectionMode.CUSTOM,
-                                    )) },
-                                    modifier = Modifier.weight(1f),
-                                )
-                            }
-                        }
-                        Text("Track retention after missed frames", style = MaterialTheme.typography.bodySmall, color = NightVisionColors.TextSecondary)
-                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            listOf(4, 8, 12, 20).forEach { count ->
-                                SettingsChoiceChip(
-                                    label = count.toString(),
-                                    selected = settings.trackerMaxMissedFrames == count,
-                                    onClick = { onSettingsChanged(settings.copy(
-                                        trackerMaxMissedFrames = count,
-                                        detectionMode = DetectionMode.CUSTOM,
-                                    )) },
-                                    modifier = Modifier.weight(1f),
-                                )
-                            }
-                        }
-                    }
-                }
-
-                SettingsSection(label = "RIDING ALERTS") {
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        verticalAlignment = Alignment.CenterVertically,
-                    ) {
-                        Column(modifier = Modifier.weight(1f)) {
-                            Text(
-                                text = "接近目标震动提醒",
-                                style = MaterialTheme.typography.bodyMedium,
-                                color = NightVisionColors.Text,
-                            )
-                            Text(
-                                text = "仅对已确认、进入中央注意区域的目标触发，并带冷却去抖",
-                                style = MaterialTheme.typography.labelSmall,
-                                color = NightVisionColors.TextMuted,
-                            )
-                        }
-                        Switch(
-                            checked = settings.vibrationAlertsEnabled,
-                            onCheckedChange = { enabled ->
-                                onSettingsChanged(settings.copy(vibrationAlertsEnabled = enabled))
-                            },
-                            colors = SwitchDefaults.colors(
-                                checkedThumbColor = NightVisionColors.Background,
-                                checkedTrackColor = NightVisionColors.Accent,
-                                uncheckedThumbColor = NightVisionColors.TextSecondary,
-                                uncheckedTrackColor = NightVisionColors.Border,
-                            ),
-                        )
-                    }
-
-                    Spacer(modifier = Modifier.height(10.dp))
-
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        verticalAlignment = Alignment.CenterVertically,
-                    ) {
-                        Column(modifier = Modifier.weight(1f)) {
-                            Text(
-                                text = "接近目标声音提醒",
-                                style = MaterialTheme.typography.bodyMedium,
-                                color = NightVisionColors.Text,
-                            )
-                            Text(
-                                text = "CAUTION 短提示音，CRITICAL 急促重复提示音",
-                                style = MaterialTheme.typography.labelSmall,
-                                color = NightVisionColors.TextMuted,
-                            )
-                        }
-                        Switch(
-                            checked = settings.soundAlertsEnabled,
-                            onCheckedChange = { enabled ->
-                                onSettingsChanged(settings.copy(soundAlertsEnabled = enabled))
-                            },
-                            colors = SwitchDefaults.colors(
-                                checkedThumbColor = NightVisionColors.Background,
-                                checkedTrackColor = NightVisionColors.Accent,
-                                uncheckedThumbColor = NightVisionColors.TextSecondary,
-                                uncheckedTrackColor = NightVisionColors.Border,
-                            ),
-                        )
-                    }
-                }
-
-                // ── Frame Skip Control ──
-                SettingsSection(label = "FRAME SKIP") {
-                    Column {
-                        Text(
-                            text = "Process every Nth frame (higher = longer battery, fewer detections)",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = NightVisionColors.TextSecondary
-                        )
-                        Spacer(modifier = Modifier.height(8.dp))
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.spacedBy(8.dp)
-                        ) {
-                            listOf(1, 2, 3).forEach { skip ->
-                                val isSelected = settings.frameSkip == skip
-                                val chipColor = if (isSelected) {
-                                    NightVisionColors.Accent.copy(alpha = 0.15f)
-                                } else {
-                                    NightVisionColors.Background
-                                }
-                                val chipBorder = if (isSelected) {
-                                    NightVisionColors.Accent
-                                } else {
-                                    NightVisionColors.Border
-                                }
-
-                                Surface(
-                                    modifier = Modifier
-                                        .weight(1f)
-                                        .clickable {
-                                            onSettingsChanged(settings.copy(
-                                                frameSkip = skip,
-                                                detectionMode = DetectionMode.CUSTOM,
-                                            ))
-                                        },
-                                    shape = RoundedCornerShape(8.dp),
-                                    color = chipColor,
-                                    border = BorderStroke(1.dp, chipBorder)
-                                ) {
-                                    Column(
-                                        modifier = Modifier.padding(vertical = 10.dp),
-                                        horizontalAlignment = Alignment.CenterHorizontally
-                                    ) {
-                                        Text(
-                                            text = "1/$skip",
-                                            style = MaterialTheme.typography.titleMedium,
-                                            fontWeight = FontWeight.Bold,
-                                            fontFamily = FontFamily.Monospace,
-                                            color = if (isSelected) NightVisionColors.Accent
-                                                    else NightVisionColors.TextSecondary
-                                        )
-                                        Text(
-                                            text = when (skip) {
-                                                1 -> "Every frame"
-                                                2 -> "Every 2nd"
-                                                3 -> "Every 3rd"
-                                                else -> ""
-                                            },
-                                            fontSize = 10.sp,
-                                            color = NightVisionColors.TextMuted
-                                        )
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-
-                SettingsSection(label = "CAMERA & DISTANCE") {
-                    Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                        Text("Analysis source quality", style = MaterialTheme.typography.bodySmall, color = NightVisionColors.TextSecondary)
-                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            AnalysisResolution.entries.forEach { resolution ->
-                                SettingsChoiceChip(
-                                    label = resolution.label,
-                                    description = resolution.description,
-                                    selected = settings.analysisResolution == resolution,
-                                    onClick = { onSettingsChanged(settings.copy(
-                                        analysisResolution = resolution,
-                                        detectionMode = DetectionMode.CUSTOM,
-                                    )) },
-                                    modifier = Modifier.weight(1f),
-                                )
-                            }
-                        }
-                        SettingsValueSlider(
-                            label = "Detection zoom",
-                            value = settings.digitalZoomRatio,
-                            valueRange = 1f..3f,
-                            steps = 7,
-                            valueText = String.format(Locale.US, "%.2fx", settings.digitalZoomRatio),
-                            onValueChange = { onSettingsChanged(settings.copy(
-                                digitalZoomRatio = it,
-                                detectionMode = DetectionMode.CUSTOM,
-                            )) },
-                        )
-                        SettingsValueSlider(
-                            label = "Auto exposure bias",
-                            value = settings.exposureCompensation.toFloat(),
-                            valueRange = -3f..3f,
-                            steps = 5,
-                            valueText = "%+d".format(settings.exposureCompensation),
-                            onValueChange = { onSettingsChanged(settings.copy(
-                                exposureCompensation = it.toInt(),
-                                detectionMode = DetectionMode.CUSTOM,
-                            )) },
-                        )
-                        Text(
-                            text = "Zoom improves distant target pixels but narrows the field of view; 1080p costs more preprocessing time",
-                            style = MaterialTheme.typography.labelSmall,
-                            color = NightVisionColors.TextMuted,
-                        )
-                    }
-                }
-
-                // ── Backend Selection ──
-                SettingsSection(label = "BACKEND") {
-                    Column {
-                        Text(
-                            text = "Inference delegate (Auto = GPU → NNAPI → CPU fallback)",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = NightVisionColors.TextSecondary
-                        )
-                        Spacer(modifier = Modifier.height(8.dp))
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.spacedBy(8.dp)
-                        ) {
-                            BackendPreference.entries.forEach { backend ->
-                                val isSelected = settings.backendPreference == backend
-                                val chipColor = if (isSelected) {
-                                    NightVisionColors.Accent.copy(alpha = 0.15f)
-                                } else {
-                                    NightVisionColors.Background
-                                }
-                                val chipBorder = if (isSelected) {
-                                    NightVisionColors.Accent
-                                } else {
-                                    NightVisionColors.Border
-                                }
-
-                                Surface(
-                                    modifier = Modifier
-                                        .weight(1f)
-                                        .clickable {
-                                            onSettingsChanged(settings.copy(backendPreference = backend))
-                                        },
-                                    shape = RoundedCornerShape(8.dp),
-                                    color = chipColor,
-                                    border = BorderStroke(1.dp, chipBorder)
-                                ) {
-                                    Column(
-                                        modifier = Modifier.padding(vertical = 10.dp, horizontal = 4.dp),
-                                        horizontalAlignment = Alignment.CenterHorizontally
-                                    ) {
-                                        Text(
-                                            text = backend.label,
-                                            style = MaterialTheme.typography.labelMedium,
-                                            fontWeight = FontWeight.Bold,
-                                            color = if (isSelected) NightVisionColors.Accent
-                                                    else NightVisionColors.TextSecondary
-                                        )
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-
-                SettingsSection(label = "CPU FALLBACK THREADS") {
-                    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                        Text(
-                            text = "Used by CPU and unsupported delegate operations; more is not always faster",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = NightVisionColors.TextSecondary,
-                        )
-                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            listOf(1, 2, 4, 6).forEach { count ->
-                                SettingsChoiceChip(
-                                    label = count.toString(),
-                                    selected = settings.cpuThreads == count,
-                                    onClick = { onSettingsChanged(settings.copy(cpuThreads = count)) },
-                                    modifier = Modifier.weight(1f),
-                                )
-                            }
-                        }
-                    }
-                }
-
-                // ── Supercombo (openpilot) ──
-                SettingsSection(label = "SUPERCOMBO") {
-                    Column {
-                        Text(
-                            text = "openpilot 前车检测 + 真实距离 (需要 supercombo 模型文件)",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = NightVisionColors.TextSecondary
-                        )
-                        Spacer(modifier = Modifier.height(8.dp))
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.SpaceBetween
-                        ) {
-                            Text(
-                                text = "启用 Supercombo",
-                                style = MaterialTheme.typography.bodyMedium,
-                                color = NightVisionColors.Text
-                            )
-                            Switch(
-                                checked = supercomboEnabled,
-                                onCheckedChange = { onSupercomboToggle(it) },
-                                colors = SwitchDefaults.colors(
-                                    checkedThumbColor = NightVisionColors.Accent,
-                                    checkedTrackColor = NightVisionColors.Accent.copy(alpha = 0.3f),
-                                    uncheckedThumbColor = NightVisionColors.TextMuted,
-                                    uncheckedTrackColor = NightVisionColors.Background,
-                                )
-                            )
-                        }
-                        if (supercomboEnabled && supercomboLatencyMs > 0) {
-                            Spacer(modifier = Modifier.height(4.dp))
-                            Text(
-                                text = "Supercombo 延迟: ${supercomboLatencyMs}ms",
-                                style = MaterialTheme.typography.bodySmall,
-                                color = NightVisionColors.TextMuted
-                            )
-                        }
-                    }
-                }
-
-                // ── GPU Precision ──
-                SettingsSection(label = "GPU PRECISION") {
-                    Column {
-                        Text(
-                            text = "FP16 is 2x faster on Adreno 750; FP32 is more accurate",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = NightVisionColors.TextSecondary
-                        )
-                        Spacer(modifier = Modifier.height(8.dp))
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.spacedBy(8.dp)
-                        ) {
-                            GpuPrecision.entries.forEach { precision ->
-                                val isSelected = settings.gpuPrecision == precision
-                                val chipColor = if (isSelected) {
-                                    NightVisionColors.Accent.copy(alpha = 0.15f)
-                                } else {
-                                    NightVisionColors.Background
-                                }
-                                val chipBorder = if (isSelected) {
-                                    NightVisionColors.Accent
-                                } else {
-                                    NightVisionColors.Border
-                                }
-
-                                Surface(
-                                    modifier = Modifier
-                                        .weight(1f)
-                                        .clickable {
-                                            onSettingsChanged(settings.copy(gpuPrecision = precision))
-                                        },
-                                    shape = RoundedCornerShape(8.dp),
-                                    color = chipColor,
-                                    border = BorderStroke(1.dp, chipBorder)
-                                ) {
-                                    Column(
-                                        modifier = Modifier.padding(vertical = 10.dp, horizontal = 4.dp),
-                                        horizontalAlignment = Alignment.CenterHorizontally
-                                    ) {
-                                        Text(
-                                            text = precision.label,
-                                            style = MaterialTheme.typography.labelMedium,
-                                            fontWeight = FontWeight.Bold,
-                                            color = if (isSelected) NightVisionColors.Accent
-                                                    else NightVisionColors.TextSecondary
-                                        )
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-
-                SettingsSection(label = "HUD DISPLAY") {
-                    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                        SettingsToggleRow(
-                            title = "Class labels",
-                            checked = settings.showLabels,
-                            onCheckedChange = { onSettingsChanged(settings.copy(showLabels = it)) },
-                        )
-                        SettingsToggleRow(
-                            title = "Confidence percentage",
-                            checked = settings.showConfidence,
-                            onCheckedChange = { onSettingsChanged(settings.copy(showConfidence = it)) },
-                        )
-                        SettingsToggleRow(
-                            title = "Tracking IDs",
-                            checked = settings.showTrackIds,
-                            onCheckedChange = { onSettingsChanged(settings.copy(showTrackIds = it)) },
-                        )
-                    }
-                }
-            }
-        },
-        confirmButton = {
-            Button(
-                onClick = onDismiss,
-                colors = ButtonDefaults.buttonColors(
-                    containerColor = NightVisionColors.Accent,
-                    contentColor = NightVisionColors.Background
-                ),
-                shape = RoundedCornerShape(8.dp)
-            ) {
-                Text("DONE", fontWeight = FontWeight.Bold, letterSpacing = 1.sp)
-            }
-        },
-        dismissButton = {
-            TextButton(onClick = onResetSettings) {
-                Text("RESET", color = NightVisionColors.TextSecondary)
-            }
-        },
-    )
-}
-
-@Composable
-private fun SettingsSection(
-    label: String,
-    content: @Composable ColumnScope.() -> Unit
-) {
-    Column {
-        Text(
-            text = label,
-            style = MaterialTheme.typography.labelSmall,
-            fontWeight = FontWeight.Bold,
-            letterSpacing = 1.5.sp,
-            color = NightVisionColors.TextMuted,
-            modifier = Modifier.padding(bottom = 8.dp)
-        )
-        content()
-    }
-}
-
-@Composable
-private fun SettingsChoiceChip(
-    label: String,
-    selected: Boolean,
-    onClick: () -> Unit,
-    modifier: Modifier = Modifier,
-    description: String? = null,
-    enabled: Boolean = true,
-) {
-    Surface(
-        modifier = modifier.clickable(enabled = enabled, onClick = onClick),
-        shape = RoundedCornerShape(8.dp),
-        color = if (selected && enabled) NightVisionColors.Accent.copy(alpha = 0.15f) else NightVisionColors.Background,
-        border = BorderStroke(1.dp, if (selected && enabled) NightVisionColors.Accent else NightVisionColors.Border),
-    ) {
-        Column(
-            modifier = Modifier.padding(horizontal = 6.dp, vertical = 9.dp),
-            horizontalAlignment = Alignment.CenterHorizontally,
-        ) {
-            Text(
-                text = label,
-                style = MaterialTheme.typography.labelMedium,
-                fontWeight = FontWeight.Bold,
-                color = when {
-                    !enabled -> NightVisionColors.TextMuted
-                    selected -> NightVisionColors.Accent
-                    else -> NightVisionColors.TextSecondary
-                },
-            )
-            description?.let {
-                Spacer(modifier = Modifier.height(2.dp))
-                Text(
-                    text = it,
-                    style = MaterialTheme.typography.labelSmall,
-                    fontSize = 9.sp,
-                    color = NightVisionColors.TextMuted,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                )
-            }
-        }
-    }
-}
-
-@Composable
-private fun SettingsValueSlider(
-    label: String,
-    value: Float,
-    valueRange: ClosedFloatingPointRange<Float>,
-    steps: Int,
-    onValueChange: (Float) -> Unit,
-    valueText: String = String.format(Locale.US, "%.2f", value),
-) {
-    Column {
-        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-            Text(label, style = MaterialTheme.typography.bodySmall, color = NightVisionColors.TextSecondary)
-            Text(
-                valueText,
-                style = MaterialTheme.typography.bodySmall,
-                fontWeight = FontWeight.Bold,
-                fontFamily = FontFamily.Monospace,
-                color = NightVisionColors.Accent,
-            )
-        }
-        Slider(
-            value = value,
-            onValueChange = onValueChange,
-            valueRange = valueRange,
-            steps = steps,
-            colors = SliderDefaults.colors(
-                thumbColor = NightVisionColors.Accent,
-                activeTrackColor = NightVisionColors.Accent,
-                inactiveTrackColor = NightVisionColors.Border,
-            ),
-        )
-    }
-}
-
-@Composable
-private fun SettingsToggleRow(
-    title: String,
-    checked: Boolean,
-    onCheckedChange: (Boolean) -> Unit,
-    description: String? = null,
-) {
-    Row(
-        modifier = Modifier.fillMaxWidth(),
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        Column(modifier = Modifier.weight(1f)) {
-            Text(title, style = MaterialTheme.typography.bodyMedium, color = NightVisionColors.Text)
-            description?.let {
-                Text(it, style = MaterialTheme.typography.labelSmall, color = NightVisionColors.TextMuted)
-            }
-        }
-        Switch(
-            checked = checked,
-            onCheckedChange = onCheckedChange,
-            colors = SwitchDefaults.colors(
-                checkedThumbColor = NightVisionColors.Background,
-                checkedTrackColor = NightVisionColors.Accent,
-                uncheckedThumbColor = NightVisionColors.TextSecondary,
-                uncheckedTrackColor = NightVisionColors.Border,
-            ),
-        )
-    }
-}
-
-// ──────────────────────────────────────────────────────────────────────────────
 // 3. PERFORMANCE PANEL (top-left overlay)
 // ──────────────────────────────────────────────────────────────────────────────
 
@@ -1178,7 +297,7 @@ fun PerformancePanel(
         ) {
             // Header
             Text(
-                text = "TELEMETRY",
+                text = "遥测数据",
                 style = MaterialTheme.typography.labelSmall,
                 fontWeight = FontWeight.Bold,
                 letterSpacing = 2.sp,
@@ -1194,7 +313,7 @@ fun PerformancePanel(
 
             // Model name
             MetricRow(
-                label = "MODEL",
+                label = "模型",
                 value = modelName,
                 valueColor = NightVisionColors.Accent
             )
@@ -1212,7 +331,7 @@ fun PerformancePanel(
 
             // Inference latency
             MetricRow(
-                label = "LATENCY",
+                label = "延迟",
                 value = "${metrics.inferenceLatencyMs.toInt()} ms",
                 valueColor = when {
                     metrics.inferenceLatencyMs <= 30f -> NightVisionColors.Success
@@ -1223,7 +342,7 @@ fun PerformancePanel(
 
             // Detection count
             MetricRow(
-                label = "DETECTS",
+                label = "检测数",
                 value = "${metrics.detectionCount}",
                 valueColor = if (metrics.detectionCount > 0) NightVisionColors.Accent
                              else NightVisionColors.TextSecondary
@@ -1231,7 +350,7 @@ fun PerformancePanel(
 
             // Backend
             MetricRow(
-                label = "BACKEND",
+                label = "后端",
                 value = metrics.backend,
                 valueColor = if (metrics.backend.contains("GPU")) NightVisionColors.Accent
                              else NightVisionColors.TextSecondary
@@ -1239,7 +358,7 @@ fun PerformancePanel(
 
             // Thermal status
             MetricRow(
-                label = "THERMAL",
+                label = "温度",
                 value = metrics.thermalStatus,
                 valueColor = when (metrics.thermalStatus.lowercase()) {
                     "normal", "none" -> NightVisionColors.Success
@@ -1327,7 +446,7 @@ private fun VisionStatusChip(
             Spacer(Modifier.width(7.dp))
             Column {
                 Text(
-                    text = "VISION",
+                    text = "视觉",
                     color = Color.White,
                     fontWeight = FontWeight.Black,
                     fontSize = 10.sp,
@@ -1393,11 +512,13 @@ private fun TargetAlertChip(
     if (risk.severity == RiskSeverity.NONE) return
 
     val alertColor = when (risk.severity) {
-        RiskSeverity.CRITICAL -> Color(0xFFC92231)
+        RiskSeverity.DANGER -> Color(0xFFC92231)
+        RiskSeverity.URGENT -> Color(0xFFE8530E)
         RiskSeverity.CAUTION -> Color(0xFFDA6F25)
         RiskSeverity.NONE -> Color.Transparent
     }
     val reason = when (risk.reason) {
+        RiskReason.IMMINENT -> "非常危险"
         RiskReason.VERY_NEAR -> "目标很近"
         RiskReason.APPROACHING_QUICKLY -> "正在快速接近"
         RiskReason.IN_ATTENTION_ZONE -> "进入注意区域"
@@ -1407,6 +528,7 @@ private fun TargetAlertChip(
         append(risk.className)
         risk.trackId?.let { append("  #$it") }
     }
+    val distText = risk.estimatedDistanceM?.let { "%.0fm".format(it) }
 
     Surface(
         modifier = modifier,
@@ -1414,13 +536,23 @@ private fun TargetAlertChip(
         color = alertColor.copy(alpha = 0.92f),
         border = BorderStroke(1.dp, Color.White.copy(alpha = 0.18f)),
     ) {
-        Text(
-            text = "$target  ·  $reason",
-            color = Color.White,
-            fontWeight = FontWeight.Black,
-            fontSize = 12.sp,
+        Row(
             modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp),
-        )
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            Text(
+                text = buildString {
+                    append(target)
+                    append("  ·  ")
+                    append(reason)
+                    distText?.let { append("  ·  $it") }
+                },
+                color = Color.White,
+                fontWeight = FontWeight.Black,
+                fontSize = 12.sp,
+            )
+        }
     }
 }
 
@@ -1534,7 +666,7 @@ fun MainScreen(
     val supercomboLatencyMs by viewModel.supercomboLatencyMs.collectAsState()
 
     // Local UI state
-    var showSettingsDialog by remember { mutableStateOf(false) }
+    var showSettingsPage by remember { mutableStateOf(false) }
     var showModelSelector by remember { mutableStateOf(false) }
     var showPerformancePanel by remember { mutableStateOf(false) }
     var flashlightOn by remember { mutableStateOf(false) }
@@ -1632,18 +764,68 @@ fun MainScreen(
 
             // Like openpilot's state border, this remains peripheral and changes only
             // when a tracked person or vehicle occupies a large part of the frame.
-            Box(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .border(
-                        width = if (ridingRisk.severity == RiskSeverity.CRITICAL) 3.dp else 1.dp,
-                        color = when (ridingRisk.severity) {
-                            RiskSeverity.CRITICAL -> Color(0xFFC92231).copy(alpha = 0.72f)
-                            RiskSeverity.CAUTION -> Color(0xFFDA6F25).copy(alpha = 0.58f)
-                            RiskSeverity.NONE -> NightVisionColors.Accent.copy(alpha = 0.20f)
-                        },
-                    ),
+            // Uses thick borders with a soft outer glow for high visibility.
+            val riskBorderColor = when (ridingRisk.severity) {
+                RiskSeverity.DANGER -> Color(0xFFC92231)
+                RiskSeverity.URGENT -> Color(0xFFE8530E)
+                RiskSeverity.CAUTION -> Color(0xFFDA6F25)
+                RiskSeverity.NONE -> NightVisionColors.Accent
+            }
+            val riskBorderWidth = when (ridingRisk.severity) {
+                RiskSeverity.DANGER -> 10.dp
+                RiskSeverity.URGENT -> 6.dp
+                RiskSeverity.CAUTION -> 3.dp
+                RiskSeverity.NONE -> 1.dp
+            }
+            val glowWidth = when (ridingRisk.severity) {
+                RiskSeverity.DANGER -> 24.dp
+                RiskSeverity.URGENT -> 14.dp
+                RiskSeverity.CAUTION -> 6.dp
+                RiskSeverity.NONE -> 0.dp
+            }
+
+            // Pulsing animation for DANGER (always created to satisfy Compose rules)
+            val infiniteTransition = rememberInfiniteTransition(label = "risk_pulse")
+            val pulseRaw by infiniteTransition.animateFloat(
+                initialValue = 0.25f,
+                targetValue = 0.65f,
+                animationSpec = infiniteRepeatable(
+                    animation = tween(durationMillis = 500),
+                    repeatMode = RepeatMode.Reverse,
+                ),
+                label = "danger_pulse",
             )
+            val pulseAlpha = if (ridingRisk.severity == RiskSeverity.DANGER) pulseRaw else 0.35f
+
+            if (ridingRisk.severity != RiskSeverity.NONE) {
+                // Outer glow layer — wider, semi-transparent
+                Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .border(
+                            width = glowWidth,
+                            color = riskBorderColor.copy(alpha = pulseAlpha * 0.5f),
+                        ),
+                )
+                // Inner solid border — crisp, high-contrast
+                Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .border(
+                            width = riskBorderWidth,
+                            color = riskBorderColor.copy(alpha = 0.90f),
+                        ),
+                )
+            } else {
+                Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .border(
+                            width = 1.dp,
+                            color = riskBorderColor.copy(alpha = 0.20f),
+                        ),
+                )
+            }
 
             VisionStatusChip(
                 modelName = currentModelName,
@@ -1696,7 +878,7 @@ fun MainScreen(
                     flashlightOn = viewModel.toggleFlashlight()
                 },
                 onOpenSettings = {
-                    showSettingsDialog = true
+                    showSettingsPage = true
                 },
                 showCameraSwitch = availableLenses.size > 1,
                 cameraLensLabel = selectedLens?.label ?: "CAM",
@@ -1721,12 +903,12 @@ fun MainScreen(
                     contentColor = NightVisionColors.Text,
                     dismissAction = {
                         TextButton(onClick = { viewModel.clearError() }) {
-                            Text("DISMISS", color = NightVisionColors.Accent, fontWeight = FontWeight.Bold)
+                            Text("忽略", color = NightVisionColors.Accent, fontWeight = FontWeight.Bold)
                         }
                     },
                     action = {
                         TextButton(onClick = { viewModel.clearError() }) {
-                            Text("OK", color = NightVisionColors.Accent, fontWeight = FontWeight.Bold)
+                            Text("确定", color = NightVisionColors.Accent, fontWeight = FontWeight.Bold)
                         }
                     }
                 ) {
@@ -1735,22 +917,18 @@ fun MainScreen(
             }
         }
 
-        // ── Settings Dialog ──
-        if (showSettingsDialog) {
-            SettingsDialog(
+        // ── Settings Page (full-screen) ──
+        if (showSettingsPage) {
+            SettingsScreen(
                 settings = settings,
                 currentModelName = currentModelName,
                 onSettingsChanged = { newSettings ->
                     viewModel.updateSettings(newSettings)
                 },
-                onOpenModelSelector = {
-                    showSettingsDialog = false
-                    showModelSelector = true
-                },
                 onResetSettings = viewModel::resetSettings,
                 int8Available = viewModel.isInt8Available(),
                 onQuantizationSelected = viewModel::selectQuantization,
-                onDismiss = { showSettingsDialog = false },
+                onDismiss = { showSettingsPage = false },
                 supercomboEnabled = supercomboEnabled,
                 onSupercomboToggle = { viewModel.setSupercomboEnabled(it) },
                 supercomboLatencyMs = supercomboLatencyMs,
@@ -1766,7 +944,7 @@ fun MainScreen(
                 onModelSelected = { model ->
                     viewModel.switchModel(model)
                     showModelSelector = false
-                    showSettingsDialog = true
+                    showSettingsPage = true
                 },
                 onDismiss = { showModelSelector = false }
             )

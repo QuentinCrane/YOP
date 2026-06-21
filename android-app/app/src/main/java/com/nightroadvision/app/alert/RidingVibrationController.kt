@@ -8,13 +8,20 @@ import android.os.Vibrator
 import android.os.VibratorManager
 import com.nightroadvision.app.FileLogger
 
-/** Provides rate-limited haptic alerts for confirmed riding risks. */
+/**
+ * Three-level haptic feedback controller for riding risk alerts.
+ *
+ * - CAUTION (注意): single soft pulse
+ * - URGENT (紧急): double pulse with medium intensity
+ * - DANGER (危险): triple strong pulse pattern
+ */
 class RidingVibrationController(context: Context) {
     companion object {
         private const val TAG = "RidingVibration"
-        private const val MIN_GLOBAL_INTERVAL_MS = 1_500L
+        private const val MIN_GLOBAL_INTERVAL_MS = 1_200L
         private const val CAUTION_COOLDOWN_MS = 5_000L
-        private const val CRITICAL_COOLDOWN_MS = 2_500L
+        private const val URGENT_COOLDOWN_MS = 3_000L
+        private const val DANGER_COOLDOWN_MS = 1_800L
     }
 
     private val vibrator: Vibrator? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
@@ -37,22 +44,38 @@ class RidingVibrationController(context: Context) {
         if (!deviceVibrator.hasVibrator()) return
 
         val now = SystemClock.elapsedRealtime()
-        val cooldown = if (risk.severity == RiskSeverity.CRITICAL) {
-            CRITICAL_COOLDOWN_MS
-        } else {
-            CAUTION_COOLDOWN_MS
+        val cooldown = when (risk.severity) {
+            RiskSeverity.DANGER -> DANGER_COOLDOWN_MS
+            RiskSeverity.URGENT -> URGENT_COOLDOWN_MS
+            else -> CAUTION_COOLDOWN_MS
         }
         val newTarget = risk.trackId != lastTrackId
         val escalated = risk.severity.ordinal > lastSeverity.ordinal
         if (now - lastAlertAtMs < MIN_GLOBAL_INTERVAL_MS) return
         if (!newTarget && !escalated && now - lastAlertAtMs < cooldown) return
 
-        val pattern = if (risk.severity == RiskSeverity.CRITICAL) {
-            longArrayOf(0L, 130L, 90L, 220L)
-        } else {
-            longArrayOf(0L, 110L)
+        val pattern = when (risk.severity) {
+            RiskSeverity.DANGER -> longArrayOf(0L, 150L, 60L, 200L, 60L, 150L)  // 三段脉冲
+            RiskSeverity.URGENT -> longArrayOf(0L, 130L, 70L, 200L)             // 双脉冲
+            else -> longArrayOf(0L, 100L)                                         // 单脉冲
         }
-        deviceVibrator.vibrate(VibrationEffect.createWaveform(pattern, -1))
+
+        val amplitude = when (risk.severity) {
+            RiskSeverity.DANGER -> 200  // 强
+            RiskSeverity.URGENT -> 140  // 中
+            else -> 80                   // 轻
+        }
+
+        // Build amplitude array matching pattern length (even indices = gap/silence, odd = vibrate)
+        val amplitudes = IntArray(pattern.size) { i ->
+            if (i % 2 == 0) 0 else amplitude
+        }
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            deviceVibrator.vibrate(VibrationEffect.createWaveform(pattern, amplitudes, -1))
+        } else {
+            deviceVibrator.vibrate(VibrationEffect.createWaveform(pattern, -1))
+        }
 
         lastAlertAtMs = now
         lastTrackId = risk.trackId

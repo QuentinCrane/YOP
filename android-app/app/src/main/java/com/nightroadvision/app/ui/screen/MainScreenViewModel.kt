@@ -143,6 +143,11 @@ class MainScreenViewModel(application: Application) : AndroidViewModel(applicati
             )
         )
         applyTrackerConfig(initialSettings)
+        ridingRiskEvaluator.setDistanceThresholds(
+            initialSettings.dangerDistanceM,
+            initialSettings.urgentDistanceM,
+            initialSettings.cautionDistanceM,
+        )
         viewModelScope.launch(Dispatchers.Default) {
             try {
                 val savedModel = modelManager.getCurrentModel()
@@ -382,6 +387,11 @@ class MainScreenViewModel(application: Application) : AndroidViewModel(applicati
         _settings.value = sanitized
         settingsStore.save(sanitized)
         applyTrackerConfig(sanitized)
+        ridingRiskEvaluator.setDistanceThresholds(
+            sanitized.dangerDistanceM,
+            sanitized.urgentDistanceM,
+            sanitized.cautionDistanceM,
+        )
         FileLogger.d(TAG, "Settings updated: conf=${newSettings.confidenceThreshold}, " +
             "iou=${newSettings.iouThreshold}, mode=${newSettings.detectionMode}, " +
             "skip=${newSettings.frameSkip}, backend=${newSettings.backendPreference}, " +

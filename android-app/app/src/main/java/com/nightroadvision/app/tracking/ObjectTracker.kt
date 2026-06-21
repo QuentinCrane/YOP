@@ -72,12 +72,12 @@ data class Track(
 class ObjectTracker(initialConfig: Config = Config()) {
 
     data class Config(
-        val iouThreshold: Float = 0.22f,
-        val confirmFrames: Int = 2,
-        val maxMissedFrames: Int = 8,
-        val boxSmoothing: Float = 0.60f,
+        val iouThreshold: Float = 0.15f,
+        val confirmFrames: Int = 1,
+        val maxMissedFrames: Int = 15,
+        val boxSmoothing: Float = 0.50f,
         val confidenceSmoothing: Float = 0.40f,
-        val maxVisibleMissedFrames: Int = 2,
+        val maxVisibleMissedFrames: Int = 4,
     ) {
         fun sanitized(): Config = copy(
             iouThreshold = iouThreshold.coerceIn(0.05f, 0.80f),

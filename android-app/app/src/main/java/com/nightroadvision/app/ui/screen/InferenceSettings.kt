@@ -4,23 +4,23 @@ import android.content.Context
 import com.nightroadvision.app.model.ModelQuantization
 
 enum class DetectionMode(val label: String, val description: String) {
-    ECO("ECO", "Low power"),
-    BALANCED("BALANCED", "Daily use"),
-    FINE("FINE", "More recall"),
-    LONG_RANGE("LONG", "Distant targets"),
-    CUSTOM("CUSTOM", "Manual tuning"),
+    ECO("ECO", "低功耗"),
+    BALANCED("BALANCED", "日常使用"),
+    FINE("FINE", "更多召回"),
+    LONG_RANGE("LONG", "远距离目标"),
+    CUSTOM("CUSTOM", "手动调节"),
 }
 
 enum class BackendPreference(val label: String) {
-    AUTO("Auto"),
+    AUTO("自动"),
     GPU("GPU"),
     NNAPI("NNAPI"),
     CPU("CPU"),
 }
 
 enum class GpuPrecision(val label: String) {
-    FP16("FP16 (Fast)"),
-    FP32("FP32 (Precise)"),
+    FP16("FP16 (快速)"),
+    FP32("FP32 (精确)"),
 }
 
 enum class AnalysisResolution(
@@ -29,9 +29,9 @@ enum class AnalysisResolution(
     val height: Int,
     val description: String,
 ) {
-    PERFORMANCE("540p", 960, 540, "Lower camera cost"),
-    BALANCED("720p", 1280, 720, "Recommended"),
-    DETAIL("1080p", 1920, 1080, "More source detail"),
+    PERFORMANCE("540p", 960, 540, "更低相机开销"),
+    BALANCED("720p", 1280, 720, "推荐"),
+    DETAIL("1080p", 1920, 1080, "更多源细节"),
 }
 
 data class InferenceSettings(
@@ -43,16 +43,16 @@ data class InferenceSettings(
     val classAwareNms: Boolean = true,
     val detectionMode: DetectionMode = DetectionMode.BALANCED,
     val frameSkip: Int = 1,
-    val selectedModelId: String = "yolo26n",
+    val selectedModelId: String = "yolo26n_int8",
     val backendPreference: BackendPreference = BackendPreference.AUTO,
     val gpuPrecision: GpuPrecision = GpuPrecision.FP16,
     val quantizationPreference: ModelQuantization = ModelQuantization.AUTO,
     val cpuThreads: Int = 4,
     val trackingEnabled: Boolean = true,
-    val trackerIouThreshold: Float = 0.22f,
-    val trackerConfirmFrames: Int = 2,
-    val trackerMaxMissedFrames: Int = 8,
-    val boxSmoothing: Float = 0.60f,
+    val trackerIouThreshold: Float = 0.15f,
+    val trackerConfirmFrames: Int = 1,
+    val trackerMaxMissedFrames: Int = 15,
+    val boxSmoothing: Float = 0.50f,
     val digitalZoomRatio: Float = 1.0f,
     val exposureCompensation: Int = 0,
     val analysisResolution: AnalysisResolution = AnalysisResolution.BALANCED,
@@ -61,6 +61,9 @@ data class InferenceSettings(
     val showTrackIds: Boolean = false,
     val vibrationAlertsEnabled: Boolean = true,
     val soundAlertsEnabled: Boolean = true,
+    val dangerDistanceM: Float = 8f,
+    val urgentDistanceM: Float = 18f,
+    val cautionDistanceM: Float = 35f,
 )
 
 fun InferenceSettings.withPreset(mode: DetectionMode): InferenceSettings = when (mode) {
@@ -72,16 +75,20 @@ fun InferenceSettings.withPreset(mode: DetectionMode): InferenceSettings = when 
         maxDetections = 30,
         frameSkip = 3,
         cpuThreads = 2,
-        trackerIouThreshold = 0.28f,
+        trackerIouThreshold = 0.20f,
         trackerConfirmFrames = 2,
-        trackerMaxMissedFrames = 6,
-        boxSmoothing = 0.55f,
+        trackerMaxMissedFrames = 10,
+        boxSmoothing = 0.50f,
         digitalZoomRatio = 1.0f,
         analysisResolution = AnalysisResolution.PERFORMANCE,
         detectionMode = mode,
     )
 
     DetectionMode.BALANCED -> InferenceSettings(
+        frameSkip = 2,
+        maxDetections = 40,
+        cpuThreads = 4,
+        analysisResolution = AnalysisResolution.PERFORMANCE,
         selectedModelId = selectedModelId,
         backendPreference = backendPreference,
         gpuPrecision = gpuPrecision,
@@ -101,10 +108,10 @@ fun InferenceSettings.withPreset(mode: DetectionMode): InferenceSettings = when 
         maxDetections = 100,
         frameSkip = 1,
         cpuThreads = 4,
-        trackerIouThreshold = 0.18f,
-        trackerConfirmFrames = 2,
-        trackerMaxMissedFrames = 10,
-        boxSmoothing = 0.68f,
+        trackerIouThreshold = 0.12f,
+        trackerConfirmFrames = 1,
+        trackerMaxMissedFrames = 18,
+        boxSmoothing = 0.55f,
         analysisResolution = AnalysisResolution.DETAIL,
         detectionMode = mode,
     )
@@ -117,10 +124,10 @@ fun InferenceSettings.withPreset(mode: DetectionMode): InferenceSettings = when 
         maxDetections = 100,
         frameSkip = 1,
         cpuThreads = 4,
-        trackerIouThreshold = 0.12f,
+        trackerIouThreshold = 0.10f,
         trackerConfirmFrames = 1,
-        trackerMaxMissedFrames = 12,
-        boxSmoothing = 0.72f,
+        trackerMaxMissedFrames = 20,
+        boxSmoothing = 0.60f,
         digitalZoomRatio = 1.25f,
         analysisResolution = AnalysisResolution.DETAIL,
         detectionMode = mode,
@@ -143,6 +150,9 @@ fun InferenceSettings.sanitized(): InferenceSettings = copy(
     boxSmoothing = boxSmoothing.coerceIn(0.05f, 1.0f),
     digitalZoomRatio = digitalZoomRatio.coerceIn(1.0f, 3.0f),
     exposureCompensation = exposureCompensation.coerceIn(-6, 6),
+    dangerDistanceM = dangerDistanceM.coerceIn(2f, 30f),
+    urgentDistanceM = urgentDistanceM.coerceIn(5f, 60f),
+    cautionDistanceM = cautionDistanceM.coerceIn(10f, 100f),
 )
 
 /** Persists advanced controls without tying the ViewModel to UI lifecycle state. */
@@ -178,6 +188,9 @@ class InferenceSettingsStore(context: Context) {
             showTrackIds = preferences.getBoolean("show_track_ids", defaults.showTrackIds),
             vibrationAlertsEnabled = preferences.getBoolean("vibration", defaults.vibrationAlertsEnabled),
             soundAlertsEnabled = preferences.getBoolean("sound", defaults.soundAlertsEnabled),
+            dangerDistanceM = preferences.getFloat("danger_dist", defaults.dangerDistanceM),
+            urgentDistanceM = preferences.getFloat("urgent_dist", defaults.urgentDistanceM),
+            cautionDistanceM = preferences.getFloat("caution_dist", defaults.cautionDistanceM),
         ).sanitized()
     }
 
@@ -210,6 +223,9 @@ class InferenceSettingsStore(context: Context) {
             .putBoolean("show_track_ids", value.showTrackIds)
             .putBoolean("vibration", value.vibrationAlertsEnabled)
             .putBoolean("sound", value.soundAlertsEnabled)
+            .putFloat("danger_dist", value.dangerDistanceM)
+            .putFloat("urgent_dist", value.urgentDistanceM)
+            .putFloat("caution_dist", value.cautionDistanceM)
             .apply()
     }
 
