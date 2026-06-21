@@ -39,6 +39,7 @@ import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.camera.view.PreviewView
 import com.nightroadvision.app.model.ModelManager
+import com.nightroadvision.app.model.ModelQuantization
 import com.nightroadvision.app.alert.RidingRisk
 import com.nightroadvision.app.alert.RiskReason
 import com.nightroadvision.app.alert.RiskSeverity
@@ -90,44 +91,6 @@ fun NightVisionTheme(content: @Composable () -> Unit) {
     )
     MaterialTheme(colorScheme = colorScheme, content = content)
 }
-
-// ──────────────────────────────────────────────────────────────────────────────
-// Detection mode enum (shared with ViewModel)
-// ──────────────────────────────────────────────────────────────────────────────
-
-enum class DetectionMode(val label: String, val description: String) {
-    ECO("ECO", "Minimal processing, best battery life"),
-    BALANCED("BALANCED", "Recommended for most scenarios"),
-    FINE("FINE", "Maximum accuracy, higher power usage")
-}
-
-// ──────────────────────────────────────────────────────────────────────────────
-// Data classes used by ViewModel (defined here for same-package access)
-// ──────────────────────────────────────────────────────────────────────────────
-
-enum class BackendPreference(val label: String) {
-    AUTO("Auto"),
-    GPU("GPU"),
-    NNAPI("NNAPI"),
-    CPU("CPU")
-}
-
-enum class GpuPrecision(val label: String) {
-    FP16("FP16 (Fast)"),
-    FP32("FP32 (Precise)")
-}
-
-data class InferenceSettings(
-    val confidenceThreshold: Float = 0.25f,
-    val iouThreshold: Float = 0.45f,
-    val detectionMode: DetectionMode = DetectionMode.BALANCED,
-    val frameSkip: Int = 1,
-    val selectedModelId: String = "yolo26n",
-    val backendPreference: BackendPreference = BackendPreference.AUTO,
-    val gpuPrecision: GpuPrecision = GpuPrecision.FP16,
-    val vibrationAlertsEnabled: Boolean = true,
-    val soundAlertsEnabled: Boolean = true,
-)
 
 data class PerformanceMetrics(
     val fps: Float = 0f,
@@ -318,6 +281,9 @@ fun SettingsDialog(
     currentModelName: String,
     onSettingsChanged: (InferenceSettings) -> Unit,
     onOpenModelSelector: () -> Unit,
+    onResetSettings: () -> Unit,
+    int8Available: Boolean,
+    onQuantizationSelected: (ModelQuantization) -> Unit,
     onDismiss: () -> Unit,
     supercomboEnabled: Boolean = false,
     onSupercomboToggle: (Boolean) -> Unit = {},
@@ -393,6 +359,42 @@ fun SettingsDialog(
                     }
                 }
 
+                SettingsSection(label = "MODEL QUANTIZATION") {
+                    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            listOf(
+                                ModelQuantization.AUTO,
+                                ModelQuantization.FP16,
+                                ModelQuantization.INT8,
+                            ).forEach { quantization ->
+                                val enabled = quantization != ModelQuantization.INT8 || int8Available
+                                SettingsChoiceChip(
+                                    label = quantization.label,
+                                    description = when (quantization) {
+                                        ModelQuantization.AUTO -> "Keep model"
+                                        ModelQuantization.FP16 -> "GPU quality"
+                                        ModelQuantization.INT8 -> if (int8Available) "NNAPI / CPU" else "Not installed"
+                                        ModelQuantization.FP32 -> "Full precision"
+                                    },
+                                    selected = settings.quantizationPreference == quantization,
+                                    enabled = enabled,
+                                    onClick = { onQuantizationSelected(quantization) },
+                                    modifier = Modifier.weight(1f),
+                                )
+                            }
+                        }
+                        Text(
+                            text = if (int8Available) {
+                                "INT8 uses a calibrated model and may reduce accuracy slightly"
+                            } else {
+                                "Export yolo26n_balanced_512x320_int8.tflite to enable INT8"
+                            },
+                            style = MaterialTheme.typography.labelSmall,
+                            color = NightVisionColors.TextMuted,
+                        )
+                    }
+                }
+
                 // ── Confidence Threshold Slider ──
                 SettingsSection(label = "CONFIDENCE THRESHOLD") {
                     Column {
@@ -417,7 +419,10 @@ fun SettingsDialog(
                         Slider(
                             value = settings.confidenceThreshold,
                             onValueChange = {
-                                onSettingsChanged(settings.copy(confidenceThreshold = it))
+                                onSettingsChanged(settings.copy(
+                                    confidenceThreshold = it,
+                                    detectionMode = DetectionMode.CUSTOM,
+                                ))
                             },
                             valueRange = 0.1f..0.9f,
                             steps = 7,
@@ -436,6 +441,40 @@ fun SettingsDialog(
                             Text("0.10", fontSize = 10.sp, color = NightVisionColors.TextMuted)
                             Text("0.90", fontSize = 10.sp, color = NightVisionColors.TextMuted)
                         }
+                    }
+                }
+
+                SettingsSection(label = "CLASS SENSITIVITY") {
+                    Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                        SettingsValueSlider(
+                            label = "Pedestrian / bicycle / motorcycle",
+                            value = settings.vulnerableUserConfidence,
+                            valueRange = 0.05f..0.60f,
+                            steps = 10,
+                            onValueChange = {
+                                onSettingsChanged(settings.copy(
+                                    vulnerableUserConfidence = it,
+                                    detectionMode = DetectionMode.CUSTOM,
+                                ))
+                            },
+                        )
+                        SettingsValueSlider(
+                            label = "Car / bus / truck",
+                            value = settings.vehicleConfidence,
+                            valueRange = 0.05f..0.70f,
+                            steps = 12,
+                            onValueChange = {
+                                onSettingsChanged(settings.copy(
+                                    vehicleConfidence = it,
+                                    detectionMode = DetectionMode.CUSTOM,
+                                ))
+                            },
+                        )
+                        Text(
+                            text = "Lower values improve distant-object recall but may increase false alarms",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = NightVisionColors.TextMuted,
+                        )
                     }
                 }
 
@@ -463,7 +502,10 @@ fun SettingsDialog(
                         Slider(
                             value = settings.iouThreshold,
                             onValueChange = {
-                                onSettingsChanged(settings.copy(iouThreshold = it))
+                                onSettingsChanged(settings.copy(
+                                    iouThreshold = it,
+                                    detectionMode = DetectionMode.CUSTOM,
+                                ))
                             },
                             valueRange = 0.1f..0.9f,
                             steps = 7,
@@ -487,53 +529,113 @@ fun SettingsDialog(
 
                 // ── Detection Mode Selector ──
                 SettingsSection(label = "DETECTION MODE") {
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(8.dp)
-                    ) {
-                        DetectionMode.entries.forEach { mode ->
-                            val isSelected = settings.detectionMode == mode
-                            val chipColor = if (isSelected) {
-                                NightVisionColors.Accent.copy(alpha = 0.15f)
-                            } else {
-                                NightVisionColors.Background
-                            }
-                            val chipBorder = if (isSelected) {
-                                NightVisionColors.Accent
-                            } else {
-                                NightVisionColors.Border
-                            }
-
-                            Surface(
-                                modifier = Modifier
-                                    .weight(1f)
-                                    .clickable {
-                                        onSettingsChanged(settings.copy(detectionMode = mode))
-                                    },
-                                shape = RoundedCornerShape(8.dp),
-                                color = chipColor,
-                                border = BorderStroke(1.dp, chipBorder)
+                    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        DetectionMode.entries.chunked(2).forEach { modes ->
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
                             ) {
-                                Column(
-                                    modifier = Modifier.padding(vertical = 10.dp, horizontal = 8.dp),
-                                    horizontalAlignment = Alignment.CenterHorizontally
-                                ) {
-                                    Text(
-                                        text = mode.label,
-                                        style = MaterialTheme.typography.labelMedium,
-                                        fontWeight = FontWeight.Bold,
-                                        color = if (isSelected) NightVisionColors.Accent
-                                                else NightVisionColors.TextSecondary
-                                    )
-                                    Spacer(modifier = Modifier.height(2.dp))
-                                    Text(
-                                        text = mode.description,
-                                        style = MaterialTheme.typography.labelSmall,
-                                        fontSize = 9.sp,
-                                        color = NightVisionColors.TextMuted,
-                                        maxLines = 2
+                                modes.forEach { mode ->
+                                    SettingsChoiceChip(
+                                        label = mode.label,
+                                        description = mode.description,
+                                        selected = settings.detectionMode == mode,
+                                        onClick = { onSettingsChanged(settings.withPreset(mode)) },
+                                        modifier = Modifier.weight(1f),
                                     )
                                 }
+                                if (modes.size == 1) Spacer(modifier = Modifier.weight(1f))
+                            }
+                        }
+                    }
+                }
+
+                SettingsSection(label = "DETECTION FILTERING") {
+                    Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                        SettingsToggleRow(
+                            title = "Class-aware overlap suppression",
+                            description = "Prevents a vehicle box from hiding an overlapping rider or pedestrian",
+                            checked = settings.classAwareNms,
+                            onCheckedChange = {
+                                onSettingsChanged(settings.copy(
+                                    classAwareNms = it,
+                                    detectionMode = DetectionMode.CUSTOM,
+                                ))
+                            },
+                        )
+                        Text("Maximum detections", style = MaterialTheme.typography.bodySmall, color = NightVisionColors.TextSecondary)
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            listOf(30, 60, 100, 200).forEach { count ->
+                                SettingsChoiceChip(
+                                    label = count.toString(),
+                                    selected = settings.maxDetections == count,
+                                    onClick = {
+                                        onSettingsChanged(settings.copy(
+                                            maxDetections = count,
+                                            detectionMode = DetectionMode.CUSTOM,
+                                        ))
+                                    },
+                                    modifier = Modifier.weight(1f),
+                                )
+                            }
+                        }
+                    }
+                }
+
+                SettingsSection(label = "TRACKING") {
+                    Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                        SettingsToggleRow(
+                            title = "Temporal tracking",
+                            description = "Stabilizes boxes and rejects one-frame flashes",
+                            checked = settings.trackingEnabled,
+                            onCheckedChange = { onSettingsChanged(settings.copy(trackingEnabled = it)) },
+                        )
+                        SettingsValueSlider(
+                            label = "Match IoU",
+                            value = settings.trackerIouThreshold,
+                            valueRange = 0.05f..0.60f,
+                            steps = 10,
+                            onValueChange = { onSettingsChanged(settings.copy(
+                                trackerIouThreshold = it,
+                                detectionMode = DetectionMode.CUSTOM,
+                            )) },
+                        )
+                        SettingsValueSlider(
+                            label = "Box responsiveness",
+                            value = settings.boxSmoothing,
+                            valueRange = 0.10f..1.0f,
+                            steps = 8,
+                            onValueChange = { onSettingsChanged(settings.copy(
+                                boxSmoothing = it,
+                                detectionMode = DetectionMode.CUSTOM,
+                            )) },
+                        )
+                        Text("Frames required before display", style = MaterialTheme.typography.bodySmall, color = NightVisionColors.TextSecondary)
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            (1..4).forEach { count ->
+                                SettingsChoiceChip(
+                                    label = count.toString(),
+                                    selected = settings.trackerConfirmFrames == count,
+                                    onClick = { onSettingsChanged(settings.copy(
+                                        trackerConfirmFrames = count,
+                                        detectionMode = DetectionMode.CUSTOM,
+                                    )) },
+                                    modifier = Modifier.weight(1f),
+                                )
+                            }
+                        }
+                        Text("Track retention after missed frames", style = MaterialTheme.typography.bodySmall, color = NightVisionColors.TextSecondary)
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            listOf(4, 8, 12, 20).forEach { count ->
+                                SettingsChoiceChip(
+                                    label = count.toString(),
+                                    selected = settings.trackerMaxMissedFrames == count,
+                                    onClick = { onSettingsChanged(settings.copy(
+                                        trackerMaxMissedFrames = count,
+                                        detectionMode = DetectionMode.CUSTOM,
+                                    )) },
+                                    modifier = Modifier.weight(1f),
+                                )
                             }
                         }
                     }
@@ -633,7 +735,10 @@ fun SettingsDialog(
                                     modifier = Modifier
                                         .weight(1f)
                                         .clickable {
-                                            onSettingsChanged(settings.copy(frameSkip = skip))
+                                            onSettingsChanged(settings.copy(
+                                                frameSkip = skip,
+                                                detectionMode = DetectionMode.CUSTOM,
+                                            ))
                                         },
                                     shape = RoundedCornerShape(8.dp),
                                     color = chipColor,
@@ -665,6 +770,53 @@ fun SettingsDialog(
                                 }
                             }
                         }
+                    }
+                }
+
+                SettingsSection(label = "CAMERA & DISTANCE") {
+                    Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                        Text("Analysis source quality", style = MaterialTheme.typography.bodySmall, color = NightVisionColors.TextSecondary)
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            AnalysisResolution.entries.forEach { resolution ->
+                                SettingsChoiceChip(
+                                    label = resolution.label,
+                                    description = resolution.description,
+                                    selected = settings.analysisResolution == resolution,
+                                    onClick = { onSettingsChanged(settings.copy(
+                                        analysisResolution = resolution,
+                                        detectionMode = DetectionMode.CUSTOM,
+                                    )) },
+                                    modifier = Modifier.weight(1f),
+                                )
+                            }
+                        }
+                        SettingsValueSlider(
+                            label = "Detection zoom",
+                            value = settings.digitalZoomRatio,
+                            valueRange = 1f..3f,
+                            steps = 7,
+                            valueText = String.format(Locale.US, "%.2fx", settings.digitalZoomRatio),
+                            onValueChange = { onSettingsChanged(settings.copy(
+                                digitalZoomRatio = it,
+                                detectionMode = DetectionMode.CUSTOM,
+                            )) },
+                        )
+                        SettingsValueSlider(
+                            label = "Auto exposure bias",
+                            value = settings.exposureCompensation.toFloat(),
+                            valueRange = -3f..3f,
+                            steps = 5,
+                            valueText = "%+d".format(settings.exposureCompensation),
+                            onValueChange = { onSettingsChanged(settings.copy(
+                                exposureCompensation = it.toInt(),
+                                detectionMode = DetectionMode.CUSTOM,
+                            )) },
+                        )
+                        Text(
+                            text = "Zoom improves distant target pixels but narrows the field of view; 1080p costs more preprocessing time",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = NightVisionColors.TextMuted,
+                        )
                     }
                 }
 
@@ -717,6 +869,26 @@ fun SettingsDialog(
                                         )
                                     }
                                 }
+                            }
+                        }
+                    }
+                }
+
+                SettingsSection(label = "CPU FALLBACK THREADS") {
+                    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Text(
+                            text = "Used by CPU and unsupported delegate operations; more is not always faster",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = NightVisionColors.TextSecondary,
+                        )
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            listOf(1, 2, 4, 6).forEach { count ->
+                                SettingsChoiceChip(
+                                    label = count.toString(),
+                                    selected = settings.cpuThreads == count,
+                                    onClick = { onSettingsChanged(settings.copy(cpuThreads = count)) },
+                                    modifier = Modifier.weight(1f),
+                                )
                             }
                         }
                     }
@@ -816,6 +988,26 @@ fun SettingsDialog(
                         }
                     }
                 }
+
+                SettingsSection(label = "HUD DISPLAY") {
+                    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                        SettingsToggleRow(
+                            title = "Class labels",
+                            checked = settings.showLabels,
+                            onCheckedChange = { onSettingsChanged(settings.copy(showLabels = it)) },
+                        )
+                        SettingsToggleRow(
+                            title = "Confidence percentage",
+                            checked = settings.showConfidence,
+                            onCheckedChange = { onSettingsChanged(settings.copy(showConfidence = it)) },
+                        )
+                        SettingsToggleRow(
+                            title = "Tracking IDs",
+                            checked = settings.showTrackIds,
+                            onCheckedChange = { onSettingsChanged(settings.copy(showTrackIds = it)) },
+                        )
+                    }
+                }
             }
         },
         confirmButton = {
@@ -829,7 +1021,12 @@ fun SettingsDialog(
             ) {
                 Text("DONE", fontWeight = FontWeight.Bold, letterSpacing = 1.sp)
             }
-        }
+        },
+        dismissButton = {
+            TextButton(onClick = onResetSettings) {
+                Text("RESET", color = NightVisionColors.TextSecondary)
+            }
+        },
     )
 }
 
@@ -848,6 +1045,114 @@ private fun SettingsSection(
             modifier = Modifier.padding(bottom = 8.dp)
         )
         content()
+    }
+}
+
+@Composable
+private fun SettingsChoiceChip(
+    label: String,
+    selected: Boolean,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+    description: String? = null,
+    enabled: Boolean = true,
+) {
+    Surface(
+        modifier = modifier.clickable(enabled = enabled, onClick = onClick),
+        shape = RoundedCornerShape(8.dp),
+        color = if (selected && enabled) NightVisionColors.Accent.copy(alpha = 0.15f) else NightVisionColors.Background,
+        border = BorderStroke(1.dp, if (selected && enabled) NightVisionColors.Accent else NightVisionColors.Border),
+    ) {
+        Column(
+            modifier = Modifier.padding(horizontal = 6.dp, vertical = 9.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+        ) {
+            Text(
+                text = label,
+                style = MaterialTheme.typography.labelMedium,
+                fontWeight = FontWeight.Bold,
+                color = when {
+                    !enabled -> NightVisionColors.TextMuted
+                    selected -> NightVisionColors.Accent
+                    else -> NightVisionColors.TextSecondary
+                },
+            )
+            description?.let {
+                Spacer(modifier = Modifier.height(2.dp))
+                Text(
+                    text = it,
+                    style = MaterialTheme.typography.labelSmall,
+                    fontSize = 9.sp,
+                    color = NightVisionColors.TextMuted,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun SettingsValueSlider(
+    label: String,
+    value: Float,
+    valueRange: ClosedFloatingPointRange<Float>,
+    steps: Int,
+    onValueChange: (Float) -> Unit,
+    valueText: String = String.format(Locale.US, "%.2f", value),
+) {
+    Column {
+        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+            Text(label, style = MaterialTheme.typography.bodySmall, color = NightVisionColors.TextSecondary)
+            Text(
+                valueText,
+                style = MaterialTheme.typography.bodySmall,
+                fontWeight = FontWeight.Bold,
+                fontFamily = FontFamily.Monospace,
+                color = NightVisionColors.Accent,
+            )
+        }
+        Slider(
+            value = value,
+            onValueChange = onValueChange,
+            valueRange = valueRange,
+            steps = steps,
+            colors = SliderDefaults.colors(
+                thumbColor = NightVisionColors.Accent,
+                activeTrackColor = NightVisionColors.Accent,
+                inactiveTrackColor = NightVisionColors.Border,
+            ),
+        )
+    }
+}
+
+@Composable
+private fun SettingsToggleRow(
+    title: String,
+    checked: Boolean,
+    onCheckedChange: (Boolean) -> Unit,
+    description: String? = null,
+) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Column(modifier = Modifier.weight(1f)) {
+            Text(title, style = MaterialTheme.typography.bodyMedium, color = NightVisionColors.Text)
+            description?.let {
+                Text(it, style = MaterialTheme.typography.labelSmall, color = NightVisionColors.TextMuted)
+            }
+        }
+        Switch(
+            checked = checked,
+            onCheckedChange = onCheckedChange,
+            colors = SwitchDefaults.colors(
+                checkedThumbColor = NightVisionColors.Background,
+                checkedTrackColor = NightVisionColors.Accent,
+                uncheckedThumbColor = NightVisionColors.TextSecondary,
+                uncheckedTrackColor = NightVisionColors.Border,
+            ),
+        )
     }
 }
 
@@ -1319,6 +1624,9 @@ fun MainScreen(
                 highlightedTrackId = ridingRisk.trackId,
                 cameraWidth = viewModel.getCameraFrameWidth(),
                 cameraHeight = viewModel.getCameraFrameHeight(),
+                showLabels = settings.showLabels,
+                showConfidence = settings.showConfidence,
+                showTrackIds = settings.showTrackIds,
                 modifier = Modifier.fillMaxSize()
             )
 
@@ -1439,6 +1747,9 @@ fun MainScreen(
                     showSettingsDialog = false
                     showModelSelector = true
                 },
+                onResetSettings = viewModel::resetSettings,
+                int8Available = viewModel.isInt8Available(),
+                onQuantizationSelected = viewModel::selectQuantization,
                 onDismiss = { showSettingsDialog = false },
                 supercomboEnabled = supercomboEnabled,
                 onSupercomboToggle = { viewModel.setSupercomboEnabled(it) },

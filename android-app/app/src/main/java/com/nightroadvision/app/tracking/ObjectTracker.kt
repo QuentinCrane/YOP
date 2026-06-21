@@ -69,26 +69,29 @@ data class Track(
  *   average (EMA) using alpha = [BOX_SMOOTH_ALPHA].
  * - Confidence is smoothed separately with alpha = [CONF_SMOOTH_ALPHA].
  */
-class ObjectTracker {
+class ObjectTracker(initialConfig: Config = Config()) {
+
+    data class Config(
+        val iouThreshold: Float = 0.22f,
+        val confirmFrames: Int = 2,
+        val maxMissedFrames: Int = 8,
+        val boxSmoothing: Float = 0.60f,
+        val confidenceSmoothing: Float = 0.40f,
+        val maxVisibleMissedFrames: Int = 2,
+    ) {
+        fun sanitized(): Config = copy(
+            iouThreshold = iouThreshold.coerceIn(0.05f, 0.80f),
+            confirmFrames = confirmFrames.coerceIn(1, 5),
+            maxMissedFrames = maxMissedFrames.coerceIn(1, 30),
+            boxSmoothing = boxSmoothing.coerceIn(0.05f, 1.0f),
+            confidenceSmoothing = confidenceSmoothing.coerceIn(0.05f, 1.0f),
+            maxVisibleMissedFrames = maxVisibleMissedFrames.coerceIn(0, 5),
+        )
+    }
 
     // ---- constants ----------------------------------------------------------
 
     companion object {
-        /** Minimum IoU required to consider a detection-to-track match valid. */
-        private const val IOU_THRESHOLD = 0.3f
-
-        /** Number of consecutive matches before a track is promoted to confirmed. */
-        private const val CONFIRM_THRESHOLD = 2
-
-        /** A track is dropped after this many consecutive unmatched frames. */
-        private const val MAX_MISSED = 10
-
-        /** EMA smoothing factor for bounding box (higher = more responsive). */
-        private const val BOX_SMOOTH_ALPHA = 0.6f
-
-        /** EMA smoothing factor for confidence score. */
-        private const val CONF_SMOOTH_ALPHA = 0.4f
-
         /**
          * Compute Intersection-over-Union of two axis-aligned rectangles.
          * Returns 0 when either rectangle is empty or they do not overlap.
@@ -119,6 +122,9 @@ class ObjectTracker {
     /** All live tracks (confirmed and tentative). */
     private val tracks = mutableListOf<InternalTrack>()
 
+    @Volatile
+    private var config = initialConfig.sanitized()
+
     /** Monotonically increasing ID counter. */
     private var nextId = 1
 
@@ -144,7 +150,7 @@ class ObjectTracker {
                 val det = detections[di]
                 if (det.classId != track.classId) continue
                 val iou = computeIoU(track.box, det.box)
-                if (iou >= IOU_THRESHOLD) {
+                if (iou >= config.iouThreshold) {
                     candTrackIdx.add(ti)
                     candDetIdx.add(di)
                     candIou.add(iou)
@@ -174,7 +180,7 @@ class ObjectTracker {
             val track = tracks[ti]
             val di = assignment[ti]
             if (di >= 0) {
-                tracks[ti] = track.applyDetection(detections[di])
+                tracks[ti] = track.applyDetection(detections[di], config)
             } else {
                 // Unmatched -- increment missed counter, age the track
                 tracks[ti] = track.copy(
@@ -185,7 +191,7 @@ class ObjectTracker {
         }
 
         // -- 4. Remove dead tracks --------------------------------------------
-        tracks.removeIf { it.missedFrames > MAX_MISSED }
+        tracks.removeIf { it.missedFrames > config.maxMissedFrames }
 
         // -- 5. Create new tracks for unmatched detections --------------------
         for (di in detections.indices) {
@@ -207,8 +213,16 @@ class ObjectTracker {
 
         // -- 6. Return confirmed tracks as public snapshot --------------------
         return tracks
-            .filter { it.consecutiveMatches >= CONFIRM_THRESHOLD && it.missedFrames <= 2 }
-            .map { it.toPublicTrack() }
+            .filter {
+                it.consecutiveMatches >= config.confirmFrames &&
+                    it.missedFrames <= config.maxVisibleMissedFrames
+            }
+            .map { it.toPublicTrack(config.confirmFrames) }
+    }
+
+    /** Applies tracking tuning live without discarding active IDs. */
+    fun updateConfig(value: Config) {
+        config = value.sanitized()
     }
 
     /**
@@ -223,7 +237,7 @@ class ObjectTracker {
     val trackCount: Int get() = tracks.size
 
     /** Public snapshot of every live track. Exposed for diagnostics. */
-    val allTracks: List<Track> get() = tracks.map { it.toPublicTrack() }
+    val allTracks: List<Track> get() = tracks.map { it.toPublicTrack(config.confirmFrames) }
 
     // ---- internal track representation --------------------------------------
 
@@ -245,17 +259,17 @@ class ObjectTracker {
          * Produce a new [InternalTrack] that incorporates a freshly matched
          * detection, applying EMA smoothing to box and confidence.
          */
-        fun applyDetection(det: Detection): InternalTrack {
+        fun applyDetection(det: Detection, config: Config): InternalTrack {
             // EMA-smooth the bounding box
             val newSmoothedBox = RectF(
-                lerp(smoothedBox.left, det.box.left, BOX_SMOOTH_ALPHA),
-                lerp(smoothedBox.top, det.box.top, BOX_SMOOTH_ALPHA),
-                lerp(smoothedBox.right, det.box.right, BOX_SMOOTH_ALPHA),
-                lerp(smoothedBox.bottom, det.box.bottom, BOX_SMOOTH_ALPHA)
+                lerp(smoothedBox.left, det.box.left, config.boxSmoothing),
+                lerp(smoothedBox.top, det.box.top, config.boxSmoothing),
+                lerp(smoothedBox.right, det.box.right, config.boxSmoothing),
+                lerp(smoothedBox.bottom, det.box.bottom, config.boxSmoothing)
             )
 
             // EMA-smooth confidence
-            val newConfidence = lerp(confidence, det.confidence, CONF_SMOOTH_ALPHA)
+            val newConfidence = lerp(confidence, det.confidence, config.confidenceSmoothing)
 
             return InternalTrack(
                 id = id,
@@ -270,7 +284,7 @@ class ObjectTracker {
         }
 
         /** Convert to the public immutable [Track] snapshot. */
-        fun toPublicTrack(): Track = Track(
+        fun toPublicTrack(confirmFrames: Int): Track = Track(
             id = id,
             classId = classId,
             confidence = confidence,
@@ -278,7 +292,7 @@ class ObjectTracker {
             smoothedBox = RectF(smoothedBox),
             ageFrames = ageFrames,
             missedFrames = missedFrames,
-            confirmed = consecutiveMatches >= CONFIRM_THRESHOLD
+            confirmed = consecutiveMatches >= confirmFrames
         )
     }
 }

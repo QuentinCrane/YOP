@@ -69,6 +69,8 @@ class CameraManager(
     private val onFrameReady: FrameCallback,
     modelInputWidth: Int = 512,
     modelInputHeight: Int = 320,
+    analysisWidth: Int = ANALYSIS_WIDTH,
+    analysisHeight: Int = ANALYSIS_HEIGHT,
     private val onYuvFrameReady: YuvFrameCallback? = null,
     private val shouldAnalyzeFrame: () -> Boolean = { true },
     private val shouldCaptureYuvFrame: () -> Boolean = { false },
@@ -100,6 +102,9 @@ class CameraManager(
     private var camera: Camera? = null
     private var previewUseCase: Preview? = null
     private var analysisUseCase: ImageAnalysis? = null
+    @Volatile private var requestedAnalysisWidth = analysisWidth
+    @Volatile private var requestedAnalysisHeight = analysisHeight
+    @Volatile private var manualZoomRatio = 1f
     @Volatile
     private var analysisExecutor = Executors.newSingleThreadExecutor()
 
@@ -371,7 +376,7 @@ class CameraManager(
         provider: ProcessCameraProvider,
         previewSurfaceProvider: Preview.SurfaceProvider
     ): Boolean {
-        val resolutionSelector = ResolutionSelector.Builder()
+        val previewResolutionSelector = ResolutionSelector.Builder()
             .setAspectRatioStrategy(AspectRatioStrategy.RATIO_16_9_FALLBACK_AUTO_STRATEGY)
             .setResolutionStrategy(
                 ResolutionStrategy(
@@ -380,14 +385,23 @@ class CameraManager(
                 )
             )
             .build()
+        val analysisResolutionSelector = ResolutionSelector.Builder()
+            .setAspectRatioStrategy(AspectRatioStrategy.RATIO_16_9_FALLBACK_AUTO_STRATEGY)
+            .setResolutionStrategy(
+                ResolutionStrategy(
+                    android.util.Size(requestedAnalysisWidth, requestedAnalysisHeight),
+                    ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER,
+                )
+            )
+            .build()
         val preview = Preview.Builder()
-            .setResolutionSelector(resolutionSelector)
+            .setResolutionSelector(previewResolutionSelector)
             .setTargetRotation(targetRotation)
             .build()
             .also { it.setSurfaceProvider(previewSurfaceProvider) }
 
         val analysisBuilder = ImageAnalysis.Builder()
-            .setResolutionSelector(resolutionSelector)
+            .setResolutionSelector(analysisResolutionSelector)
             .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
             .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_YUV_420_888)
             .setTargetRotation(targetRotation)
@@ -412,6 +426,7 @@ class CameraManager(
             analysisUseCase = analysis
             applySelectedZoom()
             addZoomPresetsIfNeeded()
+            if (exposureMode == ExposureMode.AUTO) setExposureCompensation(exposureCompensation)
             Log.i(TAG, "Camera bound successfully (lens=${_currentLens.value?.label})")
             FileLogger.i(TAG, "Camera bound, lens=${_currentLens.value?.id}, target rotation: $targetRotation")
             return true
@@ -434,8 +449,40 @@ class CameraManager(
     }
 
     private fun applySelectedZoom() {
-        val ratio = _currentLens.value?.zoomRatio ?: 1f
+        val ratio = if (manualZoomRatio > 1.001f) manualZoomRatio else (_currentLens.value?.zoomRatio ?: 1f)
         runCatching { camera?.cameraControl?.setZoomRatio(ratio) }
+    }
+
+    /** Applies a user-selected detection zoom and remembers it across camera rebinds. */
+    fun setZoomRatio(ratio: Float): Float {
+        val zoomState = camera?.cameraInfo?.zoomState?.value
+        val minimum = maxOf(1f, zoomState?.minZoomRatio ?: 1f)
+        val maximum = minOf(3f, zoomState?.maxZoomRatio ?: 3f)
+        val applied = ratio.coerceIn(minimum, maximum)
+        manualZoomRatio = applied
+        runCatching { camera?.cameraControl?.setZoomRatio(applied) }
+            .onFailure { FileLogger.e(TAG, "Zoom update failed: ${it.message}") }
+        return applied
+    }
+
+    /** Rebinds CameraX only when source-analysis quality changes. */
+    fun updateAnalysisResolution(width: Int, height: Int) {
+        if (width == requestedAnalysisWidth && height == requestedAnalysisHeight) return
+        requestedAnalysisWidth = width.coerceAtLeast(320)
+        requestedAnalysisHeight = height.coerceAtLeast(180)
+        val provider = cameraProvider ?: return
+        val surfaceProvider = previewSurfaceProvider ?: return
+        bindUseCases(provider, surfaceProvider)
+    }
+
+    /** Updates auto-exposure bias without restarting the camera. */
+    fun setExposureCompensation(index: Int): Int {
+        val range = camera?.cameraInfo?.exposureState?.exposureCompensationRange
+        val applied = if (range != null) index.coerceIn(range.lower, range.upper) else index.coerceIn(-6, 6)
+        exposureCompensation = applied
+        runCatching { camera?.cameraControl?.setExposureCompensationIndex(applied) }
+            .onFailure { FileLogger.e(TAG, "Exposure compensation failed: ${it.message}") }
+        return applied
     }
 
     /**

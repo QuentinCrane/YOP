@@ -4,6 +4,7 @@ import android.content.Context
 import android.util.Log
 import com.nightroadvision.app.FileLogger
 import org.tensorflow.lite.Interpreter
+import org.tensorflow.lite.DataType
 import org.tensorflow.lite.gpu.GpuDelegate
 import org.tensorflow.lite.nnapi.NnApiDelegate
 import java.io.FileInputStream
@@ -11,6 +12,8 @@ import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.MappedByteBuffer
 import java.nio.channels.FileChannel
+import java.util.concurrent.Executors
+import kotlin.math.roundToInt
 
 /**
  * InferenceEngine handles YOLOv8 TFLite model inference with proper letterbox coordinate mapping.
@@ -157,11 +160,22 @@ class InferenceEngine(private val context: Context) {
     private var gpuDelegate: GpuDelegate? = null
     private var nnApiDelegate: NnApiDelegate? = null
     private var gpuConfig: GpuConfig = GpuConfig()
+    @Volatile private var cpuThreadCount: Int = 4
     private val lock = Any()
+    private val inferenceExecutor = Executors.newSingleThreadExecutor { runnable ->
+        Thread(runnable, "NightRoadInference")
+    }
+    @Volatile private var inferenceThread: Thread? = null
 
     // Dynamic model input dimensions (read from TFLite after load)
     @Volatile var modelInputWidth: Int = DEFAULT_MODEL_INPUT_WIDTH; private set
     @Volatile var modelInputHeight: Int = DEFAULT_MODEL_INPUT_HEIGHT; private set
+    @Volatile private var inputDataType: DataType = DataType.FLOAT32
+    @Volatile private var outputDataType: DataType = DataType.FLOAT32
+    @Volatile private var inputQuantizationScale: Float = 0f
+    @Volatile private var inputQuantizationZeroPoint: Int = 0
+    @Volatile private var outputQuantizationScale: Float = 0f
+    @Volatile private var outputQuantizationZeroPoint: Int = 0
 
     // Dynamic output tensor shape (read from TFLite after load)
     // YOLO26n: [1, 300, 6] (post-NMS), YOLOv8: [1, 84, 8400] (raw)
@@ -179,6 +193,8 @@ class InferenceEngine(private val context: Context) {
 
     // Pooled output buffer — reused across frames to avoid per-frame allocation
     private var cachedOutputBuffer: Array<Array<FloatArray>>? = null
+    private var cachedQuantizedInputBuffer: ByteBuffer? = null
+    private var cachedQuantizedOutputBuffer: ByteBuffer? = null
 
     init {
         // Do not auto-load -- let the ViewModel control model selection
@@ -192,7 +208,7 @@ class InferenceEngine(private val context: Context) {
      *
      * @param assetPath Path inside assets, e.g. "models/yolov8s.tflite"
      */
-    fun loadModel(assetPath: String) {
+    fun loadModel(assetPath: String) = runOnInferenceThread {
         synchronized(lock) {
             if (assetPath == currentModelPath && interpreter != null) return@synchronized
             closeDelegates()
@@ -205,6 +221,8 @@ class InferenceEngine(private val context: Context) {
 
             // Reset pooled output buffer (output shape may have changed)
             cachedOutputBuffer = null
+            cachedQuantizedInputBuffer = null
+            cachedQuantizedOutputBuffer = null
 
             // Recompute letterbox params with new model dimensions
             cachedLetterboxParams = calculateLetterboxParams()
@@ -224,7 +242,7 @@ class InferenceEngine(private val context: Context) {
      *                       If false, throws on failure instead of falling back.
      * @throws IllegalStateException if [fallbackIfFail] is false and the delegate fails to init
      */
-    fun selectBackend(preferred: DelegateType, fallbackIfFail: Boolean = true) {
+    fun selectBackend(preferred: DelegateType, fallbackIfFail: Boolean = true) = runOnInferenceThread {
         synchronized(lock) {
             if (currentModelPath.isEmpty()) return@synchronized
             closeDelegates()
@@ -264,12 +282,39 @@ class InferenceEngine(private val context: Context) {
      * Reconfigure GPU options and reload the model with the new settings.
      * Call this to switch between FP16/FP32 or change inference preference at runtime.
      */
-    fun updateGpuConfig(config: GpuConfig) {
+    fun updateGpuConfig(config: GpuConfig) = runOnInferenceThread {
         synchronized(lock) {
             gpuConfig = config
             if (currentModelPath.isNotEmpty()) {
                 closeDelegates()
                 createInterpreterWithFallback(currentModelPath)
+            }
+        }
+    }
+
+    /** Restores the normal GPU -> NNAPI -> CPU fallback order. */
+    fun selectAutomaticBackend() = runOnInferenceThread {
+        synchronized(lock) {
+            if (currentModelPath.isEmpty()) return@synchronized
+            closeDelegates()
+            createInterpreterWithFallback(currentModelPath)
+            readModelInputDimensions()
+            cachedOutputBuffer = null
+            cachedLetterboxParams = calculateLetterboxParams()
+        }
+    }
+
+    /** Changes CPU/fallback parallelism and reloads the current interpreter safely. */
+    fun updateCpuThreadCount(count: Int) = runOnInferenceThread {
+        synchronized(lock) {
+            val sanitized = count.coerceIn(1, 8)
+            if (sanitized == cpuThreadCount) return@synchronized
+            cpuThreadCount = sanitized
+            if (currentModelPath.isNotEmpty()) {
+                closeDelegates()
+                createInterpreterWithFallback(currentModelPath)
+                readModelInputDimensions()
+                cachedOutputBuffer = null
             }
         }
     }
@@ -295,17 +340,18 @@ class InferenceEngine(private val context: Context) {
      * Run a warm-up inference to prime GPU kernels / JIT compilation.
      * Call once after model loading before starting real inference.
      */
-    fun warmUp() {
+    fun warmUp() = runOnInferenceThread {
         synchronized(lock) {
-            val interp = interpreter ?: return
+            val interp = interpreter ?: return@synchronized
             try {
                 val input = createInputBuffer()
                 val output = createOutputBuffer()
-                interp.run(input, output)
+                runInterpreter(interp, input, output)
                 Log.d(TAG, "Warm-up complete (delegate=$activeDelegate)")
             } catch (e: Exception) {
                 Log.w(TAG, "Warm-up failed: ${e.message}")
             }
+            Unit
         }
     }
 
@@ -345,7 +391,7 @@ class InferenceEngine(private val context: Context) {
                         gpuDelegate = createGpuDelegate()
                         val options = Interpreter.Options()
                             .addDelegate(gpuDelegate!!)
-                            .setNumThreads(4) // 4 threads for CPU fallback ops in hybrid GPU execution
+                            .setNumThreads(cpuThreadCount)
                         interpreter = Interpreter(modelBuffer, options)
                         activeDelegate = DelegateType.GPU
                         Log.i(
@@ -367,7 +413,7 @@ class InferenceEngine(private val context: Context) {
                         nnApiDelegate = NnApiDelegate()
                         val options = Interpreter.Options()
                             .addDelegate(nnApiDelegate!!)
-                            .setNumThreads(4)
+                            .setNumThreads(cpuThreadCount)
                         interpreter = Interpreter(modelBuffer, options)
                         activeDelegate = DelegateType.NNAPI
                         Log.i(TAG, "Using NNAPI delegate (Hexagon DSP)")
@@ -381,7 +427,7 @@ class InferenceEngine(private val context: Context) {
 
                 DelegateType.CPU -> {
                     try {
-                        val options = Interpreter.Options().setNumThreads(4)
+                        val options = Interpreter.Options().setNumThreads(cpuThreadCount)
                         interpreter = Interpreter(modelBuffer, options)
                         activeDelegate = DelegateType.CPU
                         Log.i(TAG, "Using CPU inference (XNNPACK, 4 threads)")
@@ -411,7 +457,7 @@ class InferenceEngine(private val context: Context) {
                 gpuDelegate = createGpuDelegate()
                 val options = Interpreter.Options()
                     .addDelegate(gpuDelegate!!)
-                    .setNumThreads(4)
+                    .setNumThreads(cpuThreadCount)
                 interpreter = Interpreter(modelBuffer, options)
                 activeDelegate = DelegateType.GPU
                 Log.i(TAG, "Forced GPU delegate")
@@ -421,14 +467,14 @@ class InferenceEngine(private val context: Context) {
                 nnApiDelegate = NnApiDelegate()
                 val options = Interpreter.Options()
                     .addDelegate(nnApiDelegate!!)
-                    .setNumThreads(4)
+                    .setNumThreads(cpuThreadCount)
                 interpreter = Interpreter(modelBuffer, options)
                 activeDelegate = DelegateType.NNAPI
                 Log.i(TAG, "Forced NNAPI delegate")
             }
 
             DelegateType.CPU -> {
-                val options = Interpreter.Options().setNumThreads(4)
+                val options = Interpreter.Options().setNumThreads(cpuThreadCount)
                 interpreter = Interpreter(modelBuffer, options)
                 activeDelegate = DelegateType.CPU
                 Log.i(TAG, "Forced CPU inference")
@@ -534,7 +580,8 @@ class InferenceEngine(private val context: Context) {
         inputBuffer: ByteBuffer,
         warmupRuns: Int = 5,
         timedRuns: Int = 20,
-    ): List<BenchmarkResult> = synchronized(lock) {
+    ): List<BenchmarkResult> = runOnInferenceThread {
+        synchronized(lock) {
         val results = mutableListOf<BenchmarkResult>()
         val modelBuffer = loadModelFile(context, currentModelPath)
 
@@ -555,6 +602,7 @@ class InferenceEngine(private val context: Context) {
         createInterpreterWithFallback(currentModelPath)
 
         results
+        }
     }
 
     private fun benchmarkGpu(
@@ -569,13 +617,13 @@ class InferenceEngine(private val context: Context) {
             gpuDel = createGpuDelegate()
             val interpOptions = Interpreter.Options()
                 .addDelegate(gpuDel)
-                .setNumThreads(4)
+                .setNumThreads(cpuThreadCount)
             val interp = Interpreter(modelBuffer, interpOptions)
 
             // Warm up
             for (i in 0 until warmupRuns) {
                 val out = outputFactory()
-                interp.run(inputBuffer, out)
+                runInterpreter(interp, inputBuffer, out)
             }
 
             // Timed runs
@@ -583,7 +631,7 @@ class InferenceEngine(private val context: Context) {
             for (i in 0 until timedRuns) {
                 val out = outputFactory()
                 val start = System.nanoTime()
-                interp.run(inputBuffer, out)
+                runInterpreter(interp, inputBuffer, out)
                 timings.add((System.nanoTime() - start) / 1_000_000L)
             }
 
@@ -625,19 +673,19 @@ class InferenceEngine(private val context: Context) {
             nnDel = NnApiDelegate()
             val interpOptions = Interpreter.Options()
                 .addDelegate(nnDel)
-                .setNumThreads(4)
+                .setNumThreads(cpuThreadCount)
             val interp = Interpreter(modelBuffer, interpOptions)
 
             for (i in 0 until warmupRuns) {
                 val out = outputFactory()
-                interp.run(inputBuffer, out)
+                runInterpreter(interp, inputBuffer, out)
             }
 
             val timings = mutableListOf<Long>()
             for (i in 0 until timedRuns) {
                 val out = outputFactory()
                 val start = System.nanoTime()
-                interp.run(inputBuffer, out)
+                runInterpreter(interp, inputBuffer, out)
                 timings.add((System.nanoTime() - start) / 1_000_000L)
             }
 
@@ -675,19 +723,19 @@ class InferenceEngine(private val context: Context) {
         timedRuns: Int,
     ): BenchmarkResult {
         return try {
-            val interpOptions = Interpreter.Options().setNumThreads(4)
+            val interpOptions = Interpreter.Options().setNumThreads(cpuThreadCount)
             val interp = Interpreter(modelBuffer, interpOptions)
 
             for (i in 0 until warmupRuns) {
                 val out = outputFactory()
-                interp.run(inputBuffer, out)
+                runInterpreter(interp, inputBuffer, out)
             }
 
             val timings = mutableListOf<Long>()
             for (i in 0 until timedRuns) {
                 val out = outputFactory()
                 val start = System.nanoTime()
-                interp.run(inputBuffer, out)
+                runInterpreter(interp, inputBuffer, out)
                 timings.add((System.nanoTime() - start) / 1_000_000L)
             }
 
@@ -739,6 +787,11 @@ class InferenceEngine(private val context: Context) {
         try {
             val interp = interpreter ?: return
             val inputTensor = interp.getInputTensor(0)
+            inputDataType = inputTensor.dataType()
+            inputTensor.quantizationParams().let { params ->
+                inputQuantizationScale = params.scale
+                inputQuantizationZeroPoint = params.zeroPoint
+            }
             val shape = inputTensor.shape() // e.g. [1, 640, 640, 3] or [1, 320, 512, 3]
             if (shape.size >= 4) {
                 // shape = [batch, height, width, channels]
@@ -750,8 +803,15 @@ class InferenceEngine(private val context: Context) {
 
             // Read output tensor shape to detect format
             val outputTensor = interp.getOutputTensor(0)
+            outputDataType = outputTensor.dataType()
+            outputTensor.quantizationParams().let { params ->
+                outputQuantizationScale = params.scale
+                outputQuantizationZeroPoint = params.zeroPoint
+            }
             val outShape = outputTensor.shape() // [1, 300, 6] or [1, 84, 8400]
-            FileLogger.i(TAG, "Model output tensor: ${outShape.joinToString("x")}")
+            FileLogger.i(TAG, "Model tensors: input=$inputDataType(scale=$inputQuantizationScale,zero=$inputQuantizationZeroPoint), " +
+                "output=$outputDataType(scale=$outputQuantizationScale,zero=$outputQuantizationZeroPoint), " +
+                "outputShape=${outShape.joinToString("x")}")
             if (outShape.size >= 3) {
                 numOutputRows = outShape[1]
                 outputCols = outShape[2]
@@ -900,7 +960,11 @@ class InferenceEngine(private val context: Context) {
         inputBuffer: ByteBuffer,
         confidenceThreshold: Float = DEFAULT_CONFIDENCE_THRESHOLD,
         iouThreshold: Float = DEFAULT_NMS_IOU_THRESHOLD,
-    ): InferenceResult = synchronized(lock) {
+        classConfidenceThresholds: Map<Int, Float> = emptyMap(),
+        maxDetections: Int = NUM_DETECTIONS,
+        classAwareNms: Boolean = true,
+    ): InferenceResult = runOnInferenceThread {
+        synchronized(lock) {
         val letterboxParams = cachedLetterboxParams
 
         // Reuse output buffer across frames to avoid GC pressure
@@ -914,18 +978,22 @@ class InferenceEngine(private val context: Context) {
         val startTime = System.nanoTime()
         val interp = interpreter
             ?: throw IllegalStateException("No interpreter loaded — model may have failed to initialize")
-        interp.run(inputBuffer, output)
+        runInterpreter(interp, inputBuffer, output)
         val inferenceTimeMs = (System.nanoTime() - startTime) / 1_000_000L
 
         // Parse detections based on output format
         val detections = if (isRawFormat) {
-            parseRawOutput(output, letterboxParams, confidenceThreshold)
+            parseRawOutput(output, letterboxParams, confidenceThreshold, classConfidenceThresholds)
         } else {
-            parsePostProcessedOutput(output, letterboxParams, confidenceThreshold)
+            parsePostProcessedOutput(output, letterboxParams, confidenceThreshold, classConfidenceThresholds)
         }
 
-        // Apply NMS
-        val nmsDetections = nms(detections, iouThreshold)
+        val nmsDetections = nms(
+            detections = detections,
+            iouThreshold = iouThreshold,
+            classAware = classAwareNms,
+            maxDetections = maxDetections.coerceIn(1, NUM_DETECTIONS),
+        )
 
         InferenceResult(
             detections = nmsDetections,
@@ -937,6 +1005,7 @@ class InferenceEngine(private val context: Context) {
             cameraWidth = actualCameraWidth,
             cameraHeight = actualCameraHeight,
         )
+        }
     }
 
     /**
@@ -947,6 +1016,7 @@ class InferenceEngine(private val context: Context) {
         output: Array<Array<FloatArray>>,
         letterboxParams: LetterboxParams,
         confidenceThreshold: Float,
+        classConfidenceThresholds: Map<Int, Float>,
     ): List<Detection> {
         val detections = mutableListOf<Detection>()
         val raw = output[0]
@@ -956,7 +1026,9 @@ class InferenceEngine(private val context: Context) {
 
         for (i in 0 until numOutputRows) {
             val conf = raw[i][4]
-            if (conf < confidenceThreshold) continue
+            val classId = raw[i][5].toInt()
+            val threshold = classConfidenceThresholds[classId] ?: confidenceThreshold
+            if (conf < threshold) continue
 
             val modelX1 = raw[i][0] * xScale
             val modelY1 = raw[i][1] * yScale
@@ -973,18 +1045,18 @@ class InferenceEngine(private val context: Context) {
             val cx2 = cameraX2.coerceIn(0f, actualCameraWidth.toFloat())
             val cy2 = cameraY2.coerceIn(0f, actualCameraHeight.toFloat())
 
-            val classId = raw[i][5].toInt()
-
-            detections.add(
-                Detection(
-                    x1 = cx1, y1 = cy1, x2 = cx2, y2 = cy2,
-                    confidence = conf,
-                    classId = classId,
-                    className = CLASS_NAMES.getOrElse(classId) { "unknown" },
-                    cameraWidth = actualCameraWidth,
-                    cameraHeight = actualCameraHeight,
-                ),
-            )
+            if (cx2 > cx1 && cy2 > cy1) {
+                detections.add(
+                    Detection(
+                        x1 = cx1, y1 = cy1, x2 = cx2, y2 = cy2,
+                        confidence = conf,
+                        classId = classId,
+                        className = CLASS_NAMES.getOrElse(classId) { "unknown" },
+                        cameraWidth = actualCameraWidth,
+                        cameraHeight = actualCameraHeight,
+                    ),
+                )
+            }
         }
         return detections
     }
@@ -993,7 +1065,12 @@ class InferenceEngine(private val context: Context) {
      * Non-maximum suppression to remove overlapping boxes.
      * Uses in-place boolean masking instead of list mutation for better performance.
      */
-    private fun nms(detections: List<Detection>, iouThreshold: Float): List<Detection> {
+    private fun nms(
+        detections: List<Detection>,
+        iouThreshold: Float,
+        classAware: Boolean,
+        maxDetections: Int,
+    ): List<Detection> {
         if (detections.isEmpty()) return emptyList()
 
         val sorted = detections.sortedByDescending { it.confidence }
@@ -1002,11 +1079,14 @@ class InferenceEngine(private val context: Context) {
 
         for (i in sorted.indices) {
             if (!active[i]) continue
-            selected.add(sorted[i])
+            val best = sorted[i]
+            selected.add(best)
+            if (selected.size >= maxDetections) break
             for (j in i + 1 until sorted.size) {
-                if (active[j] && iou(sorted[i], sorted[j]) > iouThreshold) {
-                    active[j] = false
-                }
+                if (!active[j]) continue
+                val other = sorted[j]
+                if (classAware && best.classId != other.classId) continue
+                if (iou(best, other) > iouThreshold) active[j] = false
             }
         }
         return selected
@@ -1029,6 +1109,69 @@ class InferenceEngine(private val context: Context) {
         return if (unionArea > 0f) interArea / unionArea else 0f
     }
 
+    private fun runInterpreter(
+        interp: Interpreter,
+        floatInput: ByteBuffer,
+        floatOutput: Array<Array<FloatArray>>,
+    ) {
+        val preparedInput = prepareInputBuffer(floatInput)
+        if (outputDataType == DataType.FLOAT32) {
+            interp.run(preparedInput, floatOutput)
+            return
+        }
+        require(outputDataType == DataType.INT8 || outputDataType == DataType.UINT8) {
+            "Unsupported quantized output type: $outputDataType"
+        }
+        val elementCount = numOutputRows * outputCols
+        val quantizedOutput = cachedQuantizedOutputBuffer?.takeIf { it.capacity() == elementCount }
+            ?: ByteBuffer.allocateDirect(elementCount).order(ByteOrder.nativeOrder()).also {
+                cachedQuantizedOutputBuffer = it
+            }
+        quantizedOutput.clear()
+        interp.run(preparedInput, quantizedOutput)
+        quantizedOutput.rewind()
+        val scale = outputQuantizationScale.takeIf { it > 0f } ?: 1f
+        for (row in 0 until numOutputRows) {
+            for (column in 0 until outputCols) {
+                val raw = if (outputDataType == DataType.UINT8) {
+                    quantizedOutput.get().toInt() and 0xFF
+                } else {
+                    quantizedOutput.get().toInt()
+                }
+                floatOutput[0][row][column] = (raw - outputQuantizationZeroPoint) * scale
+            }
+        }
+    }
+
+    private fun prepareInputBuffer(floatInput: ByteBuffer): ByteBuffer {
+        if (inputDataType == DataType.FLOAT32) {
+            floatInput.rewind()
+            return floatInput
+        }
+        require(inputDataType == DataType.INT8 || inputDataType == DataType.UINT8) {
+            "Unsupported quantized input type: $inputDataType"
+        }
+        val elementCount = modelInputHeight * modelInputWidth * 3
+        val quantizedInput = cachedQuantizedInputBuffer?.takeIf { it.capacity() == elementCount }
+            ?: ByteBuffer.allocateDirect(elementCount).order(ByteOrder.nativeOrder()).also {
+                cachedQuantizedInputBuffer = it
+            }
+        quantizedInput.clear()
+        val floats = floatInput.duplicate().order(ByteOrder.nativeOrder()).apply { rewind() }.asFloatBuffer()
+        val scale = inputQuantizationScale.takeIf { it > 0f } ?: (1f / 255f)
+        while (floats.hasRemaining()) {
+            val quantized = (floats.get() / scale + inputQuantizationZeroPoint).roundToInt()
+            val clamped = if (inputDataType == DataType.UINT8) {
+                quantized.coerceIn(0, 255)
+            } else {
+                quantized.coerceIn(-128, 127)
+            }
+            quantizedInput.put(clamped.toByte())
+        }
+        quantizedInput.rewind()
+        return quantizedInput
+    }
+
     /**
      * Create output buffer matching the model's output tensor shape.
      */
@@ -1047,6 +1190,7 @@ class InferenceEngine(private val context: Context) {
         output: Array<Array<FloatArray>>,
         letterboxParams: LetterboxParams,
         confidenceThreshold: Float,
+        classConfidenceThresholds: Map<Int, Float>,
     ): List<Detection> {
         val detections = mutableListOf<Detection>()
         val numAnchors = outputCols    // 8400
@@ -1087,7 +1231,8 @@ class InferenceEngine(private val context: Context) {
                 }
             }
 
-            if (bestScore < confidenceThreshold) continue
+            val threshold = classConfidenceThresholds[bestClass] ?: confidenceThreshold
+            if (bestScore < threshold) continue
 
             // Convert (cx, cy, w, h) → (x1, y1, x2, y2) and reverse letterbox
             val cameraX1 = (cx - w / 2f - lPadX) / lScale
@@ -1165,9 +1310,22 @@ class InferenceEngine(private val context: Context) {
         return buffer
     }
 
+    /** GPU delegates require initialization and invocation on the same thread. */
+    private fun <T> runOnInferenceThread(block: () -> T): T {
+        if (Thread.currentThread() === inferenceThread) return block()
+        return inferenceExecutor.submit<T> {
+            inferenceThread = Thread.currentThread()
+            block()
+        }.get()
+    }
+
     fun close() {
-        synchronized(lock) {
-            closeDelegates()
+        runOnInferenceThread {
+            synchronized(lock) {
+                closeDelegates()
+                cachedOutputBuffer = null
+            }
         }
+        inferenceExecutor.shutdown()
     }
 }

@@ -19,6 +19,7 @@ import com.nightroadvision.app.inference.SupercomboConstants
 import com.nightroadvision.app.inference.SupercomboEngine
 import com.nightroadvision.app.inference.SupercomboPreprocessor
 import com.nightroadvision.app.model.ModelManager
+import com.nightroadvision.app.model.ModelQuantization
 import com.nightroadvision.app.performance.PerformanceMonitor
 import com.nightroadvision.app.tracking.Detection as TrackingDetection
 import com.nightroadvision.app.tracking.ObjectTracker
@@ -50,6 +51,7 @@ class MainScreenViewModel(application: Application) : AndroidViewModel(applicati
 
     private val inferenceEngine = InferenceEngine(application)
     private val modelManager = ModelManager(application)
+    private val settingsStore = InferenceSettingsStore(application)
     private val performanceMonitor = PerformanceMonitor(application)
     private val objectTracker = ObjectTracker()
     private val ridingRiskEvaluator = RidingRiskEvaluator()
@@ -91,7 +93,9 @@ class MainScreenViewModel(application: Application) : AndroidViewModel(applicati
 
     // -- Settings (driven by UI's InferenceSettings data class) ----------------
 
-    private val _settings = MutableStateFlow(InferenceSettings())
+    private val _settings = MutableStateFlow(
+        settingsStore.load().copy(selectedModelId = modelManager.getCurrentModel().id)
+    )
     val settings: StateFlow<InferenceSettings> = _settings.asStateFlow()
 
     // -- Current model name ---------------------------------------------------
@@ -131,11 +135,26 @@ class MainScreenViewModel(application: Application) : AndroidViewModel(applicati
 
     init {
         FileLogger.i(TAG, "ViewModel init start")
+        val initialSettings = _settings.value
+        inferenceEngine.updateCpuThreadCount(initialSettings.cpuThreads)
+        inferenceEngine.updateGpuConfig(
+            InferenceEngine.GpuConfig(
+                precisionLossAllowed = initialSettings.gpuPrecision == GpuPrecision.FP16,
+            )
+        )
+        applyTrackerConfig(initialSettings)
         viewModelScope.launch(Dispatchers.Default) {
             try {
                 val savedModel = modelManager.getCurrentModel()
                 FileLogger.i(TAG, "Loading model: ${savedModel.name} (${savedModel.path})")
                 inferenceEngine.loadModel(savedModel.path)
+
+                when (initialSettings.backendPreference) {
+                    BackendPreference.AUTO -> Unit
+                    BackendPreference.GPU -> inferenceEngine.selectBackend(InferenceEngine.DelegateType.GPU)
+                    BackendPreference.NNAPI -> inferenceEngine.selectBackend(InferenceEngine.DelegateType.NNAPI)
+                    BackendPreference.CPU -> inferenceEngine.selectBackend(InferenceEngine.DelegateType.CPU)
+                }
 
                 if (inferenceEngine.isReady) {
                     inferenceEngine.warmUp()
@@ -201,6 +220,8 @@ class MainScreenViewModel(application: Application) : AndroidViewModel(applicati
             },
             modelInputWidth = currentModel.inputWidth,
             modelInputHeight = currentModel.inputHeight,
+            analysisWidth = _settings.value.analysisResolution.width,
+            analysisHeight = _settings.value.analysisResolution.height,
             onYuvFrameReady = { nv21, width, height ->
                 if (_supercomboEnabled.value && supercomboReady) {
                     supercomboPreprocessor.feedFrame(nv21, width, height)
@@ -210,6 +231,8 @@ class MainScreenViewModel(application: Application) : AndroidViewModel(applicati
             shouldCaptureYuvFrame = { _supercomboEnabled.value && supercomboReady },
         )
         cameraManager = manager
+        manager.setZoomRatio(_settings.value.digitalZoomRatio)
+        manager.setExposureCompensation(_settings.value.exposureCompensation)
         FileLogger.i(TAG, "createCameraManager: model=${currentModel.name}, " +
             "input=${currentModel.inputWidth}x${currentModel.inputHeight}")
         return manager
@@ -277,6 +300,9 @@ class MainScreenViewModel(application: Application) : AndroidViewModel(applicati
                 inputBuffer = inputBuffer,
                 confidenceThreshold = currentSettings.confidenceThreshold,
                 iouThreshold = currentSettings.iouThreshold,
+                classConfidenceThresholds = classThresholds(currentSettings),
+                maxDetections = currentSettings.maxDetections,
+                classAwareNms = currentSettings.classAwareNms,
             )
 
             // Hoist model lookup outside filter to avoid per-detection getCurrentModel() call
@@ -304,7 +330,11 @@ class MainScreenViewModel(application: Application) : AndroidViewModel(applicati
                 }
             }
 
-            val stabilizedDetections = stabilizeDetections(roadDetections)
+            val stabilizedDetections = if (currentSettings.trackingEnabled) {
+                stabilizeDetections(roadDetections)
+            } else {
+                roadDetections
+            }
             _detections.value = stabilizedDetections
             val ridingRisk = ridingRiskEvaluator.evaluate(
                 detections = stabilizedDetections,
@@ -348,49 +378,73 @@ class MainScreenViewModel(application: Application) : AndroidViewModel(applicati
 
     fun updateSettings(newSettings: InferenceSettings) {
         val oldSettings = _settings.value
-        _settings.value = newSettings
+        val sanitized = newSettings.sanitized()
+        _settings.value = sanitized
+        settingsStore.save(sanitized)
+        applyTrackerConfig(sanitized)
         FileLogger.d(TAG, "Settings updated: conf=${newSettings.confidenceThreshold}, " +
             "iou=${newSettings.iouThreshold}, mode=${newSettings.detectionMode}, " +
             "skip=${newSettings.frameSkip}, backend=${newSettings.backendPreference}, " +
             "gpuPrecision=${newSettings.gpuPrecision}")
 
-        // Apply backend preference change
-        if (oldSettings.backendPreference != newSettings.backendPreference) {
+        val engineConfigurationChanged =
+            oldSettings.backendPreference != sanitized.backendPreference ||
+                oldSettings.gpuPrecision != sanitized.gpuPrecision ||
+                oldSettings.cpuThreads != sanitized.cpuThreads
+        if (engineConfigurationChanged) {
             viewModelScope.launch(Dispatchers.Default) {
                 try {
-                    val delegate = when (newSettings.backendPreference) {
-                        BackendPreference.AUTO -> null // let engine pick
-                        BackendPreference.GPU -> InferenceEngine.DelegateType.GPU
-                        BackendPreference.NNAPI -> InferenceEngine.DelegateType.NNAPI
-                        BackendPreference.CPU -> InferenceEngine.DelegateType.CPU
+                    if (oldSettings.cpuThreads != sanitized.cpuThreads) {
+                        inferenceEngine.updateCpuThreadCount(sanitized.cpuThreads)
                     }
-                    if (delegate != null) {
-                        inferenceEngine.selectBackend(delegate)
+                    if (oldSettings.gpuPrecision != sanitized.gpuPrecision) {
+                        inferenceEngine.updateGpuConfig(
+                            InferenceEngine.GpuConfig(
+                                precisionLossAllowed = sanitized.gpuPrecision == GpuPrecision.FP16,
+                            )
+                        )
+                    }
+                    when (sanitized.backendPreference) {
+                        BackendPreference.AUTO -> inferenceEngine.selectAutomaticBackend()
+                        BackendPreference.GPU -> inferenceEngine.selectBackend(InferenceEngine.DelegateType.GPU)
+                        BackendPreference.NNAPI -> inferenceEngine.selectBackend(InferenceEngine.DelegateType.NNAPI)
+                        BackendPreference.CPU -> inferenceEngine.selectBackend(InferenceEngine.DelegateType.CPU)
                     }
                     _activeDelegate.value = inferenceEngine.getActiveDelegate()
                     _performanceMetrics.update { it.copy(backend = delegateLabel()) }
-                    FileLogger.i(TAG, "Backend applied: ${inferenceEngine.getActiveDelegate()}")
+                    FileLogger.i(TAG, "Engine settings applied: backend=${inferenceEngine.getActiveDelegate()}, " +
+                        "precision=${sanitized.gpuPrecision}, threads=${sanitized.cpuThreads}")
                 } catch (e: Exception) {
-                    FileLogger.e(TAG, "Backend switch failed: ${e.message}", e)
-                    _errorMessage.value = "后端切换失败: ${e.message}"
+                    FileLogger.e(TAG, "Engine settings failed: ${e.message}", e)
+                    _errorMessage.value = "推理设置应用失败: ${e.message}"
                 }
             }
         }
 
-        // Apply GPU precision change
-        if (oldSettings.gpuPrecision != newSettings.gpuPrecision) {
-            viewModelScope.launch(Dispatchers.Default) {
-                try {
-                    val gpuConfig = InferenceEngine.GpuConfig(
-                        precisionLossAllowed = newSettings.gpuPrecision == GpuPrecision.FP16
-                    )
-                    inferenceEngine.updateGpuConfig(gpuConfig)
-                    FileLogger.i(TAG, "GPU precision applied: ${newSettings.gpuPrecision}")
-                } catch (e: Exception) {
-                    FileLogger.e(TAG, "GPU config update failed: ${e.message}", e)
-                }
+        cameraManager?.let { manager ->
+            if (oldSettings.digitalZoomRatio != sanitized.digitalZoomRatio) {
+                manager.setZoomRatio(sanitized.digitalZoomRatio)
+            }
+            if (oldSettings.exposureCompensation != sanitized.exposureCompensation) {
+                manager.setExposureCompensation(sanitized.exposureCompensation)
+            }
+            if (oldSettings.analysisResolution != sanitized.analysisResolution) {
+                manager.updateAnalysisResolution(
+                    sanitized.analysisResolution.width,
+                    sanitized.analysisResolution.height,
+                )
             }
         }
+    }
+
+    fun resetSettings() {
+        updateSettings(
+            InferenceSettings(
+                selectedModelId = modelManager.getCurrentModel().id,
+                vibrationAlertsEnabled = _settings.value.vibrationAlertsEnabled,
+                soundAlertsEnabled = _settings.value.soundAlertsEnabled,
+            )
+        )
     }
 
     fun clearError() {
@@ -423,6 +477,29 @@ class MainScreenViewModel(application: Application) : AndroidViewModel(applicati
 
     fun getAvailableModels(): List<ModelManager.ModelInfo> = modelManager.getAvailableModels()
 
+    fun isInt8Available(): Boolean =
+        ModelQuantization.INT8 in modelManager.getAvailableQuantizations()
+
+    fun selectQuantization(quantization: ModelQuantization) {
+        if (quantization == ModelQuantization.AUTO) {
+            updateSettings(_settings.value.copy(quantizationPreference = quantization))
+            return
+        }
+        val current = modelManager.getCurrentModel()
+        val variant = modelManager.findInstalledVariant(current.family, quantization)
+            ?: modelManager.getInstalledModels().firstOrNull { it.quantization == quantization }
+        if (variant == null) {
+            _errorMessage.value = if (quantization == ModelQuantization.INT8) {
+                "INT8 模型未安装，请先导出并放入 assets/models"
+            } else {
+                "没有可用的 ${quantization.label} 模型"
+            }
+            return
+        }
+        updateSettings(_settings.value.copy(quantizationPreference = quantization))
+        if (variant.id != current.id) switchModel(variant)
+    }
+
     fun switchModel(model: ModelManager.ModelInfo) {
         viewModelScope.launch(Dispatchers.Default) {
             try {
@@ -431,6 +508,12 @@ class MainScreenViewModel(application: Application) : AndroidViewModel(applicati
 
                 modelManager.switchModel(model)
                 inferenceEngine.loadModel(model.path)
+                when (_settings.value.backendPreference) {
+                    BackendPreference.AUTO -> Unit
+                    BackendPreference.GPU -> inferenceEngine.selectBackend(InferenceEngine.DelegateType.GPU)
+                    BackendPreference.NNAPI -> inferenceEngine.selectBackend(InferenceEngine.DelegateType.NNAPI)
+                    BackendPreference.CPU -> inferenceEngine.selectBackend(InferenceEngine.DelegateType.CPU)
+                }
                 synchronized(objectTracker) {
                     objectTracker.reset()
                 }
@@ -443,7 +526,16 @@ class MainScreenViewModel(application: Application) : AndroidViewModel(applicati
                     inferenceEngine.warmUp()
                     _currentModelName.value = model.name
                     _activeDelegate.value = inferenceEngine.getActiveDelegate()
-                    _settings.update { it.copy(selectedModelId = model.id) }
+                    _settings.update { current ->
+                        current.copy(
+                            selectedModelId = model.id,
+                            quantizationPreference = if (current.quantizationPreference == ModelQuantization.AUTO) {
+                                ModelQuantization.AUTO
+                            } else {
+                                model.quantization
+                            },
+                        ).also(settingsStore::save)
+                    }
                     _performanceMetrics.update { it.copy(backend = delegateLabel()) }
                     _errorMessage.value = null
                     errorCount = 0
@@ -524,6 +616,38 @@ class MainScreenViewModel(application: Application) : AndroidViewModel(applicati
     }
 
     // -- Internals ------------------------------------------------------------
+
+    private fun applyTrackerConfig(settings: InferenceSettings) {
+        synchronized(objectTracker) {
+            objectTracker.updateConfig(
+                ObjectTracker.Config(
+                    iouThreshold = settings.trackerIouThreshold,
+                    confirmFrames = settings.trackerConfirmFrames,
+                    maxMissedFrames = settings.trackerMaxMissedFrames,
+                    boxSmoothing = settings.boxSmoothing,
+                )
+            )
+        }
+    }
+
+    private fun classThresholds(settings: InferenceSettings): Map<Int, Float> {
+        val model = modelManager.getCurrentModel()
+        return if (model.numClasses <= NIGHT_ROAD_CLASS_NAMES.size) {
+            buildMap {
+                for (classId in 0..3) put(classId, settings.vulnerableUserConfidence)
+                for (classId in 4..6) put(classId, settings.vehicleConfidence)
+            }
+        } else {
+            mapOf(
+                0 to settings.vulnerableUserConfidence,
+                1 to settings.vulnerableUserConfidence,
+                3 to settings.vulnerableUserConfidence,
+                2 to settings.vehicleConfidence,
+                5 to settings.vehicleConfidence,
+                7 to settings.vehicleConfidence,
+            )
+        }
+    }
 
     private fun isRoadUserDetection(detection: InferenceEngine.Detection): Boolean {
         val model = modelManager.getCurrentModel()

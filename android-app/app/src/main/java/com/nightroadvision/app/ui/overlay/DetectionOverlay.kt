@@ -42,6 +42,9 @@ fun DetectionOverlay(
     highlightedTrackId: Int? = null,
     cameraWidth: Int = InferenceEngine.DEFAULT_CAMERA_WIDTH,
     cameraHeight: Int = InferenceEngine.DEFAULT_CAMERA_HEIGHT,
+    showLabels: Boolean = true,
+    showConfidence: Boolean = true,
+    showTrackIds: Boolean = false,
 ) {
     val density = LocalDensity.current.density
 
@@ -101,7 +104,10 @@ fun DetectionOverlay(
                 overlayHeight = overlayHeight,
                 density = density,
                 bgPaint = bgPaint,
-                textPaint = textPaint
+                textPaint = textPaint,
+                showLabels = showLabels,
+                showConfidence = showConfidence,
+                showTrackIds = showTrackIds,
             )
         }
     }
@@ -122,7 +128,10 @@ private fun DrawScope.drawDetectionBox(
     overlayHeight: Float,
     density: Float,
     bgPaint: android.graphics.Paint,
-    textPaint: android.graphics.Paint
+    textPaint: android.graphics.Paint,
+    showLabels: Boolean,
+    showConfidence: Boolean,
+    showTrackIds: Boolean,
 ) {
     // Map upright coordinates to screen/overlay coordinates. FILL_CENTER crops the
     // preview, so valid camera coordinates can legitimately land outside the canvas.
@@ -203,13 +212,17 @@ private fun DrawScope.drawDetectionBox(
     // Draw label background
     val shouldDrawLabel = highlighted || proximity != TargetProximity.FAR ||
         (boxWidth >= 56f * density && boxHeight >= 40f * density)
-    if (!shouldDrawLabel) return
+    if (!shouldDrawLabel || (!showLabels && !showConfidence && !showTrackIds)) return
 
     val distanceLabel = detection.distanceMeters
-        ?.let { "  ${String.format(Locale.US, "%.0f", it)}m" }
+        ?.let { "${String.format(Locale.US, "%.0f", it)}m" }
         .orEmpty()
-    val label = "${detection.className.uppercase(Locale.ROOT)}  " +
-        "${(detection.confidence * 100).toInt()}%$distanceLabel"
+    val label = buildList {
+        if (showTrackIds) detection.trackId?.let { add("#$it") }
+        if (showLabels) add(detection.className.uppercase(Locale.ROOT))
+        if (showConfidence) add("${(detection.confidence * 100).toInt()}%")
+        if (distanceLabel.isNotEmpty()) add(distanceLabel)
+    }.joinToString("  ")
     val textWidth = bgPaint.measureText(label)
     val textHeight = bgPaint.textSize
     val labelPadding = 4f * density

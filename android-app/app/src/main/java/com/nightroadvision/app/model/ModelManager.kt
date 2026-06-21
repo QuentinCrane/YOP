@@ -9,6 +9,13 @@ import kotlinx.coroutines.flow.asStateFlow
 import java.io.BufferedReader
 import java.io.InputStreamReader
 
+enum class ModelQuantization(val label: String) {
+    AUTO("Auto"),
+    FP32("FP32"),
+    FP16("FP16"),
+    INT8("INT8"),
+}
+
 /**
  * Manages YOLO model selection and switching.
  * Supports multiple YOLOv8 variants with different speed/accuracy tradeoffs.
@@ -56,6 +63,8 @@ class ModelManager(private val context: Context) {
         val inputWidth: Int = DEFAULT_INPUT_WIDTH,
         val inputHeight: Int = DEFAULT_INPUT_HEIGHT,
         val numClasses: Int = DEFAULT_NUM_CLASSES,
+        val family: String = id,
+        val quantization: ModelQuantization = ModelQuantization.FP32,
     )
 
     private val prefs: SharedPreferences =
@@ -73,6 +82,21 @@ class ModelManager(private val context: Context) {
             inputWidth = 640,
             inputHeight = 640,
             numClasses = 80,
+            family = "yolo26n",
+            quantization = ModelQuantization.FP16,
+        ),
+        ModelInfo(
+            id = "yolo26n_int8",
+            name = "YOLO26n INT8",
+            path = "models/yolo26n_balanced_512x320_int8.tflite",
+            size = "~3 MB",
+            description = "YOLO26 Nano INT8 -- calibrated model for NNAPI/CPU acceleration.",
+            parameterCount = "2.4M",
+            inputWidth = 512,
+            inputHeight = 320,
+            numClasses = 80,
+            family = "yolo26n",
+            quantization = ModelQuantization.INT8,
         ),
         ModelInfo(
             id = "yolo26s",
@@ -85,6 +109,8 @@ class ModelManager(private val context: Context) {
             inputWidth = 640,
             inputHeight = 640,
             numClasses = 80,
+            family = "yolo26s",
+            quantization = ModelQuantization.FP16,
         ),
         ModelInfo(
             id = "yolov8n",
@@ -97,6 +123,7 @@ class ModelManager(private val context: Context) {
             inputWidth = 640,
             inputHeight = 640,
             numClasses = 80,
+            quantization = ModelQuantization.FP32,
         ),
         ModelInfo(
             id = "yolov8s",
@@ -109,6 +136,7 @@ class ModelManager(private val context: Context) {
             inputWidth = 640,
             inputHeight = 640,
             numClasses = 80,
+            quantization = ModelQuantization.FP32,
         ),
         ModelInfo(
             id = "yolov8m",
@@ -121,6 +149,7 @@ class ModelManager(private val context: Context) {
             inputWidth = 640,
             inputHeight = 640,
             numClasses = 80,
+            quantization = ModelQuantization.FP32,
         ),
     )
 
@@ -150,6 +179,16 @@ class ModelManager(private val context: Context) {
     fun getInstalledModels(): List<ModelInfo> = _installedModels.value
 
     fun getCurrentModel(): ModelInfo = _currentModel.value
+
+    fun getAvailableQuantizations(): Set<ModelQuantization> =
+        _installedModels.value.mapTo(mutableSetOf()) { it.quantization }
+
+    fun findInstalledVariant(
+        family: String,
+        quantization: ModelQuantization,
+    ): ModelInfo? = _installedModels.value.firstOrNull {
+        it.family == family && it.quantization == quantization
+    }
 
     /**
      * Switches the active model.
