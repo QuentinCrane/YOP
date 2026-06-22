@@ -1,8 +1,13 @@
 package com.nightroadvision.app.alert
 
+import android.content.Context
 import android.media.AudioAttributes
+import android.media.AudioFocusRequest
 import android.media.AudioFormat
+import android.media.AudioManager
 import android.media.AudioTrack
+import android.os.Handler
+import android.os.Looper
 import android.os.SystemClock
 import android.util.Log
 import kotlin.math.PI
@@ -55,7 +60,7 @@ data class SoundPreset(
  * - CHIME: pleasant musical triad notes
  * - BUZZER: harsh square-wave pulses
  */
-class AlertSoundPlayer {
+class AlertSoundPlayer(context: Context) {
 
     companion object {
         private const val TAG = "AlertSoundPlayer"
@@ -205,6 +210,38 @@ class AlertSoundPlayer {
     @Volatile private var released = false
     private val stateLock = Any()
 
+    private val audioManager = context.applicationContext
+        .getSystemService(Context.AUDIO_SERVICE) as AudioManager
+    private val audioAttributes = AudioAttributes.Builder()
+        // Navigation guidance is routed through the media volume stream. The old
+        // sonification usage was tied to system-sound volume and could be silent
+        // even when the user had media audio turned up.
+        .setUsage(AudioAttributes.USAGE_ASSISTANCE_NAVIGATION_GUIDANCE)
+        .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+        .build()
+    private val audioFocusListener = AudioManager.OnAudioFocusChangeListener { change ->
+        when (change) {
+            AudioManager.AUDIOFOCUS_GAIN -> {
+                activeTrack?.let { track -> runCatching { track.setVolume(1.0f) } }
+            }
+            AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK -> {
+                activeTrack?.let { track -> runCatching { track.setVolume(0.25f) } }
+            }
+            AudioManager.AUDIOFOCUS_LOSS,
+            AudioManager.AUDIOFOCUS_LOSS_TRANSIENT -> {
+                activeTrack?.let { track -> runCatching { track.stop() } }
+            }
+        }
+    }
+    private val audioFocusRequest = AudioFocusRequest.Builder(
+        AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK,
+    )
+        .setAudioAttributes(audioAttributes)
+        .setAcceptsDelayedFocusGain(false)
+        .setWillPauseWhenDucked(false)
+        .setOnAudioFocusChangeListener(audioFocusListener, Handler(Looper.getMainLooper()))
+        .build()
+
     // PCM buffers — regenerated when style changes
     @Volatile private var cautionPcm: ShortArray? = null
     @Volatile private var urgentPcm: ShortArray? = null
@@ -291,20 +328,30 @@ class AlertSoundPlayer {
      * Preview play a single alert level (for settings UI).
      */
     fun previewPlay(severity: RiskSeverity) {
-        if (released) return
-        val preset = PRESETS[currentStyle] ?: return
+        if (released) {
+            Log.w(TAG, "previewPlay: player released")
+            return
+        }
+        val preset = PRESETS[currentStyle]
+        if (preset == null) {
+            Log.e(TAG, "previewPlay: no preset for style $currentStyle")
+            return
+        }
         val params = when (severity) {
             RiskSeverity.CAUTION -> preset.caution
             RiskSeverity.URGENT -> preset.urgent
             RiskSeverity.DANGER -> preset.danger
             RiskSeverity.NONE -> return
         }
-        playbackQueue.offerLast {
+        Log.d(TAG, "previewPlay: queuing ${severity.name} for style ${currentStyle.label}")
+        val queued = playbackQueue.offerLast {
             runPlayback("Preview") {
                 val pcm = generateSequence(params)
+                Log.d(TAG, "Preview PCM generated: ${pcm.size} samples")
                 playPcm(pcm)
             }
         }
+        if (!queued) Log.e(TAG, "previewPlay: queue offer failed")
     }
 
     fun onRiskChanged(risk: RidingRisk) {
@@ -321,16 +368,19 @@ class AlertSoundPlayer {
             }
             RiskSeverity.CAUTION -> {
                 if (lastRiskSeverity != RiskSeverity.CAUTION || elapsed > MIN_ALERT_INTERVAL_MS * 2) {
+                    Log.d(TAG, "onRiskChanged: CAUTION detected, dist=${risk.estimatedDistanceM}")
                     if (playCautionAlert()) lastAlertTime = now
                 }
             }
             RiskSeverity.URGENT -> {
                 if (elapsed > MIN_ALERT_INTERVAL_MS || risk.severity.ordinal > lastRiskSeverity.ordinal) {
+                    Log.d(TAG, "onRiskChanged: URGENT detected, dist=${risk.estimatedDistanceM}")
                     if (playUrgentAlert()) lastAlertTime = now
                 }
             }
             RiskSeverity.DANGER -> {
                 if (elapsed > MIN_ALERT_INTERVAL_MS / 2 || risk.severity.ordinal > lastRiskSeverity.ordinal) {
+                    Log.d(TAG, "onRiskChanged: DANGER detected, dist=${risk.estimatedDistanceM}")
                     if (playDangerAlert()) lastAlertTime = now
                 }
             }
@@ -437,8 +487,46 @@ class AlertSoundPlayer {
 
     // ── Playback ──
 
+    /**
+     * Get cached PCM or generate on-demand if prewarm hasn't completed yet.
+     */
+    private fun getOrGeneratePcm(severity: RiskSeverity): ShortArray? {
+        synchronized(stateLock) {
+            if (released) return null
+            val cached = when (severity) {
+                RiskSeverity.CAUTION -> cautionPcm
+                RiskSeverity.URGENT -> urgentPcm
+                RiskSeverity.DANGER -> dangerPcm
+                RiskSeverity.NONE -> return null
+            }
+            if (cached != null) return cached
+        }
+        // Generate on-demand (prewarm may not have completed yet)
+        val preset = PRESETS[currentStyle] ?: return null
+        val params = when (severity) {
+            RiskSeverity.CAUTION -> preset.caution
+            RiskSeverity.URGENT -> preset.urgent
+            RiskSeverity.DANGER -> preset.danger
+            RiskSeverity.NONE -> return null
+        }
+        val pcm = generateSequence(params)
+        synchronized(stateLock) {
+            if (!released) {
+                when (severity) {
+                    RiskSeverity.CAUTION -> if (cautionPcm == null) cautionPcm = pcm
+                    RiskSeverity.URGENT -> if (urgentPcm == null) urgentPcm = pcm
+                    RiskSeverity.DANGER -> if (dangerPcm == null) dangerPcm = pcm
+                    RiskSeverity.NONE -> {}
+                }
+            }
+        }
+        Log.d(TAG, "Generated on-demand PCM for ${severity.name}")
+        return pcm
+    }
+
     private fun playCautionAlert(): Boolean {
-        val pcm = cautionPcm ?: return false
+        val pcm = getOrGeneratePcm(RiskSeverity.CAUTION) ?: return false
+        Log.d(TAG, "playCautionAlert: PCM size=${pcm.size}")
         return synchronized(stateLock) {
             if (released || !enabled) return false
             playbackQueue.offerLast {
@@ -448,11 +536,18 @@ class AlertSoundPlayer {
     }
 
     private fun playUrgentAlert(): Boolean {
-        val pcm = urgentPcm ?: return false
+        val pcm = getOrGeneratePcm(RiskSeverity.URGENT) ?: return false
         synchronized(stateLock) {
-            if (released || !enabled || isPlaying) return false
+            if (released || !enabled) return false
+        }
+        // Stop any currently playing alert to allow urgent to take over
+        activeTrack?.let { track ->
+            runCatching { track.stop() }
+        }
+        synchronized(stateLock) {
             isPlaying = true
         }
+        Log.d(TAG, "playUrgentAlert: PCM size=${pcm.size}")
         val queued = playbackQueue.offerFirst {
             try {
                 runPlayback("Urgent alert") { playPcm(pcm) }
@@ -465,11 +560,18 @@ class AlertSoundPlayer {
     }
 
     private fun playDangerAlert(): Boolean {
-        val pcm = dangerPcm ?: return false
+        val pcm = getOrGeneratePcm(RiskSeverity.DANGER) ?: return false
         synchronized(stateLock) {
-            if (released || !enabled || isPlaying) return false
+            if (released || !enabled) return false
+        }
+        // Stop any currently playing alert to allow danger to take over
+        activeTrack?.let { track ->
+            runCatching { track.stop() }
+        }
+        synchronized(stateLock) {
             isPlaying = true
         }
+        Log.d(TAG, "playDangerAlert: PCM size=${pcm.size}")
         val queued = playbackQueue.offerFirst {
             try {
                 runPlayback("Danger alert") {
@@ -501,15 +603,18 @@ class AlertSoundPlayer {
         val bufferSize = AudioTrack.getMinBufferSize(
             SAMPLE_RATE, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT
         )
+        check(bufferSize > 0) { "AudioTrack returned invalid minimum buffer size: $bufferSize" }
+
+        val focusResult = audioManager.requestAudioFocus(audioFocusRequest)
+        if (focusResult != AudioManager.AUDIOFOCUS_REQUEST_GRANTED) {
+            Log.w(TAG, "Audio focus denied; alert playback skipped")
+            return
+        }
+
         var track: AudioTrack? = null
         try {
             val audioTrack = AudioTrack.Builder()
-                .setAudioAttributes(
-                    AudioAttributes.Builder()
-                        .setUsage(AudioAttributes.USAGE_ASSISTANCE_SONIFICATION)
-                        .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
-                        .build()
-                )
+                .setAudioAttributes(audioAttributes)
                 .setAudioFormat(
                     AudioFormat.Builder()
                         .setSampleRate(SAMPLE_RATE)
@@ -518,22 +623,44 @@ class AlertSoundPlayer {
                         .build()
                 )
                 .setBufferSizeInBytes(maxOf(bufferSize, pcm.size * 2))
-                .setTransferMode(AudioTrack.MODE_STATIC)
+                .setTransferMode(AudioTrack.MODE_STREAM)
                 .build()
             track = audioTrack
             check(audioTrack.state == AudioTrack.STATE_INITIALIZED) { "AudioTrack initialization failed" }
+            audioTrack.setVolume(1.0f)
             activeTrack = audioTrack
-            val written = audioTrack.write(pcm, 0, pcm.size)
-            check(written >= 0) { "AudioTrack write failed: $written" }
             audioTrack.play()
+
+            var offset = 0
+            while (offset < pcm.size) {
+                val written = audioTrack.write(
+                    pcm,
+                    offset,
+                    pcm.size - offset,
+                    AudioTrack.WRITE_BLOCKING,
+                )
+                check(written > 0) { "AudioTrack write failed: $written" }
+                offset += written
+            }
+
             val durationMs = (pcm.size.toLong() * 1000) / SAMPLE_RATE
-            Thread.sleep(durationMs + 20)
+            Log.d(
+                TAG,
+                "Playing PCM: ${pcm.size} samples, ${durationMs}ms, " +
+                    "mediaVolume=${audioManager.getStreamVolume(AudioManager.STREAM_MUSIC)}/" +
+                    audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC),
+            )
+            Thread.sleep(durationMs + 50)
+            Log.d(TAG, "Playback completed")
+        } catch (e: Exception) {
+            Log.e(TAG, "playPcm failed", e)
         } finally {
             if (activeTrack === track) activeTrack = null
             track?.let { audioTrack ->
                 runCatching { audioTrack.stop() }
                 runCatching { audioTrack.release() }
             }
+            audioManager.abandonAudioFocusRequest(audioFocusRequest)
         }
     }
 

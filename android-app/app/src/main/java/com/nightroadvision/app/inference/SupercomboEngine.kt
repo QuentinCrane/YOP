@@ -15,6 +15,16 @@ class SupercomboEngine(private val context: Context) : Closeable {
 
     companion object {
         private const val TAG = "SupercomboEngine"
+
+        // Normalized phone-camera intrinsics used only to place supercombo leads
+        // on the preview. These are deliberately separate from metric distance,
+        // which comes directly from the model's road-frame x/y output.
+        private const val FOCAL_X_NORMALIZED = 0.46f
+        private const val FOCAL_Y_NORMALIZED = 0.82f
+        private const val HORIZON_Y_NORMALIZED = 0.42f
+        private const val CAMERA_HEIGHT_METERS = 1.20f
+        private const val LEAD_WIDTH_METERS = 1.80f
+        private const val LEAD_HEIGHT_METERS = 1.50f
     }
 
     private val env = OrtEnvironment.getEnvironment()
@@ -179,18 +189,23 @@ class SupercomboEngine(private val context: Context) : Closeable {
             val v = output[baseOffset + 2]  // velocity (m/s)
             val a = output[baseOffset + 3]  // acceleration (m/s²)
 
+            if (!x.isFinite() || !y.isFinite() || x <= 0.5f) {
+                Log.w(TAG, "Lead $leadIdx has invalid road coordinates: x=$x y=$y")
+                continue
+            }
             val distance = Math.sqrt((x * x + y * y).toDouble()).toFloat()
 
-            // Map vehicle-frame coords to normalized camera coords
-            // x = forward distance, y = lateral offset
-            // Camera center = (0.5, 0.5), forward maps to upper part of frame
-            val scale = 0.01f
-            val cameraX = (0.5f + y * scale).coerceIn(0f, 1f)
-            val cameraY = (0.5f - x * scale * 0.5f).coerceIn(0f, 1f)
-
-            // Rough bbox estimate
-            val approxBoxHeight = (0.12f / maxOf(distance, 1f)).coerceIn(0.01f, 0.5f)
-            val approxBoxWidth = approxBoxHeight * 0.5f
+            // Perspective projection from openpilot road frame (x forward, y left)
+            // into normalized preview coordinates. The old linear mapping moved a
+            // farther lead upward by a fixed amount and reversed lateral direction.
+            val cameraX = (0.5f - FOCAL_X_NORMALIZED * y / x).coerceIn(0f, 1f)
+            val groundY = HORIZON_Y_NORMALIZED +
+                FOCAL_Y_NORMALIZED * CAMERA_HEIGHT_METERS / x
+            val approxBoxHeight = (FOCAL_Y_NORMALIZED * LEAD_HEIGHT_METERS / x)
+                .coerceIn(0.018f, 0.48f)
+            val approxBoxWidth = (FOCAL_X_NORMALIZED * LEAD_WIDTH_METERS / x)
+                .coerceIn(0.018f, 0.42f)
+            val cameraY = (groundY - approxBoxHeight / 2f).coerceIn(0f, 1f)
 
             Log.i(TAG, "Lead $leadIdx: x=$x y=$y v=$v dist=$distance prob=$prob")
 

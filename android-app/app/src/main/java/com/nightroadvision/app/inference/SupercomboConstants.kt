@@ -67,7 +67,7 @@ object SupercomboConstants {
     val LEAD_T_OFFSETS = floatArrayOf(0f, 2f, 4f)
 
     // Detection probability threshold for leads
-    const val LEAD_PROB_THRESHOLD = 0.3f
+    const val LEAD_PROB_THRESHOLD = 0.2f
 
     // Inference frequency
     const val MODEL_RUN_FREQ_HZ = 20

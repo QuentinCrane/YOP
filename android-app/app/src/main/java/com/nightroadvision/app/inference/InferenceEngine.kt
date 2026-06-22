@@ -952,9 +952,10 @@ class InferenceEngine(private val context: Context) {
         val trackId: Int? = null,
         val cameraWidth: Int = DEFAULT_CAMERA_WIDTH,
         val cameraHeight: Int = DEFAULT_CAMERA_HEIGHT,
-        val distanceMeters: Float? = null,   // real distance from supercombo (meters)
-        val velocityMps: Float? = null,      // velocity from supercombo (m/s)
-        val isLeadVehicle: Boolean = false,   // detected by supercombo as lead vehicle
+        val distanceMeters: Float? = null,         // real distance from supercombo (meters)
+        val estimatedDistanceMeters: Float? = null, // pinhole model estimated distance (meters)
+        val velocityMps: Float? = null,            // velocity from supercombo (m/s)
+        val isLeadVehicle: Boolean = false,         // detected by supercombo as lead vehicle
     ) {
         val centerX: Float get() = (x1 + x2) / 2f
         val centerY: Float get() = (y1 + y2) / 2f
@@ -1016,8 +1017,6 @@ class InferenceEngine(private val context: Context) {
             parseRawOutput(output, letterboxParams, confidenceThreshold, classConfidenceThresholds)
         } else {
             parsePostProcessedOutput(output, letterboxParams, confidenceThreshold, classConfidenceThresholds)
-        } finally {
-            runCatching { interp?.close() }
         }
 
         val nmsDetections = nms(

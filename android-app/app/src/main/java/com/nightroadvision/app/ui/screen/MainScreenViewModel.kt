@@ -58,7 +58,7 @@ class MainScreenViewModel(application: Application) : AndroidViewModel(applicati
     private val objectTracker = ObjectTracker()
     private val ridingRiskEvaluator = RidingRiskEvaluator()
     private val ridingVibrationController = RidingVibrationController(application)
-    private val alertSoundPlayer = AlertSoundPlayer()
+    private val alertSoundPlayer = AlertSoundPlayer(application)
 
     // -- Supercombo (openpilot) ------------------------------------------------
 
@@ -374,10 +374,17 @@ class MainScreenViewModel(application: Application) : AndroidViewModel(applicati
                 _routePoints.value = emptyList()
             }
 
+            // Enrich detections with pinhole-model distance estimates
+            val enrichedDetections = enrichWithPinholeDistance(
+                roadDetections, cameraFrameHeight,
+                useNightRoad = useNightRoad,
+                digitalZoomRatio = currentSettings.digitalZoomRatio,
+            )
+
             val stabilizedDetections = if (currentSettings.trackingEnabled) {
-                stabilizeDetections(roadDetections)
+                stabilizeDetections(enrichedDetections)
             } else {
-                roadDetections
+                enrichedDetections
             }
             _detections.value = stabilizedDetections
             val ridingRisk = ridingRiskEvaluator.evaluate(
@@ -853,6 +860,7 @@ class MainScreenViewModel(application: Application) : AndroidViewModel(applicati
                 cameraWidth = cameraFrameWidth,
                 cameraHeight = cameraFrameHeight,
                 distanceMeters = original?.distanceMeters,
+                estimatedDistanceMeters = original?.estimatedDistanceMeters,
                 velocityMps = original?.velocityMps,
                 isLeadVehicle = original?.isLeadVehicle ?: false,
             )
@@ -892,6 +900,63 @@ class MainScreenViewModel(application: Application) : AndroidViewModel(applicati
             InferenceEngine.DelegateType.GPU -> "GPU (Adreno)"
             InferenceEngine.DelegateType.NNAPI -> "NNAPI (Hexagon)"
             InferenceEngine.DelegateType.CPU -> "CPU (XNNPACK)"
+        }
+    }
+
+    // Pinhole camera model constants for distance estimation
+    private val pinholeClassHeights = mapOf(
+        "person" to 1.7f, "rider" to 1.7f, "bicycle" to 1.5f,
+        "car" to 1.5f, "motorcycle" to 1.4f, "bus" to 1.5f, "truck" to 1.8f,
+    )
+    private val pinholeClassWidths = mapOf(
+        "person" to 0.5f, "rider" to 0.6f, "bicycle" to 0.6f,
+        "car" to 1.8f, "motorcycle" to 0.8f, "bus" to 2.5f, "truck" to 2.4f,
+    )
+    private val PINHOLE_FOCAL = 588f
+
+    /**
+     * Enrich detections with pinhole-model estimated distance.
+     * Uses both height and width of bounding box for robustness.
+     * Resolves night-road class names correctly (COCO class 4 = "airplane" → "car").
+     */
+    private fun enrichWithPinholeDistance(
+        detections: List<InferenceEngine.Detection>,
+        cameraHeight: Int,
+        useNightRoad: Boolean,
+        digitalZoomRatio: Float,
+    ): List<InferenceEngine.Detection> {
+        return detections.map { det ->
+            // Resolve correct class name: night-road model uses different class IDs than COCO
+            val className = if (useNightRoad) {
+                NIGHT_ROAD_CLASS_NAMES.getOrElse(det.classId) { det.className }.lowercase()
+            } else {
+                det.className.lowercase()
+            }
+            if (det.distanceMeters != null || det.estimatedDistanceMeters != null) {
+                return@map if (det.className == className) det else det.copy(className = className)
+            }
+            val classHeight = pinholeClassHeights[className] ?: return@map det
+            val pixelHeight = kotlin.math.abs(det.y2 - det.y1).coerceAtLeast(1f)
+            val pixelWidth = kotlin.math.abs(det.x2 - det.x1).coerceAtLeast(1f)
+
+            // Adjust focal factor for digital zoom: zoom narrows FOV, increasing effective focal
+            val zoomFocal = PINHOLE_FOCAL * digitalZoomRatio.coerceAtLeast(1f)
+
+            val focalH = zoomFocal * cameraHeight.coerceAtLeast(1) / 720f
+            val distH = (classHeight * focalH) / pixelHeight
+
+            val classWidth = pinholeClassWidths[className] ?: 1.8f
+            // Square pixels imply fx ≈ fy in pixel units. Scaling fx from frame
+            // width made 16:9 estimates roughly one third too large.
+            val focalW = focalH
+            val distW = (classWidth * focalW) / pixelWidth
+
+            // Weighted average: trust height more for small bboxes
+            val dist = if (pixelHeight > 20f) distH * 0.6f + distW * 0.4f else distH
+            det.copy(
+                className = className,
+                estimatedDistanceMeters = dist.coerceIn(1f, 200f),
+            )
         }
     }
 

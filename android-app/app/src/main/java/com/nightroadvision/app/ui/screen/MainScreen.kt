@@ -11,6 +11,7 @@ import androidx.compose.animation.fadeOut
 import androidx.compose.animation.slideInHorizontally
 import androidx.compose.animation.slideOutHorizontally
 import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -29,8 +30,12 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.CornerRadius
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
@@ -633,6 +638,101 @@ private fun HudSettingsButton(onClick: () -> Unit) {
     )
 }
 
+/**
+ * Thin state frame with a soft, tapered halo. The large radius and small edge
+ * inset mimic the continuous screen corners used by modern iPhones without
+ * turning the warning into an opaque band over the camera preview.
+ */
+@Composable
+private fun RiskGlowFrame(
+    severity: RiskSeverity,
+    portrait: Boolean,
+    modifier: Modifier = Modifier,
+) {
+    val primary = when (severity) {
+        RiskSeverity.DANGER -> Color(0xFFFF3B4E)
+        RiskSeverity.URGENT -> Color(0xFFFF7A1A)
+        RiskSeverity.CAUTION -> Color(0xFFFFB340)
+        RiskSeverity.NONE -> NightVisionColors.Accent
+    }
+    val highlight = when (severity) {
+        RiskSeverity.DANGER -> Color(0xFFFF8A9A)
+        RiskSeverity.URGENT -> Color(0xFFFFC06A)
+        RiskSeverity.CAUTION -> Color(0xFFFFD98A)
+        RiskSeverity.NONE -> NightVisionColors.AccentDim
+    }
+
+    val pulse = if (severity == RiskSeverity.NONE) {
+        1f
+    } else {
+        val pulseTransition = rememberInfiniteTransition(label = "risk_frame_pulse")
+        val animatedPulse by pulseTransition.animateFloat(
+            initialValue = 0.62f,
+            targetValue = 1f,
+            animationSpec = infiniteRepeatable(
+                animation = tween(
+                    durationMillis = if (severity == RiskSeverity.DANGER) 520 else 920,
+                ),
+                repeatMode = RepeatMode.Reverse,
+            ),
+            label = "risk_frame_alpha",
+        )
+        animatedPulse
+    }
+
+    Canvas(modifier = modifier) {
+        val inset = 3.dp.toPx()
+        val frameSize = Size(
+            width = (size.width - inset * 2f).coerceAtLeast(0f),
+            height = (size.height - inset * 2f).coerceAtLeast(0f),
+        )
+        if (frameSize.width <= 0f || frameSize.height <= 0f) return@Canvas
+
+        val radius = (if (portrait) 46.dp else 32.dp).toPx()
+            .coerceAtMost(frameSize.minDimension / 2f)
+        val corner = CornerRadius(radius, radius)
+        val frameBrush = Brush.sweepGradient(
+            colors = listOf(primary, highlight, primary, primary.copy(alpha = 0.72f), primary),
+            center = Offset(size.width / 2f, size.height / 2f),
+        )
+
+        if (severity == RiskSeverity.NONE) {
+            drawRoundRect(
+                color = primary.copy(alpha = 0.16f),
+                topLeft = Offset(inset, inset),
+                size = frameSize,
+                cornerRadius = corner,
+                style = Stroke(width = 0.75.dp.toPx()),
+            )
+            return@Canvas
+        }
+
+        // Wide layers stay deliberately faint; only the 1.25dp core is crisp.
+        fun drawHalo(widthPixels: Float, alpha: Float) {
+            drawRoundRect(
+                brush = frameBrush,
+                topLeft = Offset(inset, inset),
+                size = frameSize,
+                cornerRadius = corner,
+                alpha = alpha * pulse,
+                style = Stroke(width = widthPixels),
+            )
+        }
+        drawHalo(15.dp.toPx(), 0.035f)
+        drawHalo(9.dp.toPx(), 0.060f)
+        drawHalo(5.dp.toPx(), 0.105f)
+        drawHalo(2.5.dp.toPx(), 0.18f)
+        drawRoundRect(
+            brush = frameBrush,
+            topLeft = Offset(inset, inset),
+            size = frameSize,
+            cornerRadius = corner,
+            alpha = 0.82f * pulse,
+            style = Stroke(width = 1.25.dp.toPx()),
+        )
+    }
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 // 5. MAIN SCREEN (root composable)
 // ──────────────────────────────────────────────────────────────────────────────
@@ -764,91 +864,11 @@ fun MainScreen(
                 modifier = Modifier.fillMaxSize()
             )
 
-            // Animated gradient glow border — openpilot-style warning frame.
-            // Uses a rotating sweep gradient with pulsing intensity for a
-            // living, breathing effect instead of a flat solid border.
-            val riskBorderColor1 = when (ridingRisk.severity) {
-                RiskSeverity.DANGER -> Color(0xFFC92231)
-                RiskSeverity.URGENT -> Color(0xFFE8530E)
-                RiskSeverity.CAUTION -> Color(0xFFDA6F25)
-                RiskSeverity.NONE -> NightVisionColors.Accent
-            }
-            val riskBorderColor2 = when (ridingRisk.severity) {
-                RiskSeverity.DANGER -> Color(0xFFFF2266)
-                RiskSeverity.URGENT -> Color(0xFFFFAA00)
-                RiskSeverity.CAUTION -> Color(0xFFFFCC44)
-                RiskSeverity.NONE -> NightVisionColors.AccentDim
-            }
-            val riskBorderWidth = when (ridingRisk.severity) {
-                RiskSeverity.DANGER -> 10.dp
-                RiskSeverity.URGENT -> 6.dp
-                RiskSeverity.CAUTION -> 3.dp
-                RiskSeverity.NONE -> 1.dp
-            }
-            val glowWidth = when (ridingRisk.severity) {
-                RiskSeverity.DANGER -> 28.dp
-                RiskSeverity.URGENT -> 16.dp
-                RiskSeverity.CAUTION -> 8.dp
-                RiskSeverity.NONE -> 0.dp
-            }
-
-            // Pulsing animation for gradient glow
-            val infiniteTransition = rememberInfiniteTransition(label = "risk_pulse")
-            val pulseRaw by infiniteTransition.animateFloat(
-                initialValue = 0.20f,
-                targetValue = 0.70f,
-                animationSpec = infiniteRepeatable(
-                    animation = tween(durationMillis = if (ridingRisk.severity == RiskSeverity.DANGER) 400 else 800),
-                    repeatMode = RepeatMode.Reverse,
-                ),
-                label = "danger_pulse",
+            RiskGlowFrame(
+                severity = ridingRisk.severity,
+                portrait = portrait,
+                modifier = Modifier.fillMaxSize(),
             )
-            val pulseAlpha = if (ridingRisk.severity != RiskSeverity.NONE) pulseRaw else 0.18f
-
-            if (ridingRisk.severity != RiskSeverity.NONE) {
-                // Outer gradient glow — sweep gradient rotates for a living shimmer
-                val outerGlowBrush = Brush.sweepGradient(
-                    colors = listOf(
-                        riskBorderColor1.copy(alpha = pulseAlpha * 0.45f),
-                        riskBorderColor2.copy(alpha = pulseAlpha * 0.25f),
-                        riskBorderColor1.copy(alpha = pulseAlpha * 0.50f),
-                        riskBorderColor2.copy(alpha = pulseAlpha * 0.20f),
-                        riskBorderColor1.copy(alpha = pulseAlpha * 0.45f),
-                    ),
-                    center = androidx.compose.ui.geometry.Offset.Unspecified,
-                )
-                Box(
-                    modifier = Modifier
-                        .fillMaxSize()
-                        .border(width = glowWidth, brush = outerGlowBrush, shape = RoundedCornerShape(0.dp)),
-                )
-                // Inner gradient border — crisp with color shift
-                val innerBrush = Brush.sweepGradient(
-                    colors = listOf(
-                        riskBorderColor1.copy(alpha = 0.92f),
-                        riskBorderColor2.copy(alpha = 0.78f),
-                        riskBorderColor1.copy(alpha = 0.92f),
-                        riskBorderColor2.copy(alpha = 0.78f),
-                        riskBorderColor1.copy(alpha = 0.92f),
-                    ),
-                    center = androidx.compose.ui.geometry.Offset.Unspecified,
-                )
-                Box(
-                    modifier = Modifier
-                        .fillMaxSize()
-                        .border(width = riskBorderWidth, brush = innerBrush, shape = RoundedCornerShape(0.dp)),
-                )
-            } else {
-                // Subtle idle border
-                Box(
-                    modifier = Modifier
-                        .fillMaxSize()
-                        .border(
-                            width = 1.dp,
-                            color = NightVisionColors.Accent.copy(alpha = 0.15f),
-                        ),
-                )
-            }
 
             VisionStatusChip(
                 modelName = currentModelName,

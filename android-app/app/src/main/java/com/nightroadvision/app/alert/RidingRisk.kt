@@ -24,6 +24,7 @@ data class RidingRisk(
     val trackId: Int? = null,
     val className: String = "",
     val estimatedDistanceM: Float? = null,  // 估算距离（米）
+    val distanceSource: String = "",        // 距离来源：supercombo / pinhole / bbox
 )
 
 /**
@@ -53,6 +54,28 @@ class RidingRiskEvaluator {
             "truck" to 1.8f,
         )
 
+        // Typical visible widths (meters) for width-based distance estimation
+        private val CLASS_WIDTHS = mapOf(
+            "person" to 0.5f,
+            "rider" to 0.6f,
+            "bicycle" to 0.6f,
+            "car" to 1.8f,
+            "motorcycle" to 0.8f,
+            "bus" to 2.5f,
+            "truck" to 2.4f,
+        )
+
+        // Typical bbox aspect ratios (width/height) for confidence scoring
+        private val CLASS_ASPECTS = mapOf(
+            "person" to 0.4f,
+            "rider" to 0.5f,
+            "bicycle" to 0.6f,
+            "car" to 1.2f,
+            "motorcycle" to 0.7f,
+            "bus" to 1.5f,
+            "truck" to 1.4f,
+        )
+
         // Default focal length factor (tunable via calibration)
         // Calibrated for typical phone camera (~66° vertical FOV, 720px height)
         // distance = (real_height * focal_factor) / pixel_height_in_camera_space
@@ -61,6 +84,8 @@ class RidingRiskEvaluator {
 
     private val previousAreaByTrack = mutableMapOf<Int, Float>()
     private val previousDistanceByTrack = mutableMapOf<Int, Float>()
+    private val previousConfidenceByTrack = mutableMapOf<Int, Float>()
+    private val previousDistanceSourceByTrack = mutableMapOf<Int, String>()
     private var lastRisk = RidingRisk()
     private var consecutiveClearFrames = 0
 
@@ -88,23 +113,62 @@ class RidingRiskEvaluator {
     }
 
     /**
-     * Estimate distance to a detected object based on its bounding box size
-     * and known real-world class height.
+     * Estimate distance using the pinhole camera model.
      *
-     * Uses the pinhole camera model: distance = (real_height * focal_factor) / pixel_height
+     * Uses both height and width of the bounding box and averages them for robustness.
+     * At long range, small pixel errors cause large distance errors, so we also
+     * compute a confidence value based on how large the bbox is.
+     *
+     * @return Pair(distance meters, confidence 0..1) or null if class unknown
      */
     private fun estimateDistance(
         detection: InferenceEngine.Detection,
         cameraHeight: Int,
-    ): Float? {
-        val classHeight = CLASS_HEIGHTS[detection.className.lowercase()] ?: return null
-        val pixelHeight = abs(detection.y2 - detection.y1)
-        if (pixelHeight < 1f) return null
+    ): Pair<Float, Float>? {
+        val className = detection.className.lowercase()
+        val classHeight = CLASS_HEIGHTS[className] ?: return null
+        val pixelHeight = abs(detection.y2 - detection.y1).coerceAtLeast(1f)
+        val pixelWidth = abs(detection.x2 - detection.x1).coerceAtLeast(1f)
 
-        // Pinhole camera model: distance = (real_height * focal_factor) / pixel_height
-        // focalFactor is calibrated at 720px; scale it with the active analysis height.
+        // Typical aspect ratios (width/height) for each class at ~30m
+        val classAspect = CLASS_ASPECTS[className] ?: 0.5f
+
         val resolutionAdjustedFocal = focalFactor * cameraHeight.coerceAtLeast(1) / 720f
-        return (classHeight * resolutionAdjustedFocal) / pixelHeight
+
+        // Height-based estimate
+        val distFromHeight = (classHeight * resolutionAdjustedFocal) / pixelHeight
+
+        // With square camera pixels, horizontal and vertical focal lengths are
+        // approximately equal in pixel units. Scaling by frame width here would
+        // over-estimate distance on a 16:9 frame.
+        val classWidth = CLASS_WIDTHS[className] ?: 1.8f
+        val widthFocal = resolutionAdjustedFocal
+        val distFromWidth = (classWidth * widthFocal) / pixelWidth
+
+        // Weighted average: height is more reliable for upright objects (person, car),
+        // width helps when object is partially occluded vertically.
+        val dist = when {
+            pixelHeight > 40f && pixelWidth > 20f -> distFromHeight * 0.6f + distFromWidth * 0.4f
+            pixelHeight > 20f -> distFromHeight  // small bbox, trust height more
+            else -> distFromHeight * 0.7f + distFromWidth * 0.3f
+        }
+
+        // Confidence: higher for closer (larger) objects, lower for distant (tiny) ones
+        // At 5m: pixelHeight ~170px → confidence ~0.95
+        // At 15m: pixelHeight ~57px → confidence ~0.8
+        // At 30m: pixelHeight ~29px → confidence ~0.5
+        // At 50m: pixelHeight ~17px → confidence ~0.3
+        val sizeConfidence = (pixelHeight / 180f).coerceIn(0.15f, 1f)
+
+        // Aspect ratio plausibility check: if bbox is very elongated or squished,
+        // the detection may be partial/occluded → lower confidence
+        val actualAspect = pixelWidth / pixelHeight
+        val aspectDeviation = abs(actualAspect - classAspect) / classAspect
+        val aspectConfidence = (1f - aspectDeviation * 0.5f).coerceIn(0.4f, 1f)
+
+        val confidence = (sizeConfidence * aspectConfidence).coerceIn(0.1f, 1f)
+
+        return Pair(dist.coerceIn(1f, 200f), confidence)
     }
 
     @Synchronized
@@ -117,6 +181,8 @@ class RidingRiskEvaluator {
         val liveTrackIds = detections.mapNotNull { it.trackId }.toSet()
         previousAreaByTrack.keys.retainAll(liveTrackIds)
         previousDistanceByTrack.keys.retainAll(liveTrackIds)
+        previousConfidenceByTrack.keys.retainAll(liveTrackIds)
+        previousDistanceSourceByTrack.keys.retainAll(liveTrackIds)
 
         var selected = RidingRisk()
         var selectedScore = 0f
@@ -136,37 +202,62 @@ class RidingRiskEvaluator {
                 geometry.centerY in 0.34f..1f
             if (!inAttentionZone) continue
 
-            // Estimate distance
-            val estimatedDist = estimateDistance(detection, cameraHeight)
-
-            // Smooth distance with previous estimate
-            val prevDist = trackId?.let(previousDistanceByTrack::get)
-            val smoothedDist = if (prevDist != null && estimatedDist != null) {
-                prevDist * 0.3f + estimatedDist * 0.7f
-            } else {
-                estimatedDist
-            }
-            if (trackId != null && smoothedDist != null) {
-                previousDistanceByTrack[trackId] = smoothedDist
-            }
-
             val severity: RiskSeverity
             val reason: RiskReason
+            val supercomboDistance = detection.distanceMeters
+                ?.takeIf { it.isFinite() && it > 0.5f }
+            val pinholeResult = when {
+                supercomboDistance != null -> null
+                detection.estimatedDistanceMeters != null -> {
+                    detection.estimatedDistanceMeters
+                        .takeIf { it.isFinite() && it > 0.5f }
+                        ?.let { Pair(it, 0.7f) }
+                }
+                else -> estimateDistance(detection, cameraHeight)
+            }
+            val rawDistance = supercomboDistance ?: pinholeResult?.first
+            val estimateConfidence = if (supercomboDistance != null) 1f else pinholeResult?.second ?: 0f
+            val distanceSource = when {
+                supercomboDistance != null -> "supercombo"
+                rawDistance != null -> "pinhole"
+                else -> "bbox"
+            }
 
-            // Use real distance from supercombo if available, otherwise use estimated
-            val dist = detection.distanceMeters ?: smoothedDist
+            // Smooth exactly one source per frame. When the source switches, start
+            // from the new measurement instead of blending metric model output with
+            // a class-size estimate from the previous frame.
+            val previousDistance = trackId?.let(previousDistanceByTrack::get)
+            val previousSource = trackId?.let(previousDistanceSourceByTrack::get)
+            val alpha = if (distanceSource == "supercombo") {
+                0.68f
+            } else {
+                (0.3f + estimateConfidence * 0.5f).coerceIn(0.3f, 0.8f)
+            }
+            val smoothedDistance = when {
+                rawDistance == null -> null
+                previousDistance != null && previousSource == distanceSource ->
+                    previousDistance * (1f - alpha) + rawDistance * alpha
+                else -> rawDistance
+            }
+            if (trackId != null && smoothedDistance != null) {
+                val previousConfidence = previousConfidenceByTrack[trackId] ?: 0f
+                previousDistanceByTrack[trackId] = smoothedDistance
+                previousConfidenceByTrack[trackId] =
+                    maxOf(estimateConfidence, previousConfidence * 0.9f)
+                previousDistanceSourceByTrack[trackId] = distanceSource
+            }
 
-            if (dist != null) {
+            if (smoothedDistance != null) {
                 when {
-                    dist < dangerThreshold -> {
+                    smoothedDistance < dangerThreshold -> {
                         severity = RiskSeverity.DANGER
                         reason = RiskReason.IMMINENT
                     }
-                    dist < urgentThreshold -> {
+                    smoothedDistance < urgentThreshold -> {
                         severity = RiskSeverity.URGENT
                         reason = RiskReason.VERY_NEAR
                     }
-                    dist < cautionThreshold -> {
+                    smoothedDistance < cautionThreshold -> {
                         severity = RiskSeverity.CAUTION
                         reason = RiskReason.IN_ATTENTION_ZONE
                     }
@@ -208,7 +299,8 @@ class RidingRiskEvaluator {
                     reason = reason,
                     trackId = trackId,
                     className = detection.className,
-                    estimatedDistanceM = dist,
+                    estimatedDistanceM = smoothedDistance,
+                    distanceSource = distanceSource,
                 )
             }
         }
@@ -228,6 +320,8 @@ class RidingRiskEvaluator {
     fun reset() {
         previousAreaByTrack.clear()
         previousDistanceByTrack.clear()
+        previousConfidenceByTrack.clear()
+        previousDistanceSourceByTrack.clear()
         lastRisk = RidingRisk()
         consecutiveClearFrames = 0
     }

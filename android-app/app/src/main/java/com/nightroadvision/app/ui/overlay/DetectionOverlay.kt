@@ -191,7 +191,7 @@ private fun DrawScope.drawDetectionBox(
         className = detection.className,
         proximity = proximity,
         inAttentionZone = inRidingAttentionZone,
-        distanceMeters = detection.distanceMeters,
+        distanceMeters = detection.distanceMeters ?: detection.estimatedDistanceMeters,
     )
 
     if (highlighted) {
@@ -236,7 +236,7 @@ private fun DrawScope.drawDetectionBox(
         (boxWidth >= 56f * density && boxHeight >= 40f * density)
     if (!shouldDrawLabel || (!showLabels && !showConfidence && !showTrackIds)) return
 
-    val distanceLabel = detection.distanceMeters
+    val distanceLabel = (detection.distanceMeters ?: detection.estimatedDistanceMeters)
         ?.let { "${String.format(Locale.US, "%.0f", it)}m" }
         .orEmpty()
     val label = buildList {
@@ -333,27 +333,30 @@ private fun DrawScope.drawRoutePath(
     overlayHeight: Float,
     density: Float,
 ) {
-    // Path starts from bottom-center (ego vehicle position)
+    // Approximate pinhole projection. openpilot road coordinates use x forward
+    // and y left, while screen x grows to the right.
     val startX = overlayWidth / 2f
     val startY = overlayHeight * 0.92f
-
-    // Scale: map meters to screen pixels. ~30m ahead ≈ top of screen
-    val forwardScale = overlayHeight * 0.65f / 30f   // pixels per meter forward
-    val lateralScale = overlayWidth * 0.45f / 10f     // pixels per meter lateral
+    val horizonY = overlayHeight * 0.42f
+    val focalXPixels = overlayWidth * 0.46f
+    val focalYPixels = overlayHeight * 0.82f
+    val cameraHeightMeters = 1.20f
 
     val path = Path()
     path.moveTo(startX, startY)
 
     for (pt in routePoints) {
-        // Skip very distant points to avoid visual noise
-        if (pt.vehicleX > 80f || pt.vehicleX < 0.5f) continue
+        val forwardMeters = pt.vehicleX
+        if (!forwardMeters.isFinite() || !pt.vehicleY.isFinite() ||
+            forwardMeters !in 0.75f..80f
+        ) continue
 
-        val depthFraction = (pt.vehicleX / 80f).coerceIn(0f, 1f)
-        // Perspective: things converge toward vanishing point as distance increases
-        val perspectiveFade = 1f - depthFraction * 0.6f
-
-        val screenX = startX + pt.vehicleY * lateralScale * perspectiveFade
-        val screenY = startY - pt.vehicleX * forwardScale * perspectiveFade
+        // u = cx - fx * lateral / depth. Positive road-frame y is left.
+        val screenX = startX - pt.vehicleY * focalXPixels / forwardMeters
+        // Ground points approach the horizon asymptotically instead of moving
+        // linearly past it as distance grows.
+        val screenY = (horizonY + cameraHeightMeters * focalYPixels / forwardMeters)
+            .coerceIn(horizonY, startY)
 
         path.lineTo(screenX, screenY)
     }

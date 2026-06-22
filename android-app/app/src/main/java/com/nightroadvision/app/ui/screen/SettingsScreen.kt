@@ -24,6 +24,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.foundation.text.KeyboardOptions
@@ -474,7 +475,7 @@ private fun ChoiceChipRow(
                 ),
             ) {
                 Column(
-                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 14.dp),
+                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 12.dp),
                     horizontalAlignment = Alignment.CenterHorizontally,
                 ) {
                     Text(
@@ -483,6 +484,7 @@ private fun ChoiceChipRow(
                         fontWeight = FontWeight.Bold,
                         color = if (isSelected) NightVisionColors.Accent
                         else NightVisionColors.TextSecondary,
+                        textAlign = TextAlign.Center,
                     )
                     if (description.isNotEmpty()) {
                         Spacer(Modifier.height(2.dp))
@@ -491,8 +493,8 @@ private fun ChoiceChipRow(
                             style = MaterialTheme.typography.labelSmall,
                             fontSize = 10.sp,
                             color = NightVisionColors.TextMuted,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
+                            maxLines = 2,
+                            textAlign = TextAlign.Center,
                         )
                     }
                 }

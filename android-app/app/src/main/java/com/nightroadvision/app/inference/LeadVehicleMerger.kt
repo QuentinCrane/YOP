@@ -8,7 +8,10 @@ package com.nightroadvision.app.inference
 class LeadVehicleMerger {
 
     companion object {
-        private const val CENTER_DIST_THRESHOLD = 0.25f  // max normalized distance for matching
+        // 0.35 covered more than a third of the preview and could attach a lead's
+        // metric distance to the wrong vehicle. Perspective projection is now
+        // close enough to use a tighter gate.
+        private const val CENTER_DIST_THRESHOLD = 0.18f
     }
 
     /**
