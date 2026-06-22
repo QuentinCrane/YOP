@@ -1,5 +1,9 @@
 package com.nightroadvision.app.ui.screen
 
+import android.Manifest
+import android.content.pm.PackageManager
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.animateFloat
@@ -28,6 +32,7 @@ import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
+import androidx.core.content.ContextCompat
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.CornerRadius
@@ -509,6 +514,40 @@ private fun TelemetryChip(
 }
 
 @Composable
+private fun SpeedChip(
+    speedKmh: Float,
+    speedUnit: SpeedUnit,
+    modifier: Modifier = Modifier,
+) {
+    val displaySpeed = speedKmh * speedUnit.factor
+    Surface(
+        modifier = modifier.height(40.dp),
+        shape = RoundedCornerShape(18.dp),
+        color = Color.Black.copy(alpha = 0.48f),
+        border = BorderStroke(1.dp, Color.White.copy(alpha = 0.14f)),
+    ) {
+        Row(
+            modifier = Modifier.padding(horizontal = 11.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(
+                text = String.format(Locale.US, "%.0f", displaySpeed),
+                color = if (speedKmh > 1f) NightVisionColors.Accent else Color.White.copy(alpha = 0.65f),
+                fontWeight = FontWeight.Bold,
+                fontFamily = FontFamily.Monospace,
+                fontSize = 14.sp,
+            )
+            Text(
+                text = " ${speedUnit.suffix}",
+                color = Color.White.copy(alpha = 0.45f),
+                fontFamily = FontFamily.Monospace,
+                fontSize = 9.sp,
+            )
+        }
+    }
+}
+
+@Composable
 private fun TargetAlertChip(
     risk: RidingRisk,
     modifier: Modifier = Modifier,
@@ -765,6 +804,24 @@ fun MainScreen(
     val supercomboEnabled by viewModel.supercomboEnabled.collectAsState()
     val supercomboLatencyMs by viewModel.supercomboLatencyMs.collectAsState()
     val supercomboAvailable by viewModel.supercomboAvailable.collectAsState()
+    val speedKmh by viewModel.speedKmh.collectAsState()
+
+    // GPS permission
+    val context = androidx.compose.ui.platform.LocalContext.current
+    val gpsPermissionLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { isGranted ->
+        if (isGranted) viewModel.startGpsSpeed()
+    }
+    LaunchedEffect(Unit) {
+        if (ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_FINE_LOCATION)
+            == PackageManager.PERMISSION_GRANTED
+        ) {
+            viewModel.startGpsSpeed()
+        } else {
+            gpsPermissionLauncher.launch(Manifest.permission.ACCESS_FINE_LOCATION)
+        }
+    }
 
     // Local UI state
     var showSettingsPage by remember { mutableStateOf(false) }
@@ -890,14 +947,23 @@ fun MainScreen(
                     .padding(end = edgePadding, top = 8.dp),
             )
 
-            // ── Performance Panel (top-left) ──
+            SpeedChip(
+                speedKmh = speedKmh,
+                speedUnit = settings.speedUnit,
+                modifier = Modifier
+                    .align(Alignment.TopEnd)
+                    .statusBarsPadding()
+                    .padding(end = edgePadding, top = 60.dp),
+            )
+
+            // ── Performance Panel (top-right) ──
             AnimatedVisibility(
                 visible = showPerformancePanel,
                 enter = fadeIn() + slideInHorizontally(initialOffsetX = { -it }),
                 exit = fadeOut() + slideOutHorizontally(targetOffsetX = { -it }),
                 modifier = Modifier
                     .statusBarsPadding()
-                    .padding(end = edgePadding, top = 64.dp)
+                    .padding(end = edgePadding, top = 104.dp)
                     .align(Alignment.TopEnd)
                     .widthIn(min = 160.dp, max = 200.dp)
             ) {

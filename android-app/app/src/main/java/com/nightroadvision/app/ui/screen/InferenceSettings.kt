@@ -24,6 +24,12 @@ enum class GpuPrecision(val label: String) {
     FP32("FP32 (精确)"),
 }
 
+enum class SpeedUnit(val label: String, val suffix: String, val factor: Float) {
+    KMH("km/h", "km/h", 1f),
+    MPH("mph", "mph", 0.621371f),
+    MS("m/s", "m/s", 0.277778f),
+}
+
 enum class AnalysisResolution(
     val label: String,
     val width: Int,
@@ -64,6 +70,7 @@ data class InferenceSettings(
     val soundAlertsEnabled: Boolean = true,
     val alertSoundStyle: AlertSoundStyle = AlertSoundStyle.TESLA,
     val showRoutePrediction: Boolean = true,
+    val speedUnit: SpeedUnit = SpeedUnit.KMH,
     val dangerDistanceM: Float = 8f,
     val urgentDistanceM: Float = 18f,
     val cautionDistanceM: Float = 35f,
@@ -199,6 +206,7 @@ class InferenceSettingsStore(context: Context) {
             soundAlertsEnabled = preferences.getBoolean("sound", defaults.soundAlertsEnabled),
             alertSoundStyle = enumValue("alert_sound_style", defaults.alertSoundStyle),
             showRoutePrediction = preferences.getBoolean("show_route", defaults.showRoutePrediction),
+            speedUnit = enumValue("speed_unit", defaults.speedUnit),
             dangerDistanceM = preferences.getFloat("danger_dist", defaults.dangerDistanceM),
             urgentDistanceM = preferences.getFloat("urgent_dist", defaults.urgentDistanceM),
             cautionDistanceM = preferences.getFloat("caution_dist", defaults.cautionDistanceM),
@@ -236,6 +244,7 @@ class InferenceSettingsStore(context: Context) {
             .putBoolean("sound", value.soundAlertsEnabled)
             .putString("alert_sound_style", value.alertSoundStyle.name)
             .putBoolean("show_route", value.showRoutePrediction)
+            .putString("speed_unit", value.speedUnit.name)
             .putFloat("danger_dist", value.dangerDistanceM)
             .putFloat("urgent_dist", value.urgentDistanceM)
             .putFloat("caution_dist", value.cautionDistanceM)

@@ -45,14 +45,14 @@ class SupercomboEngine(private val context: Context) : Closeable {
             isModelLoaded = true
 
             session?.let { s ->
-                val expectedInputs = setOf(
+                val requiredInputs = setOf(
                     SupercomboConstants.IN_IMGS,
                     SupercomboConstants.IN_DESIRE,
                     SupercomboConstants.IN_TRAFFIC_CONVENTION,
                     SupercomboConstants.IN_INITIAL_STATE,
                 )
-                check(s.inputNames == expectedInputs) {
-                    "Unsupported supercombo inputs: ${s.inputNames}"
+                check(requiredInputs.all { it in s.inputNames }) {
+                    "Missing supercombo inputs: expected $requiredInputs but got ${s.inputNames}"
                 }
                 check(SupercomboConstants.OUT_OUTPUTS in s.outputNames) {
                     "Missing supercombo output: ${SupercomboConstants.OUT_OUTPUTS}"

@@ -18,6 +18,7 @@ import com.nightroadvision.app.inference.LeadVehicleMerger
 import com.nightroadvision.app.inference.SupercomboEngine
 import com.nightroadvision.app.inference.SupercomboPreprocessor
 import com.nightroadvision.app.ui.overlay.RoutePoint
+import com.nightroadvision.app.location.GpsSpeedManager
 import com.nightroadvision.app.model.ModelManager
 import com.nightroadvision.app.model.ModelQuantization
 import com.nightroadvision.app.performance.PerformanceMonitor
@@ -77,6 +78,19 @@ class MainScreenViewModel(application: Application) : AndroidViewModel(applicati
 
     @Volatile
     private var supercomboReady = false
+
+    // -- GPS Speed ------------------------------------------------------------
+
+    private val _speedKmh = MutableStateFlow(0f)
+    val speedKmh: StateFlow<Float> = _speedKmh.asStateFlow()
+
+    private val gpsSpeedManager = GpsSpeedManager(application) { speed ->
+        _speedKmh.value = speed
+    }
+
+    fun startGpsSpeed() {
+        gpsSpeedManager.start()
+    }
 
     // -- Camera ---------------------------------------------------------------
 
@@ -202,17 +216,23 @@ class MainScreenViewModel(application: Application) : AndroidViewModel(applicati
                     // Try loading supercombo model (optional, non-fatal)
                     try {
                         val scPath = "models/driving_supercombo.onnx"
+                        val assetList = try { application.assets.list("models")?.toList() } catch (_: Exception) { null }
+                        FileLogger.i(TAG, "Assets in models/: ${assetList?.joinToString() ?: "(null)"}")
                         supercomboReady = supercomboEngine.loadModel(scPath)
                         _supercomboAvailable.value = supercomboReady
                         if (supercomboReady) {
                             FileLogger.i(TAG, "Supercombo model loaded OK")
                         } else {
-                            FileLogger.w(TAG, "Supercombo model not found (optional)")
+                            val msg = "Supercombo 模型加载失败（文件可能不存在或格式不兼容）"
+                            FileLogger.w(TAG, msg)
+                            _errorMessage.value = msg
                         }
                     } catch (e: Exception) {
                         supercomboReady = false
                         _supercomboAvailable.value = false
-                        FileLogger.w(TAG, "Supercombo load skipped: ${e.message}")
+                        val msg = "Supercombo 加载异常: ${e.message}"
+                        FileLogger.e(TAG, msg, e)
+                        _errorMessage.value = msg
                     }
                 } else {
                     FileLogger.e(TAG, "Model load failed: ${savedModel.name} — interpreter is null")
@@ -348,6 +368,9 @@ class MainScreenViewModel(application: Application) : AndroidViewModel(applicati
             // Run supercombo if enabled and ready
             if (_supercomboEnabled.value && supercomboReady) {
                 val scInputs = supercomboPreprocessor.prepareInputs()
+                if (scInputs == null) {
+                    Log.d(TAG, "Supercombo: no inputs yet (waiting for YUV frames)")
+                }
                 val scOutput = scInputs?.let(supercomboEngine::runInference)
                 if (scOutput != null) {
                     _supercomboLatencyMs.value = scOutput.inferenceTimeMs
@@ -365,9 +388,12 @@ class MainScreenViewModel(application: Application) : AndroidViewModel(applicati
                     _routePoints.value = scOutput.pathPoints.map { pt ->
                         RoutePoint(vehicleX = pt.x, vehicleY = pt.y)
                     }
+                    Log.d(TAG, "Supercombo: ${scOutput.pathPoints.size} path points, " +
+                        "${scOutput.leads.size} leads, latency=${scOutput.inferenceTimeMs}ms")
                 } else {
                     _supercomboLatencyMs.value = 0L
                     _routePoints.value = emptyList()
+                    Log.w(TAG, "Supercombo: inference returned null")
                 }
             } else {
                 _supercomboLatencyMs.value = 0L
@@ -962,6 +988,7 @@ class MainScreenViewModel(application: Application) : AndroidViewModel(applicati
 
     override fun onCleared() {
         super.onCleared()
+        gpsSpeedManager.stop()
         cameraManager?.release()
         ridingVibrationController.reset()
         alertSoundPlayer.release()

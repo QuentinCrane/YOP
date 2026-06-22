@@ -10,7 +10,6 @@ val prepareLightweightAssets by tasks.registering(org.gradle.api.tasks.Sync::cla
     exclude(
         "models/yolov8s.tflite",
         "models/yolov8m.tflite",
-        "models/driving_supercombo.onnx",
     )
     into(lightweightAssetsDir)
 }
@@ -37,6 +36,12 @@ android {
                 "proguard-rules.pro"
             )
         }
+    }
+
+    androidResources {
+        // Compress .onnx model assets to reduce APK size.
+        // TFLite uses openFd() requiring STORED, but ONNX uses open().readBytes() so DEFLATED is fine.
+        noCompress += listOf("tflite", "txt")
     }
 
     buildFeatures {
@@ -66,8 +71,10 @@ android {
     }
 }
 
-tasks.matching { it.name.startsWith("merge") && it.name.endsWith("Assets") }.configureEach {
-    dependsOn(prepareLightweightAssets)
+afterEvaluate {
+    tasks.matching { it.name.contains("LintModel") }.configureEach {
+        dependsOn(prepareLightweightAssets)
+    }
 }
 
 dependencies {
@@ -98,6 +105,9 @@ dependencies {
 
     // ONNX Runtime for openpilot supercombo model
     implementation("com.microsoft.onnxruntime:onnxruntime-android:1.20.0")
+
+    // GPS speed
+    implementation("com.google.android.gms:play-services-location:21.3.0")
 
     testImplementation("junit:junit:4.13.2")
 
