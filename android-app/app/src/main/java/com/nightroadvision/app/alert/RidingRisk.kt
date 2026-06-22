@@ -1,6 +1,8 @@
 package com.nightroadvision.app.alert
 
 import com.nightroadvision.app.inference.InferenceEngine
+import com.nightroadvision.app.motion.CorridorProjection
+import com.nightroadvision.app.motion.DrivingCorridor
 import kotlin.math.abs
 
 enum class RiskSeverity {
@@ -24,7 +26,7 @@ data class RidingRisk(
     val trackId: Int? = null,
     val className: String = "",
     val estimatedDistanceM: Float? = null,  // 估算距离（米）
-    val distanceSource: String = "",        // 距离来源：supercombo / pinhole / bbox
+    val distanceSource: String = "",        // 距离来源：pinhole / bbox
 )
 
 /**
@@ -177,6 +179,8 @@ class RidingRiskEvaluator {
         rotationDegrees: Int,
         cameraWidth: Int,
         cameraHeight: Int,
+        drivingCorridor: DrivingCorridor = DrivingCorridor.EMPTY,
+        corridorFilteringEnabled: Boolean = true,
     ): RidingRisk {
         val liveTrackIds = detections.mapNotNull { it.trackId }.toSet()
         previousAreaByTrack.keys.retainAll(liveTrackIds)
@@ -198,16 +202,33 @@ class RidingRiskEvaluator {
             }
             if (trackId != null) previousAreaByTrack[trackId] = geometry.areaRatio
 
-            val inAttentionZone = geometry.centerX in 0.22f..0.78f &&
-                geometry.centerY in 0.34f..1f
+            val roadPoint = if (corridorFilteringEnabled) {
+                CorridorProjection.unproject(geometry.centerX, geometry.bottomY)
+            } else {
+                null
+            }
+            val corridorMargin = roadPoint
+                ?.let {
+                    (geometry.widthRatio * it.forwardMeters /
+                        (2f * CorridorProjection.FOCAL_X_NORMALIZED)).coerceIn(0.15f, 1.20f)
+                }
+                ?: 0.25f
+            val inAttentionZone = when {
+                !corridorFilteringEnabled -> true
+                drivingCorridor.points.size >= 2 -> {
+                    roadPoint != null && drivingCorridor.containsRoadPoint(
+                        forwardMeters = roadPoint.forwardMeters,
+                        lateralMeters = roadPoint.lateralMeters,
+                        extraMarginMeters = corridorMargin,
+                    )
+                }
+                else -> geometry.centerX in 0.22f..0.78f && geometry.centerY in 0.34f..1f
+            }
             if (!inAttentionZone) continue
 
             val severity: RiskSeverity
             val reason: RiskReason
-            val supercomboDistance = detection.distanceMeters
-                ?.takeIf { it.isFinite() && it > 0.5f }
             val pinholeResult = when {
-                supercomboDistance != null -> null
                 detection.estimatedDistanceMeters != null -> {
                     detection.estimatedDistanceMeters
                         .takeIf { it.isFinite() && it > 0.5f }
@@ -215,10 +236,9 @@ class RidingRiskEvaluator {
                 }
                 else -> estimateDistance(detection, cameraHeight)
             }
-            val rawDistance = supercomboDistance ?: pinholeResult?.first
-            val estimateConfidence = if (supercomboDistance != null) 1f else pinholeResult?.second ?: 0f
+            val rawDistance = pinholeResult?.first
+            val estimateConfidence = pinholeResult?.second ?: 0f
             val distanceSource = when {
-                supercomboDistance != null -> "supercombo"
                 rawDistance != null -> "pinhole"
                 else -> "bbox"
             }
@@ -228,11 +248,7 @@ class RidingRiskEvaluator {
             // a class-size estimate from the previous frame.
             val previousDistance = trackId?.let(previousDistanceByTrack::get)
             val previousSource = trackId?.let(previousDistanceSourceByTrack::get)
-            val alpha = if (distanceSource == "supercombo") {
-                0.68f
-            } else {
-                (0.3f + estimateConfidence * 0.5f).coerceIn(0.3f, 0.8f)
-            }
+            val alpha = (0.3f + estimateConfidence * 0.5f).coerceIn(0.3f, 0.8f)
             val smoothedDistance = when {
                 rawDistance == null -> null
                 previousDistance != null && previousSource == distanceSource ->
@@ -332,6 +348,25 @@ class RidingRiskEvaluator {
         cameraWidth: Int,
         cameraHeight: Int,
     ): DisplayGeometry {
+        if (rotationDegrees % 360 == 0) {
+            val displayWidth = cameraWidth.toFloat().coerceAtLeast(1f)
+            val displayHeight = cameraHeight.toFloat().coerceAtLeast(1f)
+            val minX = minOf(detection.x1, detection.x2)
+            val maxX = maxOf(detection.x1, detection.x2)
+            val minY = minOf(detection.y1, detection.y2)
+            val maxY = maxOf(detection.y1, detection.y2)
+            val widthRatio = abs(maxX - minX) / displayWidth
+            val heightRatio = abs(maxY - minY) / displayHeight
+            return DisplayGeometry(
+                centerX = ((minX + maxX) / 2f / displayWidth).coerceIn(0f, 1f),
+                centerY = ((minY + maxY) / 2f / displayHeight).coerceIn(0f, 1f),
+                bottomY = (maxY / displayHeight).coerceIn(0f, 1f),
+                widthRatio = widthRatio,
+                areaRatio = widthRatio * heightRatio,
+                maxDimension = maxOf(widthRatio, heightRatio),
+            )
+        }
+
         val points = arrayOf(
             rotate(detection.x1, detection.y1, rotationDegrees, cameraWidth, cameraHeight),
             rotate(detection.x2, detection.y1, rotationDegrees, cameraWidth, cameraHeight),
@@ -359,6 +394,8 @@ class RidingRiskEvaluator {
         return DisplayGeometry(
             centerX = ((minX + maxX) / 2f / displayWidth).coerceIn(0f, 1f),
             centerY = ((minY + maxY) / 2f / displayHeight).coerceIn(0f, 1f),
+            bottomY = (maxY / displayHeight).coerceIn(0f, 1f),
+            widthRatio = widthRatio,
             areaRatio = widthRatio * heightRatio,
             maxDimension = maxOf(widthRatio, heightRatio),
         )
@@ -380,6 +417,8 @@ class RidingRiskEvaluator {
     private data class DisplayGeometry(
         val centerX: Float,
         val centerY: Float,
+        val bottomY: Float,
+        val widthRatio: Float,
         val areaRatio: Float,
         val maxDimension: Float,
     )

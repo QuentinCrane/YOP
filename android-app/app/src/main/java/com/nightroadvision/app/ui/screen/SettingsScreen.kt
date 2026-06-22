@@ -63,10 +63,6 @@ fun SettingsScreen(
     int8Available: Boolean,
     onQuantizationSelected: (ModelQuantization) -> Unit,
     onDismiss: () -> Unit,
-    supercomboEnabled: Boolean,
-    supercomboAvailable: Boolean,
-    onSupercomboToggle: (Boolean) -> Unit,
-    supercomboLatencyMs: Long,
     onPreviewAlert: (com.nightroadvision.app.alert.RiskSeverity) -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
@@ -125,10 +121,6 @@ fun SettingsScreen(
                             onSelectModel = onSelectModel,
                             int8Available = int8Available,
                             onQuantizationSelected = onQuantizationSelected,
-                            supercomboEnabled = supercomboEnabled,
-                            supercomboAvailable = supercomboAvailable,
-                            onSupercomboToggle = onSupercomboToggle,
-                            supercomboLatencyMs = supercomboLatencyMs,
                             onPreviewAlert = onPreviewAlert,
                             horizontalPadding = contentPadding,
                         )
@@ -162,10 +154,6 @@ fun SettingsScreen(
                         onSelectModel = onSelectModel,
                         int8Available = int8Available,
                         onQuantizationSelected = onQuantizationSelected,
-                        supercomboEnabled = supercomboEnabled,
-                        supercomboAvailable = supercomboAvailable,
-                        onSupercomboToggle = onSupercomboToggle,
-                        supercomboLatencyMs = supercomboLatencyMs,
                         onPreviewAlert = onPreviewAlert,
                         horizontalPadding = contentPadding,
                     )
@@ -334,10 +322,6 @@ private fun SettingsContent(
     onSelectModel: () -> Unit,
     int8Available: Boolean,
     onQuantizationSelected: (ModelQuantization) -> Unit,
-    supercomboEnabled: Boolean,
-    supercomboAvailable: Boolean,
-    onSupercomboToggle: (Boolean) -> Unit,
-    supercomboLatencyMs: Long,
     onPreviewAlert: (com.nightroadvision.app.alert.RiskSeverity) -> Unit = {},
     horizontalPadding: Dp = 20.dp,
 ) {
@@ -356,10 +340,6 @@ private fun SettingsContent(
                 int8Available = int8Available,
                 onQuantizationSelected = onQuantizationSelected,
                 onSettingsChanged = onSettingsChanged,
-                supercomboEnabled = supercomboEnabled,
-                supercomboAvailable = supercomboAvailable,
-                onSupercomboToggle = onSupercomboToggle,
-                supercomboLatencyMs = supercomboLatencyMs,
             )
             SettingsCategory.DETECTION -> DetectionTrackingSection(
                 settings = settings,
@@ -509,9 +489,13 @@ private fun SliderWithValue(
     value: Float,
     valueRange: ClosedFloatingPointRange<Float>,
     steps: Int,
-    valueText: String,
+    valueText: (Float) -> String,
     onValueChange: (Float) -> Unit,
 ) {
+    // Keep drag feedback local. Publishing every pointer sample used to rebuild the
+    // camera HUD, persist all preferences, and refresh tracker configuration.
+    var displayedValue by remember(value) { mutableFloatStateOf(value) }
+
     Column {
         Row(
             modifier = Modifier.fillMaxWidth(),
@@ -523,7 +507,7 @@ private fun SliderWithValue(
                 color = NightVisionColors.Text,
             )
             Text(
-                text = valueText,
+                text = valueText(displayedValue),
                 style = MaterialTheme.typography.bodyMedium,
                 fontWeight = FontWeight.Bold,
                 fontFamily = FontFamily.Monospace,
@@ -531,8 +515,11 @@ private fun SliderWithValue(
             )
         }
         Slider(
-            value = value,
-            onValueChange = onValueChange,
+            value = displayedValue,
+            onValueChange = { displayedValue = it },
+            onValueChangeFinished = {
+                if (displayedValue != value) onValueChange(displayedValue)
+            },
             valueRange = valueRange,
             steps = steps,
             colors = SliderDefaults.colors(
@@ -596,10 +583,6 @@ private fun ModelBackendSection(
     int8Available: Boolean,
     onQuantizationSelected: (ModelQuantization) -> Unit,
     onSettingsChanged: (InferenceSettings) -> Unit,
-    supercomboEnabled: Boolean,
-    supercomboAvailable: Boolean,
-    onSupercomboToggle: (Boolean) -> Unit,
-    supercomboLatencyMs: Long,
 ) {
     SectionHeader("模型与后端")
 
@@ -712,31 +695,6 @@ private fun ModelBackendSection(
         )
     }
 
-    SectionCard(title = "超级组合") {
-        Text(
-            text = if (supercomboAvailable) {
-                "openpilot 前车检测 + 真实距离"
-            } else {
-                "当前轻量安装包未包含 supercombo 模型"
-            },
-            style = MaterialTheme.typography.labelSmall,
-            color = NightVisionColors.TextMuted,
-        )
-        ToggleSetting(
-            label = "启用 Supercombo",
-            checked = supercomboEnabled,
-            onCheckedChange = onSupercomboToggle,
-            enabled = supercomboAvailable,
-        )
-        if (supercomboEnabled && supercomboLatencyMs > 0) {
-            Text(
-                text = "延迟: ${supercomboLatencyMs}ms",
-                style = MaterialTheme.typography.labelSmall,
-                color = NightVisionColors.TextMuted,
-            )
-        }
-    }
-
     SectionCard(title = "跳帧") {
         Text(
             text = "每 N 帧处理一次（值越大越省电，检测越少）",
@@ -787,7 +745,7 @@ private fun DetectionTrackingSection(
             value = settings.confidenceThreshold,
             valueRange = 0.1f..0.9f,
             steps = 7,
-            valueText = String.format(Locale.US, "%.2f", settings.confidenceThreshold),
+            valueText = { String.format(Locale.US, "%.2f", it) },
             onValueChange = {
                 onSettingsChanged(settings.copy(
                     confidenceThreshold = it,
@@ -803,7 +761,7 @@ private fun DetectionTrackingSection(
             value = settings.vulnerableUserConfidence,
             valueRange = 0.05f..0.60f,
             steps = 10,
-            valueText = String.format(Locale.US, "%.2f", settings.vulnerableUserConfidence),
+            valueText = { String.format(Locale.US, "%.2f", it) },
             onValueChange = {
                 onSettingsChanged(settings.copy(
                     vulnerableUserConfidence = it,
@@ -816,7 +774,7 @@ private fun DetectionTrackingSection(
             value = settings.vehicleConfidence,
             valueRange = 0.05f..0.70f,
             steps = 12,
-            valueText = String.format(Locale.US, "%.2f", settings.vehicleConfidence),
+            valueText = { String.format(Locale.US, "%.2f", it) },
             onValueChange = {
                 onSettingsChanged(settings.copy(
                     vehicleConfidence = it,
@@ -837,7 +795,7 @@ private fun DetectionTrackingSection(
             value = settings.iouThreshold,
             valueRange = 0.1f..0.9f,
             steps = 7,
-            valueText = String.format(Locale.US, "%.2f", settings.iouThreshold),
+            valueText = { String.format(Locale.US, "%.2f", it) },
             onValueChange = {
                 onSettingsChanged(settings.copy(
                     iouThreshold = it,
@@ -898,7 +856,7 @@ private fun DetectionTrackingSection(
             value = settings.trackerIouThreshold,
             valueRange = 0.05f..0.60f,
             steps = 10,
-            valueText = String.format(Locale.US, "%.2f", settings.trackerIouThreshold),
+            valueText = { String.format(Locale.US, "%.2f", it) },
             onValueChange = {
                 onSettingsChanged(settings.copy(
                     trackerIouThreshold = it,
@@ -911,7 +869,7 @@ private fun DetectionTrackingSection(
             value = settings.boxSmoothing,
             valueRange = 0.10f..1.0f,
             steps = 8,
-            valueText = String.format(Locale.US, "%.2f", settings.boxSmoothing),
+            valueText = { String.format(Locale.US, "%.2f", it) },
             onValueChange = {
                 onSettingsChanged(settings.copy(
                     boxSmoothing = it,
@@ -989,7 +947,7 @@ private fun CameraDisplaySection(
             value = settings.digitalZoomRatio,
             valueRange = 1f..3f,
             steps = 7,
-            valueText = String.format(Locale.US, "%.2fx", settings.digitalZoomRatio),
+            valueText = { String.format(Locale.US, "%.2fx", it) },
             onValueChange = {
                 onSettingsChanged(settings.copy(
                     digitalZoomRatio = it,
@@ -1002,7 +960,7 @@ private fun CameraDisplaySection(
             value = settings.exposureCompensation.toFloat(),
             valueRange = -3f..3f,
             steps = 5,
-            valueText = "%+d".format(settings.exposureCompensation),
+            valueText = { "%+d".format(it.toInt()) },
             onValueChange = {
                 onSettingsChanged(settings.copy(
                     exposureCompensation = it.toInt(),
@@ -1048,11 +1006,234 @@ private fun CameraDisplaySection(
 
     SectionCard(title = "行车辅助") {
         ToggleSetting(
-            label = "路线预测显示",
-            description = "在相机画面上叠加预测的行车轨迹 (需启用 Supercombo)",
+            label = "动态风险走廊",
+            description = "开启时仅预警走廊内目标；关闭后隐藏走廊，并对全画面中达到距离阈值的目标预警",
             checked = settings.showRoutePrediction,
             onCheckedChange = { onSettingsChanged(settings.copy(showRoutePrediction = it)) },
         )
+
+        if (settings.showRoutePrediction) {
+            HorizontalDivider(
+                color = NightVisionColors.Border,
+                thickness = 0.5.dp,
+                modifier = Modifier.padding(vertical = 4.dp),
+            )
+            Text(
+                text = "走廊预设",
+                style = MaterialTheme.typography.labelSmall,
+                color = NightVisionColors.TextMuted,
+                modifier = Modifier.padding(top = 4.dp),
+            )
+            ChoiceChipRow(
+                options = CorridorProfile.entries.map { it.label to it.description },
+                selectedIndex = CorridorProfile.entries.indexOf(settings.corridorProfile),
+                onSelect = {
+                    onSettingsChanged(settings.withCorridorProfile(CorridorProfile.entries[it]))
+                },
+            )
+
+            if (settings.corridorProfile == CorridorProfile.CUSTOM) {
+                Spacer(modifier = Modifier.height(8.dp))
+                Text(
+                    text = "走廊宽度",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = NightVisionColors.TextMuted,
+                )
+                SliderWithValue(
+                    label = "基础半宽",
+                    value = settings.corridorBaseHalfWidth,
+                    valueRange = 0.3f..2.0f,
+                    steps = 16,
+                    valueText = { String.format(Locale.US, "%.2f m", it) },
+                    onValueChange = { onSettingsChanged(settings.copy(corridorBaseHalfWidth = it)) },
+                )
+                SliderWithValue(
+                    label = "最大半宽",
+                    value = settings.corridorMaxHalfWidth,
+                    valueRange = settings.corridorBaseHalfWidth..3.5f,
+                    steps = 14,
+                    valueText = { String.format(Locale.US, "%.2f m", it) },
+                    onValueChange = { onSettingsChanged(settings.copy(corridorMaxHalfWidth = it)) },
+                )
+                SliderWithValue(
+                    label = "距离增长系数",
+                    value = settings.corridorWidthGrowthPerMeter,
+                    valueRange = 0f..0.06f,
+                    steps = 12,
+                    valueText = { String.format(Locale.US, "%.3f", it) },
+                    onValueChange = { onSettingsChanged(settings.copy(corridorWidthGrowthPerMeter = it)) },
+                )
+                SliderWithValue(
+                    label = "转向增长系数",
+                    value = settings.corridorWidthGrowthPerYawRate,
+                    valueRange = 0f..0.5f,
+                    steps = 10,
+                    valueText = { String.format(Locale.US, "%.2f", it) },
+                    onValueChange = { onSettingsChanged(settings.copy(corridorWidthGrowthPerYawRate = it)) },
+                )
+
+                Spacer(modifier = Modifier.height(8.dp))
+                Text(
+                    text = "走廊长度",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = NightVisionColors.TextMuted,
+                )
+                SliderWithValue(
+                    label = "预测时长",
+                    value = settings.corridorHorizonSeconds,
+                    valueRange = 0.5f..5.0f,
+                    steps = 9,
+                    valueText = { String.format(Locale.US, "%.1f s", it) },
+                    onValueChange = { onSettingsChanged(settings.copy(corridorHorizonSeconds = it)) },
+                )
+                SliderWithValue(
+                    label = "最短距离",
+                    value = settings.corridorMinDistance,
+                    valueRange = 3f..20f,
+                    steps = 17,
+                    valueText = { String.format(Locale.US, "%.0f m", it) },
+                    onValueChange = { onSettingsChanged(settings.copy(corridorMinDistance = it)) },
+                )
+                SliderWithValue(
+                    label = "最长距离",
+                    value = settings.corridorMaxDistance,
+                    valueRange = 10f..80f,
+                    steps = 14,
+                    valueText = { String.format(Locale.US, "%.0f m", it) },
+                    onValueChange = { onSettingsChanged(settings.copy(corridorMaxDistance = it)) },
+                )
+
+                Spacer(modifier = Modifier.height(8.dp))
+                Text(
+                    text = "速度-扩展曲线",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = NightVisionColors.TextMuted,
+                )
+                Text(
+                    text = "低于起始速度 → 最小尺寸，高于终止速度 → 最大尺寸，中间线性过渡",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = NightVisionColors.TextMuted.copy(alpha = 0.6f),
+                    modifier = Modifier.padding(bottom = 4.dp),
+                )
+                SliderWithValue(
+                    label = "起始速度",
+                    value = settings.corridorSpeedRangeLow,
+                    valueRange = 0f..60f,
+                    steps = 12,
+                    valueText = { String.format(Locale.US, "%.0f km/h", it) },
+                    onValueChange = { onSettingsChanged(settings.copy(corridorSpeedRangeLow = it)) },
+                )
+                SliderWithValue(
+                    label = "终止速度",
+                    value = settings.corridorSpeedRangeHigh,
+                    valueRange = 10f..120f,
+                    steps = 22,
+                    valueText = { String.format(Locale.US, "%.0f km/h", it) },
+                    onValueChange = { onSettingsChanged(settings.copy(corridorSpeedRangeHigh = it)) },
+                )
+                // Speed expansion preview
+                SpeedExpansionPreview(settings)
+            }
+        }
+
+        HorizontalDivider(
+            color = NightVisionColors.Border,
+            thickness = 0.5.dp,
+            modifier = Modifier.padding(vertical = 4.dp),
+        )
+        Text(
+            text = "速度样式",
+            style = MaterialTheme.typography.labelSmall,
+            color = NightVisionColors.TextMuted,
+            modifier = Modifier.padding(top = 8.dp),
+        )
+        ChoiceChipRow(
+            options = SpeedStyle.entries.map { it.label to "" },
+            selectedIndex = SpeedStyle.entries.indexOf(settings.speedStyle),
+            onSelect = { onSettingsChanged(settings.copy(speedStyle = SpeedStyle.entries[it])) },
+        )
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Speed expansion preview (shows speed → corridor size mapping)
+// ──────────────────────────────────────────────────────────────────────────────
+
+@Composable
+private fun SpeedExpansionPreview(settings: InferenceSettings) {
+    val sampleSpeeds = listOf(0f, 10f, 20f, 30f, 40f, 50f, 60f, 80f, 100f)
+    val low = settings.corridorSpeedRangeLow
+    val high = settings.corridorSpeedRangeHigh
+    val minDist = settings.corridorMinDistance
+    val maxDist = settings.corridorMaxDistance
+    val baseHW = settings.corridorBaseHalfWidth
+
+    Column(modifier = Modifier.padding(top = 8.dp)) {
+        Text(
+            text = "速度 → 扩展预览",
+            style = MaterialTheme.typography.labelSmall,
+            color = NightVisionColors.Accent,
+            fontWeight = FontWeight.Bold,
+        )
+        Spacer(modifier = Modifier.height(4.dp))
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+        ) {
+            Text("速度", style = MaterialTheme.typography.labelSmall,
+                color = NightVisionColors.TextMuted, modifier = Modifier.weight(1f))
+            Text("走廊长度", style = MaterialTheme.typography.labelSmall,
+                color = NightVisionColors.TextMuted, modifier = Modifier.weight(1f),
+                textAlign = TextAlign.Center)
+            Text("基础半宽", style = MaterialTheme.typography.labelSmall,
+                color = NightVisionColors.TextMuted, modifier = Modifier.weight(1f),
+                textAlign = TextAlign.End)
+        }
+        HorizontalDivider(
+            color = NightVisionColors.Border,
+            thickness = 0.5.dp,
+            modifier = Modifier.padding(vertical = 2.dp),
+        )
+        for (spd in sampleSpeeds) {
+            val scale = if (high <= low) 1f
+                else ((spd - low) / (high - low)).coerceIn(0f, 1f)
+            val dist = minDist + (maxDist - minDist) * scale
+            val hw = baseHW * (0.6f + 0.4f * scale)
+            val isTransition = spd in low..high
+            val textColor = when {
+                spd < low -> NightVisionColors.TextMuted
+                spd > high -> NightVisionColors.Accent
+                else -> NightVisionColors.Text
+            }
+            Row(
+                modifier = Modifier.fillMaxWidth().padding(vertical = 1.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+            ) {
+                Text(
+                    text = "%.0f km/h".format(spd),
+                    style = MaterialTheme.typography.labelSmall,
+                    color = textColor,
+                    fontFamily = FontFamily.Monospace,
+                    modifier = Modifier.weight(1f),
+                )
+                Text(
+                    text = "%.1f m".format(dist),
+                    style = MaterialTheme.typography.labelSmall,
+                    color = textColor,
+                    fontFamily = FontFamily.Monospace,
+                    modifier = Modifier.weight(1f),
+                    textAlign = TextAlign.Center,
+                )
+                Text(
+                    text = "%.2f m".format(hw),
+                    style = MaterialTheme.typography.labelSmall,
+                    color = textColor,
+                    fontFamily = FontFamily.Monospace,
+                    modifier = Modifier.weight(1f),
+                    textAlign = TextAlign.End,
+                )
+            }
+        }
     }
 }
 
@@ -1226,6 +1407,7 @@ private fun DistanceSliderWithPresets(
 ) {
     var showInputDialog by remember { mutableStateOf(false) }
     var inputText by remember { mutableStateOf("") }
+    var displayedValue by remember(value) { mutableFloatStateOf(value) }
 
     Column {
         Row(
@@ -1239,20 +1421,23 @@ private fun DistanceSliderWithPresets(
                 color = NightVisionColors.Text,
             )
             Text(
-                text = String.format(Locale.US, "%.0f m", value),
+                text = String.format(Locale.US, "%.0f m", displayedValue),
                 style = MaterialTheme.typography.bodyMedium,
                 fontWeight = FontWeight.Bold,
                 fontFamily = FontFamily.Monospace,
                 color = NightVisionColors.Accent,
                 modifier = Modifier.clickable {
-                    inputText = String.format(Locale.US, "%.0f", value)
+                    inputText = String.format(Locale.US, "%.0f", displayedValue)
                     showInputDialog = true
                 },
             )
         }
         Slider(
-            value = value,
-            onValueChange = onValueChange,
+            value = displayedValue,
+            onValueChange = { displayedValue = it },
+            onValueChangeFinished = {
+                if (displayedValue != value) onValueChange(displayedValue)
+            },
             valueRange = valueRange,
             colors = SliderDefaults.colors(
                 thumbColor = NightVisionColors.Accent,
@@ -1266,7 +1451,7 @@ private fun DistanceSliderWithPresets(
             horizontalArrangement = Arrangement.spacedBy(6.dp),
         ) {
             presets.forEach { preset ->
-                val isSelected = kotlin.math.abs(value - preset) < 0.5f
+                val isSelected = kotlin.math.abs(displayedValue - preset) < 0.5f
                 Surface(
                     modifier = Modifier
                         .weight(1f)

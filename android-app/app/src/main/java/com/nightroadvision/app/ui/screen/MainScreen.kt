@@ -40,15 +40,19 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.lifecycle.compose.LocalLifecycleOwner
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.camera.view.PreviewView
 import com.nightroadvision.app.model.ModelManager
@@ -325,9 +329,9 @@ fun PerformancePanel(
                 valueColor = NightVisionColors.Accent
             )
 
-            // FPS
+            // Inference throughput; this is intentionally distinct from UI refresh rate.
             MetricRow(
-                label = "FPS",
+                label = "推理 FPS",
                 value = String.format(Locale.US, "%.1f", metrics.fps),
                 valueColor = when {
                     metrics.fps >= 24f -> NightVisionColors.Success
@@ -504,7 +508,7 @@ private fun TelemetryChip(
                 fontSize = 13.sp,
             )
             Text(
-                text = " FPS  ·  ${metrics.inferenceLatencyMs.toInt()} ms",
+                text = " AI FPS  ·  ${metrics.inferenceLatencyMs.toInt()} ms",
                 color = Color.White.copy(alpha = 0.65f),
                 fontFamily = FontFamily.Monospace,
                 fontSize = 9.sp,
@@ -516,32 +520,220 @@ private fun TelemetryChip(
 @Composable
 private fun SpeedChip(
     speedKmh: Float,
-    speedUnit: SpeedUnit,
+    speedStyle: SpeedStyle,
     modifier: Modifier = Modifier,
 ) {
-    val displaySpeed = speedKmh * speedUnit.factor
+    when (speedStyle) {
+        SpeedStyle.COMPACT -> SpeedStyleBar(speedKmh, modifier)
+        SpeedStyle.DIGITAL -> SpeedStyleGauge(speedKmh, modifier)
+        SpeedStyle.LARGE -> SpeedStyleNeon(speedKmh, modifier)
+        SpeedStyle.MINIMAL -> SpeedStyleHud(speedKmh, modifier)
+    }
+}
+
+/** Style 1: Full-width gradient bar with speed + label */
+@Composable
+private fun SpeedStyleBar(speedKmh: Float, modifier: Modifier) {
+    val active = speedKmh > 1f
     Surface(
-        modifier = modifier.height(40.dp),
-        shape = RoundedCornerShape(18.dp),
-        color = Color.Black.copy(alpha = 0.48f),
-        border = BorderStroke(1.dp, Color.White.copy(alpha = 0.14f)),
+        modifier = modifier.height(44.dp),
+        shape = RoundedCornerShape(8.dp),
+        color = Color.Transparent,
     ) {
-        Row(
-            modifier = Modifier.padding(horizontal = 11.dp),
-            verticalAlignment = Alignment.CenterVertically,
+        Box(
+            modifier = Modifier
+                .background(
+                    brush = Brush.horizontalGradient(
+                        colors = if (active) listOf(
+                            NightVisionColors.Accent.copy(alpha = 0.35f),
+                            Color.Black.copy(alpha = 0.6f),
+                        ) else listOf(
+                            Color.White.copy(alpha = 0.06f),
+                            Color.Black.copy(alpha = 0.4f),
+                        )
+                    )
+                )
+                .border(
+                    1.dp,
+                    if (active) NightVisionColors.Accent.copy(alpha = 0.4f)
+                    else Color.White.copy(alpha = 0.08f),
+                    RoundedCornerShape(8.dp),
+                )
+                .padding(horizontal = 14.dp),
+            contentAlignment = Alignment.Center,
         ) {
+            Row(verticalAlignment = Alignment.Bottom) {
+                Text(
+                    text = String.format(Locale.US, "%.0f", speedKmh),
+                    color = if (active) Color.White else Color.White.copy(alpha = 0.3f),
+                    fontWeight = FontWeight.Black,
+                    fontFamily = FontFamily.Monospace,
+                    fontSize = 22.sp,
+                )
+                Spacer(Modifier.width(4.dp))
+                Text(
+                    text = "km/h",
+                    color = if (active) NightVisionColors.Accent.copy(alpha = 0.7f)
+                    else Color.White.copy(alpha = 0.2f),
+                    fontWeight = FontWeight.Bold,
+                    fontFamily = FontFamily.Monospace,
+                    fontSize = 10.sp,
+                    modifier = Modifier.padding(bottom = 3.dp),
+                )
+            }
+        }
+    }
+}
+
+/** Style 2: Circular gauge with arc progress */
+@Composable
+private fun SpeedStyleGauge(speedKmh: Float, modifier: Modifier) {
+    val active = speedKmh > 1f
+    val sweep = (speedKmh.coerceIn(0f, 60f) / 60f) * 270f
+    val accentColor = when {
+        speedKmh > 25 -> Color(0xFFFF4444)
+        speedKmh > 15 -> Color(0xFFFFAA00)
+        active -> NightVisionColors.Accent
+        else -> Color.White.copy(alpha = 0.15f)
+    }
+
+    Box(modifier = modifier.size(64.dp), contentAlignment = Alignment.Center) {
+        Canvas(modifier = Modifier.fillMaxSize()) {
+            val stroke = 4.dp.toPx()
+            val pad = stroke / 2
+            val arcSize = Size(size.width - stroke, size.height - stroke)
+            val topLeft = Offset(pad, pad)
+            // Background arc
+            drawArc(
+                color = Color.White.copy(alpha = 0.08f),
+                startAngle = 135f,
+                sweepAngle = 270f,
+                useCenter = false,
+                topLeft = topLeft,
+                size = arcSize,
+                style = Stroke(width = stroke, cap = StrokeCap.Round),
+            )
+            // Active arc
+            drawArc(
+                color = accentColor.copy(alpha = 0.8f),
+                startAngle = 135f,
+                sweepAngle = sweep,
+                useCenter = false,
+                topLeft = topLeft,
+                size = arcSize,
+                style = Stroke(width = stroke, cap = StrokeCap.Round),
+            )
+        }
+        Column(horizontalAlignment = Alignment.CenterHorizontally) {
             Text(
-                text = String.format(Locale.US, "%.0f", displaySpeed),
-                color = if (speedKmh > 1f) NightVisionColors.Accent else Color.White.copy(alpha = 0.65f),
-                fontWeight = FontWeight.Bold,
+                text = String.format(Locale.US, "%.0f", speedKmh),
+                color = if (active) Color.White else Color.White.copy(alpha = 0.3f),
+                fontWeight = FontWeight.Black,
                 fontFamily = FontFamily.Monospace,
-                fontSize = 14.sp,
+                fontSize = 18.sp,
             )
             Text(
-                text = " ${speedUnit.suffix}",
-                color = Color.White.copy(alpha = 0.45f),
+                text = "km/h",
+                color = accentColor.copy(alpha = 0.6f),
                 fontFamily = FontFamily.Monospace,
-                fontSize = 9.sp,
+                fontSize = 7.sp,
+                fontWeight = FontWeight.Bold,
+            )
+        }
+    }
+}
+
+/** Style 3: Neon glow — big number with colored glow effect */
+@Composable
+private fun SpeedStyleNeon(speedKmh: Float, modifier: Modifier) {
+    val active = speedKmh > 1f
+    val glowColor = when {
+        speedKmh > 25 -> Color(0xFFFF2222)
+        speedKmh > 15 -> Color(0xFFFF8800)
+        active -> NightVisionColors.Accent
+        else -> Color.White.copy(alpha = 0.1f)
+    }
+
+    Column(
+        modifier = modifier.padding(horizontal = 8.dp),
+        horizontalAlignment = Alignment.End,
+    ) {
+        Text(
+            text = String.format(Locale.US, "%.0f", speedKmh),
+            color = if (active) glowColor else Color.White.copy(alpha = 0.2f),
+            fontWeight = FontWeight.Black,
+            fontFamily = FontFamily.Monospace,
+            fontSize = 42.sp,
+            letterSpacing = (-1).sp,
+        )
+        Box(
+            modifier = Modifier
+                .width(60.dp)
+                .height(2.dp)
+                .background(
+                    brush = Brush.horizontalGradient(
+                        colors = listOf(glowColor.copy(alpha = 0f), glowColor.copy(alpha = 0.6f))
+                    )
+                )
+        )
+        Spacer(Modifier.height(2.dp))
+        Text(
+            text = "KM/H",
+            color = glowColor.copy(alpha = 0.4f),
+            fontFamily = FontFamily.Monospace,
+            fontSize = 9.sp,
+            fontWeight = FontWeight.Bold,
+            letterSpacing = 3.sp,
+        )
+    }
+}
+
+/** Style 4: Military HUD — boxed tactical readout */
+@Composable
+private fun SpeedStyleHud(speedKmh: Float, modifier: Modifier) {
+    val active = speedKmh > 1f
+    val borderColor = if (active) Color.White.copy(alpha = 0.25f) else Color.White.copy(alpha = 0.08f)
+
+    Box(
+        modifier = modifier
+            .border(1.dp, borderColor, RoundedCornerShape(2.dp))
+            .padding(horizontal = 10.dp, vertical = 6.dp),
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            // Small bracket decoration
+            Text(
+                text = "[",
+                color = borderColor,
+                fontFamily = FontFamily.Monospace,
+                fontWeight = FontWeight.Light,
+                fontSize = 18.sp,
+            )
+            Column(
+                modifier = Modifier.padding(horizontal = 4.dp),
+                horizontalAlignment = Alignment.CenterHorizontally,
+            ) {
+                Text(
+                    text = "SPD",
+                    color = if (active) Color.White.copy(alpha = 0.35f) else Color.White.copy(alpha = 0.12f),
+                    fontFamily = FontFamily.Monospace,
+                    fontSize = 7.sp,
+                    fontWeight = FontWeight.Bold,
+                    letterSpacing = 2.sp,
+                )
+                Text(
+                    text = String.format(Locale.US, "%03.0f", speedKmh),
+                    color = if (active) Color.White else Color.White.copy(alpha = 0.25f),
+                    fontWeight = FontWeight.Black,
+                    fontFamily = FontFamily.Monospace,
+                    fontSize = 20.sp,
+                )
+            }
+            Text(
+                text = "]",
+                color = borderColor,
+                fontFamily = FontFamily.Monospace,
+                fontWeight = FontWeight.Light,
+                fontSize = 18.sp,
             )
         }
     }
@@ -776,6 +968,98 @@ private fun RiskGlowFrame(
 // 5. MAIN SCREEN (root composable)
 // ──────────────────────────────────────────────────────────────────────────────
 
+@Composable
+private fun BoxScope.PerceptionLayers(
+    viewModel: MainScreenViewModel,
+    settings: InferenceSettings,
+    portrait: Boolean,
+) {
+    val detections by viewModel.detections.collectAsState()
+    val ridingRisk by viewModel.ridingRisk.collectAsState()
+    val drivingCorridor by viewModel.drivingCorridor.collectAsState()
+
+    DetectionOverlay(
+        detections = detections,
+        highlightedTrackId = ridingRisk.trackId,
+        cameraWidth = viewModel.getCameraFrameWidth(),
+        cameraHeight = viewModel.getCameraFrameHeight(),
+        showLabels = settings.showLabels,
+        showConfidence = settings.showConfidence,
+        showTrackIds = settings.showTrackIds,
+        drivingCorridor = if (settings.showRoutePrediction) {
+            drivingCorridor
+        } else {
+            com.nightroadvision.app.motion.DrivingCorridor.EMPTY
+        },
+        modifier = Modifier.fillMaxSize(),
+    )
+
+    RiskGlowFrame(
+        severity = ridingRisk.severity,
+        portrait = portrait,
+        modifier = Modifier.fillMaxSize(),
+    )
+
+    TargetAlertChip(
+        risk = ridingRisk,
+        modifier = Modifier
+            .align(Alignment.BottomCenter)
+            .navigationBarsPadding()
+            .padding(bottom = 10.dp),
+    )
+}
+
+@Composable
+private fun BoxScope.PerformanceLayers(
+    viewModel: MainScreenViewModel,
+    currentModelName: String,
+    showPerformancePanel: Boolean,
+    edgePadding: Dp,
+    onTogglePanel: () -> Unit,
+) {
+    val metrics by viewModel.performanceMetrics.collectAsState()
+
+    TelemetryChip(
+        metrics = metrics,
+        active = showPerformancePanel,
+        onClick = onTogglePanel,
+        modifier = Modifier
+            .align(Alignment.TopEnd)
+            .statusBarsPadding()
+            .padding(end = edgePadding, top = 8.dp),
+    )
+
+    AnimatedVisibility(
+        visible = showPerformancePanel,
+        enter = fadeIn() + slideInHorizontally(initialOffsetX = { -it }),
+        exit = fadeOut() + slideOutHorizontally(targetOffsetX = { -it }),
+        modifier = Modifier
+            .statusBarsPadding()
+            .padding(end = edgePadding, top = 104.dp)
+            .align(Alignment.TopEnd)
+            .widthIn(min = 160.dp, max = 200.dp),
+    ) {
+        PerformancePanel(modelName = currentModelName, metrics = metrics)
+    }
+}
+
+@Composable
+private fun BoxScope.SpeedLayer(
+    viewModel: MainScreenViewModel,
+    speedStyle: SpeedStyle,
+    edgePadding: Dp,
+) {
+    val speedKmh by viewModel.speedKmh.collectAsState()
+    SpeedChip(
+        speedKmh = speedKmh,
+        speedStyle = speedStyle,
+        modifier = Modifier
+            .align(Alignment.TopEnd)
+            .statusBarsPadding()
+            .padding(end = edgePadding, top = 60.dp),
+    )
+}
+
 /**
  * MainScreen composable that displays the camera preview with detection overlay,
  * performance telemetry, and a full settings panel.
@@ -793,33 +1077,31 @@ fun MainScreen(
     val configurationOrientation = LocalConfiguration.current.orientation
 
     // ViewModel state
-    val detections by viewModel.detections.collectAsState()
-    val metrics by viewModel.performanceMetrics.collectAsState()
     val settings by viewModel.settings.collectAsState()
     val currentModelName by viewModel.currentModelName.collectAsState()
     val errorMessage by viewModel.errorMessage.collectAsState()
     val activeDelegate by viewModel.activeDelegate.collectAsState()
-    val ridingRisk by viewModel.ridingRisk.collectAsState()
-    val routePoints by viewModel.routePoints.collectAsState()
-    val supercomboEnabled by viewModel.supercomboEnabled.collectAsState()
-    val supercomboLatencyMs by viewModel.supercomboLatencyMs.collectAsState()
-    val supercomboAvailable by viewModel.supercomboAvailable.collectAsState()
-    val speedKmh by viewModel.speedKmh.collectAsState()
 
     // GPS permission
     val context = androidx.compose.ui.platform.LocalContext.current
     val gpsPermissionLauncher = rememberLauncherForActivityResult(
-        ActivityResultContracts.RequestPermission()
-    ) { isGranted ->
-        if (isGranted) viewModel.startGpsSpeed()
+        ActivityResultContracts.RequestMultiplePermissions()
+    ) { permissions ->
+        val isGranted = permissions[Manifest.permission.ACCESS_FINE_LOCATION] == true
+        if (isGranted && lifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)) {
+            viewModel.startGpsSpeed()
+        }
     }
     LaunchedEffect(Unit) {
         if (ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_FINE_LOCATION)
-            == PackageManager.PERMISSION_GRANTED
+            != PackageManager.PERMISSION_GRANTED
         ) {
-            viewModel.startGpsSpeed()
-        } else {
-            gpsPermissionLauncher.launch(Manifest.permission.ACCESS_FINE_LOCATION)
+            gpsPermissionLauncher.launch(
+                arrayOf(
+                    Manifest.permission.ACCESS_COARSE_LOCATION,
+                    Manifest.permission.ACCESS_FINE_LOCATION,
+                )
+            )
         }
     }
 
@@ -828,6 +1110,44 @@ fun MainScreen(
     var showModelSelector by remember { mutableStateOf(false) }
     var showPerformancePanel by remember { mutableStateOf(false) }
     var flashlightOn by remember { mutableStateOf(false) }
+    val settingsPageVisible by rememberUpdatedState(showSettingsPage)
+
+    // Keep sensors and GPS scoped to the visible camera lifecycle to avoid background drain.
+    DisposableEffect(lifecycleOwner, viewModel, context) {
+        fun startMotionSources() {
+            if (settingsPageVisible) return
+            viewModel.startMotionEstimation()
+            if (ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_FINE_LOCATION)
+                == PackageManager.PERMISSION_GRANTED
+            ) {
+                viewModel.startGpsSpeed()
+            }
+        }
+
+        val observer = LifecycleEventObserver { _, event ->
+            when (event) {
+                Lifecycle.Event.ON_START -> startMotionSources()
+                Lifecycle.Event.ON_STOP -> {
+                    viewModel.stopMotionEstimation()
+                    viewModel.stopGpsSpeed()
+                }
+                else -> Unit
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        if (lifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)) {
+            startMotionSources()
+        }
+        onDispose {
+            lifecycleOwner.lifecycle.removeObserver(observer)
+            viewModel.stopMotionEstimation()
+            viewModel.stopGpsSpeed()
+        }
+    }
+
+    DisposableEffect(viewModel) {
+        onDispose { viewModel.setInferencePaused(false) }
+    }
 
     // Camera setup - runs once on first composition
     val cameraManager = remember(viewModel, lifecycleOwner) {
@@ -837,6 +1157,33 @@ fun MainScreen(
     val availableLenses by cameraManager.availableLenses.collectAsState()
     val selectedLens by cameraManager.currentLens.collectAsState()
 
+    // A full-screen settings surface should be operationally full-screen too.
+    // Stop CameraX and motion sources instead of spending GPU/CPU time behind an
+    // opaque page. The preview is rebound to a fresh surface when returning.
+    LaunchedEffect(
+        showSettingsPage,
+        showModelSelector,
+        cameraManager,
+        viewModel,
+        lifecycleOwner,
+        context,
+    ) {
+        viewModel.setInferencePaused(showSettingsPage || showModelSelector)
+        if (showSettingsPage) {
+            cameraStarted = false
+            cameraManager.stopCamera()
+            viewModel.stopMotionEstimation()
+            viewModel.stopGpsSpeed()
+        } else if (lifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)) {
+            viewModel.startMotionEstimation()
+            if (ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_FINE_LOCATION)
+                == PackageManager.PERMISSION_GRANTED
+            ) {
+                viewModel.startGpsSpeed()
+            }
+        }
+    }
+
     // Cleanup camera when composable leaves composition
     DisposableEffect(cameraManager) {
         onDispose {
@@ -845,11 +1192,12 @@ fun MainScreen(
     }
 
     NightVisionTheme {
-        BoxWithConstraints(
-            modifier = modifier
-                .fillMaxSize()
-                .background(NightVisionColors.Background)
-        ) {
+        if (!showSettingsPage) {
+            BoxWithConstraints(
+                modifier = modifier
+                    .fillMaxSize()
+                    .background(NightVisionColors.Background)
+            ) {
             val portrait = maxHeight > maxWidth
             val edgePadding = if (portrait) 10.dp else 14.dp
 
@@ -908,24 +1256,7 @@ fun MainScreen(
                     ),
             )
 
-            // ── Detection overlay ──
-            DetectionOverlay(
-                detections = detections,
-                highlightedTrackId = ridingRisk.trackId,
-                cameraWidth = viewModel.getCameraFrameWidth(),
-                cameraHeight = viewModel.getCameraFrameHeight(),
-                showLabels = settings.showLabels,
-                showConfidence = settings.showConfidence,
-                showTrackIds = settings.showTrackIds,
-                routePoints = if (settings.showRoutePrediction) routePoints else emptyList(),
-                modifier = Modifier.fillMaxSize()
-            )
-
-            RiskGlowFrame(
-                severity = ridingRisk.severity,
-                portrait = portrait,
-                modifier = Modifier.fillMaxSize(),
-            )
+            PerceptionLayers(viewModel = viewModel, settings = settings, portrait = portrait)
 
             VisionStatusChip(
                 modelName = currentModelName,
@@ -937,49 +1268,14 @@ fun MainScreen(
                     .widthIn(max = if (portrait) 142.dp else 180.dp),
             )
 
-            TelemetryChip(
-                metrics = metrics,
-                active = showPerformancePanel,
-                onClick = { showPerformancePanel = !showPerformancePanel },
-                modifier = Modifier
-                    .align(Alignment.TopEnd)
-                    .statusBarsPadding()
-                    .padding(end = edgePadding, top = 8.dp),
+            PerformanceLayers(
+                viewModel = viewModel,
+                currentModelName = currentModelName,
+                showPerformancePanel = showPerformancePanel,
+                edgePadding = edgePadding,
+                onTogglePanel = { showPerformancePanel = !showPerformancePanel },
             )
-
-            SpeedChip(
-                speedKmh = speedKmh,
-                speedUnit = settings.speedUnit,
-                modifier = Modifier
-                    .align(Alignment.TopEnd)
-                    .statusBarsPadding()
-                    .padding(end = edgePadding, top = 60.dp),
-            )
-
-            // ── Performance Panel (top-right) ──
-            AnimatedVisibility(
-                visible = showPerformancePanel,
-                enter = fadeIn() + slideInHorizontally(initialOffsetX = { -it }),
-                exit = fadeOut() + slideOutHorizontally(targetOffsetX = { -it }),
-                modifier = Modifier
-                    .statusBarsPadding()
-                    .padding(end = edgePadding, top = 104.dp)
-                    .align(Alignment.TopEnd)
-                    .widthIn(min = 160.dp, max = 200.dp)
-            ) {
-                PerformancePanel(
-                    modelName = currentModelName,
-                    metrics = metrics
-                )
-            }
-
-            TargetAlertChip(
-                risk = ridingRisk,
-                modifier = Modifier
-                    .align(Alignment.BottomCenter)
-                    .navigationBarsPadding()
-                    .padding(bottom = 10.dp),
-            )
+            SpeedLayer(viewModel, settings.speedStyle, edgePadding)
 
             HudControls(
                 portrait = portrait,
@@ -1025,6 +1321,7 @@ fun MainScreen(
                     Text(text = error, style = MaterialTheme.typography.bodySmall)
                 }
             }
+            }
         }
 
         // ── Settings Page (full-screen) ──
@@ -1040,10 +1337,6 @@ fun MainScreen(
                 int8Available = viewModel.isInt8Available(),
                 onQuantizationSelected = viewModel::selectQuantization,
                 onDismiss = { showSettingsPage = false },
-                supercomboEnabled = supercomboEnabled,
-                supercomboAvailable = supercomboAvailable,
-                onSupercomboToggle = { viewModel.setSupercomboEnabled(it) },
-                supercomboLatencyMs = supercomboLatencyMs,
                 onPreviewAlert = { severity -> viewModel.previewAlertSound(severity) },
             )
         }

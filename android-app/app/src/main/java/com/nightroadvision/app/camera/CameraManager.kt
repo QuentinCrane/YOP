@@ -4,6 +4,7 @@ import android.content.Context
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraMetadata
 import android.hardware.camera2.CaptureRequest
+import android.os.Build
 import android.util.Log
 import android.view.Surface
 import androidx.camera.camera2.interop.Camera2CameraInfo
@@ -32,17 +33,11 @@ import kotlin.math.roundToInt
 
 /**
  * Callback type for processed frames.
- * Receives a letterboxed float32 ByteBuffer, the source ImageProxy, and the exact
- * upright geometry used by the model.
+ * Receives a letterboxed input ByteBuffer, the source ImageProxy, the exact upright
+ * geometry, and whether the buffer already matches a quantized model tensor.
  * The callback is responsible for closing the ImageProxy when done.
  */
-typealias FrameCallback = (ByteBuffer, ImageProxy, FrameGeometry) -> Unit
-
-/**
- * Callback type for raw NV21 YUV frames (used by supercombo preprocessor).
- * Receives NV21 byte array, width, and height.
- */
-typealias YuvFrameCallback = (ByteArray, Int, Int) -> Unit
+typealias FrameCallback = (ByteBuffer, ImageProxy, FrameGeometry, Boolean) -> Unit
 
 /** Geometry of the camera image after [rotationDegrees] has been applied. */
 data class FrameGeometry(
@@ -58,9 +53,9 @@ data class FrameGeometry(
 /**
  * Manages CameraX pipeline: preview + image analysis.
  *
- * Frames are converted to letterboxed RGB float32 ByteBuffers (512x320)
- * and delivered via [onFrameReady]. The callback receives both the buffer
- * and the original ImageProxy so the caller can close it after processing.
+ * Frames are sampled directly into the model input tensor. Quantized models receive
+ * byte input without an intermediate Float32 tensor; float models retain the normalized
+ * RGB path. The caller closes the original ImageProxy after inference.
  */
 @androidx.annotation.OptIn(markerClass = [ExperimentalCamera2Interop::class])
 class CameraManager(
@@ -71,9 +66,8 @@ class CameraManager(
     modelInputHeight: Int = 320,
     analysisWidth: Int = ANALYSIS_WIDTH,
     analysisHeight: Int = ANALYSIS_HEIGHT,
-    private val onYuvFrameReady: YuvFrameCallback? = null,
     private val shouldAnalyzeFrame: () -> Boolean = { true },
-    private val shouldCaptureYuvFrame: () -> Boolean = { false },
+    private val inputQuantizationLutProvider: () -> ByteArray? = { null },
 ) {
     companion object {
         private const val TAG = "CameraManager"
@@ -107,6 +101,7 @@ class CameraManager(
     @Volatile private var manualZoomRatio = 1f
     private val analysisExecutor = Executors.newSingleThreadExecutor()
     @Volatile private var released = false
+    @Volatile private var cameraStartRequested = false
     private val modelDimensionsLock = Any()
 
     // Model input dimensions for letterboxing (updatable when model changes)
@@ -130,14 +125,14 @@ class CameraManager(
             )
             targetModelWidth = sanitizedWidth
             targetModelHeight = sanitizedHeight
+            frameGeometryModelWidth = 0
+            frameGeometryModelHeight = 0
             cachedFloatBuffer = null
+            cachedQuantizedBuffer = null
             cachedModelRow = null
+            cachedQuantizedRow = null
             invalidatePixelMap()
         }
-    }
-
-    private fun targetModelDimensions(): Pair<Int, Int> = synchronized(modelDimensionsLock) {
-        targetModelWidth to targetModelHeight
     }
 
     // Actual frame dimensions from the camera (may differ from ANALYSIS_WIDTH/HEIGHT)
@@ -150,9 +145,11 @@ class CameraManager(
 
     // Pooled float buffer for letterboxing — reused across frames to avoid allocation
     private var cachedFloatBuffer: ByteBuffer? = null
+    private var cachedQuantizedBuffer: ByteBuffer? = null
     private var cachedBufferModelW = 0
     private var cachedBufferModelH = 0
     private var cachedModelRow: FloatArray? = null
+    private var cachedQuantizedRow: ByteArray? = null
 
     private data class PixelMapKey(
         val sourceWidth: Int,
@@ -178,13 +175,11 @@ class CameraManager(
     private var cachedUOffsets: IntArray? = null
     private var cachedVOffsets: IntArray? = null
 
-    // Pooled NV21 byte array — reused across frames to avoid 1.4MB allocation per frame
-    private var cachedNv21: ByteArray? = null
-    private var cachedNv21Size = 0
-
     @Volatile
     var frameGeometry = createFrameGeometry(ANALYSIS_WIDTH, ANALYSIS_HEIGHT, 0)
         private set
+    @Volatile private var frameGeometryModelWidth = modelInputWidth
+    @Volatile private var frameGeometryModelHeight = modelInputHeight
 
     // Camera exposure settings
     enum class ExposureMode { AUTO, MANUAL }
@@ -209,14 +204,15 @@ class CameraManager(
         targetRotation: Int = Surface.ROTATION_0,
     ) {
         if (released) return
+        cameraStartRequested = true
         this.previewSurfaceProvider = previewSurfaceProvider
         this.targetRotation = targetRotation
         val cameraProviderFuture = ProcessCameraProvider.getInstance(context)
         cameraProviderFuture.addListener({
-            if (released) return@addListener
+            if (released || !cameraStartRequested) return@addListener
             try {
                 val provider = cameraProviderFuture.get()
-                if (released) return@addListener
+                if (released || !cameraStartRequested) return@addListener
                 cameraProvider = provider
                 discoverCameras(provider)
                 bindUseCases(provider, previewSurfaceProvider)
@@ -253,6 +249,11 @@ class CameraManager(
             val defaultFocal = defaultChars
                 .get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)
                 ?.firstOrNull()
+            val physicalCameraIds = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                defaultChars.physicalCameraIds
+            } else {
+                emptySet()
+            }
 
             // Enumerate ALL physical camera IDs from Camera2 API
             val allCameraIds = camera2Manager.cameraIdList
@@ -269,7 +270,7 @@ class CameraManager(
                         ?.firstOrNull()
 
                     // Check if this is a physical camera within a logical multi-camera
-                    val isPhysical = defaultChars.physicalCameraIds.contains(camId)
+                    val isPhysical = physicalCameraIds.contains(camId)
                     val isLogical = camId == defaultId
 
                     if (isLogical || isPhysical) {
@@ -518,7 +519,7 @@ class CameraManager(
         provider: ProcessCameraProvider,
         previewSurfaceProvider: Preview.SurfaceProvider
     ): Boolean {
-        if (released || analysisExecutor.isShutdown) return false
+        if (released || !cameraStartRequested || analysisExecutor.isShutdown) return false
         val previewResolutionSelector = ResolutionSelector.Builder()
             .setAspectRatioStrategy(AspectRatioStrategy.RATIO_16_9_FALLBACK_AUTO_STRATEGY)
             .setResolutionStrategy(
@@ -674,10 +675,24 @@ class CameraManager(
             val swapsDimensions = rotation == 90 || rotation == 270
             val outputW = if (swapsDimensions) rawH else rawW
             val outputH = if (swapsDimensions) rawW else rawH
-            val geometry = createFrameGeometry(outputW, outputH, rotation)
-            val frameGeometryChanged = geometry != frameGeometry
+            val modelW = targetModelWidth
+            val modelH = targetModelHeight
+            val currentGeometry = frameGeometry
+            val frameGeometryChanged = currentGeometry.width != outputW ||
+                currentGeometry.height != outputH ||
+                currentGeometry.rotationDegrees != rotation ||
+                frameGeometryModelWidth != modelW ||
+                frameGeometryModelHeight != modelH
+            val geometry = if (frameGeometryChanged) {
+                createFrameGeometry(outputW, outputH, rotation, modelW, modelH).also {
+                    frameGeometry = it
+                    frameGeometryModelWidth = modelW
+                    frameGeometryModelHeight = modelH
+                }
+            } else {
+                currentGeometry
+            }
             if (frameCount == 0L || frameGeometryChanged) {
-                frameGeometry = geometry
                 actualFrameWidth = outputW
                 actualFrameHeight = outputH
                 invalidatePixelMap()
@@ -693,13 +708,9 @@ class CameraManager(
                 return
             }
 
-            if (shouldCaptureYuvFrame()) {
-                val nv21 = yuvToNv21(imageProxy)
-                onYuvFrameReady?.invoke(nv21, rawW, rawH)
-            }
-
-            val buffer = yuvToLetterboxedBuffer(imageProxy, geometry)
-            onFrameReady(buffer, imageProxy, geometry)
+            val quantizationLut = inputQuantizationLutProvider()
+            val buffer = yuvToLetterboxedBuffer(imageProxy, geometry, quantizationLut)
+            onFrameReady(buffer, imageProxy, geometry, quantizationLut != null)
         } catch (e: Exception) {
             Log.e(TAG, "Frame processing failed", e)
             FileLogger.e(TAG, "Frame processing failed: ${e.message}", e)
@@ -707,103 +718,58 @@ class CameraManager(
         }
     }
 
-    /**
-     * Convert YUV_420_888 ImageProxy directly to letterboxed float32 ByteBuffer.
-     *
-     * Optimized pipeline: NV21 extraction → direct YUV-to-float32 with letterboxing.
-     * Skips the expensive JPEG encode/decode round-trip that the old pipeline used.
-     */
-    private fun yuvToNv21(imageProxy: ImageProxy): ByteArray {
-        val yPlane = imageProxy.planes[0]
-        val uPlane = imageProxy.planes[1]
-        val vPlane = imageProxy.planes[2]
-
-        // Work on duplicates so optional NV21 export never changes the buffers used by YOLO.
-        val yBuffer = yPlane.buffer.duplicate()
-        val uBuffer = uPlane.buffer.duplicate()
-        val vBuffer = vPlane.buffer.duplicate()
-
-        val width = imageProxy.width
-        val height = imageProxy.height
-        val yRowStride = yPlane.rowStride
-        val yPixelStride = yPlane.pixelStride
-        val uvRowStride = uPlane.rowStride
-        val uvPixelStride = uPlane.pixelStride
-        val yBase = yBuffer.position()
-        val uBase = uBuffer.position()
-        val vBase = vBuffer.position()
-
-        // Build NV21 byte array for supercombo preprocessor (pooled)
-        val nv21Size = width * height * 3 / 2
-        val nv21 = cachedNv21?.takeIf { cachedNv21Size == nv21Size }
-            ?: ByteArray(nv21Size).also { cachedNv21 = it; cachedNv21Size = nv21Size }
-        var pos = 0
-        // Bulk-copy Y plane when stride equals width (common case)
-        if (yRowStride == width && yPixelStride == 1 && yBuffer.remaining() >= width * height) {
-            yBuffer.get(nv21, 0, width * height)
-            pos = width * height
-        } else {
-            for (row in 0 until height) {
-                for (col in 0 until width) {
-                    nv21[pos++] = yBuffer.get(yBase + row * yRowStride + col * yPixelStride)
-                }
-            }
-        }
-        val uvHeight = height / 2
-        val uvWidth = width / 2
-        val vBufLimit = vBuffer.limit()
-        val uBufLimit = uBuffer.limit()
-        for (row in 0 until uvHeight) {
-            for (col in 0 until uvWidth) {
-                val uvIndex = row * uvRowStride + col * uvPixelStride
-                if (vBase + uvIndex < vBufLimit && uBase + uvIndex < uBufLimit) {
-                    nv21[pos++] = vBuffer.get(vBase + uvIndex)
-                    nv21[pos++] = uBuffer.get(uBase + uvIndex)
-                } else {
-                    nv21[pos++] = 128.toByte()
-                    nv21[pos++] = 128.toByte()
-                }
-            }
-        }
-
-        return nv21
-    }
-
     /** Directly sample YUV planes into the model tensor; no full-frame NV21 copy. */
     private fun yuvToLetterboxedBuffer(
         imageProxy: ImageProxy,
         geometry: FrameGeometry,
+        quantizationLut: ByteArray?,
     ): ByteBuffer {
         val srcW = imageProxy.width
         val srcH = imageProxy.height
-        val (modelW, modelH) = targetModelDimensions()
+        val modelW = targetModelWidth
+        val modelH = targetModelHeight
         val planes = imageProxy.planes
         val yPlane = planes[0]
         val uPlane = planes[1]
         val vPlane = planes[2]
-        val yBuffer = yPlane.buffer.duplicate()
-        val uBuffer = uPlane.buffer.duplicate()
-        val vBuffer = vPlane.buffer.duplicate()
+        val yBuffer = yPlane.buffer
+        val uBuffer = uPlane.buffer
+        val vBuffer = vPlane.buffer
 
-        val mapKey = PixelMapKey(
-            sourceWidth = srcW,
-            sourceHeight = srcH,
-            outputWidth = geometry.width,
-            outputHeight = geometry.height,
-            rotationDegrees = geometry.rotationDegrees,
-            modelWidth = modelW,
-            modelHeight = modelH,
-            yRowStride = yPlane.rowStride,
-            yPixelStride = yPlane.pixelStride,
-            uRowStride = uPlane.rowStride,
-            uPixelStride = uPlane.pixelStride,
-            vRowStride = vPlane.rowStride,
-            vPixelStride = vPlane.pixelStride,
-            modelScale = geometry.modelScale,
-            modelOffsetX = geometry.modelOffsetX,
-            modelOffsetY = geometry.modelOffsetY,
-        )
-        ensurePixelMap(mapKey)
+        val existingMap = cachedPixelMapKey
+        if (existingMap == null ||
+            existingMap.sourceWidth != srcW || existingMap.sourceHeight != srcH ||
+            existingMap.outputWidth != geometry.width || existingMap.outputHeight != geometry.height ||
+            existingMap.rotationDegrees != geometry.rotationDegrees ||
+            existingMap.modelWidth != modelW || existingMap.modelHeight != modelH ||
+            existingMap.yRowStride != yPlane.rowStride || existingMap.yPixelStride != yPlane.pixelStride ||
+            existingMap.uRowStride != uPlane.rowStride || existingMap.uPixelStride != uPlane.pixelStride ||
+            existingMap.vRowStride != vPlane.rowStride || existingMap.vPixelStride != vPlane.pixelStride ||
+            existingMap.modelScale != geometry.modelScale ||
+            existingMap.modelOffsetX != geometry.modelOffsetX ||
+            existingMap.modelOffsetY != geometry.modelOffsetY
+        ) {
+            ensurePixelMap(
+                PixelMapKey(
+                    sourceWidth = srcW,
+                    sourceHeight = srcH,
+                    outputWidth = geometry.width,
+                    outputHeight = geometry.height,
+                    rotationDegrees = geometry.rotationDegrees,
+                    modelWidth = modelW,
+                    modelHeight = modelH,
+                    yRowStride = yPlane.rowStride,
+                    yPixelStride = yPlane.pixelStride,
+                    uRowStride = uPlane.rowStride,
+                    uPixelStride = uPlane.pixelStride,
+                    vRowStride = vPlane.rowStride,
+                    vPixelStride = vPlane.pixelStride,
+                    modelScale = geometry.modelScale,
+                    modelOffsetX = geometry.modelOffsetX,
+                    modelOffsetY = geometry.modelOffsetY,
+                )
+            )
+        }
         val yOffsets = checkNotNull(cachedYOffsets)
         val uOffsets = checkNotNull(cachedUOffsets)
         val vOffsets = checkNotNull(cachedVOffsets)
@@ -811,7 +777,46 @@ class CameraManager(
         val uBase = uBuffer.position()
         val vBase = vBuffer.position()
 
-        // Reuse pooled buffer if dimensions match, otherwise allocate new one
+        if (quantizationLut != null) {
+            val requiredSize = modelH * modelW * 3
+            val buffer = cachedQuantizedBuffer?.takeIf { it.capacity() == requiredSize }
+                ?: ByteBuffer.allocateDirect(requiredSize).also { cachedQuantizedBuffer = it }
+            val row = cachedQuantizedRow?.takeIf { it.size == modelW * 3 }
+                ?: ByteArray(modelW * 3).also { cachedQuantizedRow = it }
+            val padValue = quantizationLut[(0.447f * 255f).roundToInt()]
+
+            buffer.clear()
+            var pixelIndex = 0
+            for (my in 0 until modelH) {
+                var ri = 0
+                repeat(modelW) {
+                    val yOffset = yOffsets[pixelIndex]
+                    if (yOffset < 0) {
+                        row[ri++] = padValue
+                        row[ri++] = padValue
+                        row[ri++] = padValue
+                    } else {
+                        val y = yBuffer.get(yBase + yOffset).toInt() and 0xFF
+                        val uIndex = (uBase + uOffsets[pixelIndex]).coerceAtMost(uBuffer.limit() - 1)
+                        val vIndex = (vBase + vOffsets[pixelIndex]).coerceAtMost(vBuffer.limit() - 1)
+                        val u = (uBuffer.get(uIndex).toInt() and 0xFF) - 128
+                        val v = (vBuffer.get(vIndex).toInt() and 0xFF) - 128
+                        val red = (y + (v * 1436 shr 10)).coerceIn(0, 255)
+                        val green = (y - ((u * 352 + v * 731) shr 10)).coerceIn(0, 255)
+                        val blue = (y + (u * 1815 shr 10)).coerceIn(0, 255)
+                        row[ri++] = quantizationLut[red]
+                        row[ri++] = quantizationLut[green]
+                        row[ri++] = quantizationLut[blue]
+                    }
+                    pixelIndex++
+                }
+                buffer.put(row, 0, ri)
+            }
+            buffer.rewind()
+            return buffer
+        }
+
+        // Reuse pooled float buffer if dimensions match, otherwise allocate new one.
         val requiredSize = modelH * modelW * 3 * 4
         val buffer = cachedFloatBuffer?.takeIf {
             cachedBufferModelW == modelW && cachedBufferModelH == modelH
@@ -905,8 +910,11 @@ class CameraManager(
         outputWidth: Int,
         outputHeight: Int,
         rotationDegrees: Int,
+        modelWidth: Int = targetModelWidth,
+        modelHeight: Int = targetModelHeight,
     ): FrameGeometry {
-        val (modelW, modelH) = targetModelDimensions()
+        val modelW = modelWidth
+        val modelH = modelHeight
         val width = outputWidth.coerceAtLeast(1)
         val height = outputHeight.coerceAtLeast(1)
         val scaleX = modelW.toFloat() / width
@@ -1061,6 +1069,7 @@ class CameraManager(
      * Release all camera resources.
      */
     fun stopCamera() {
+        cameraStartRequested = false
         analysisUseCase?.clearAnalyzer()
         cameraProvider?.unbindAll()
         camera = null

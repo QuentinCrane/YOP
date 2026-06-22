@@ -24,10 +24,19 @@ enum class GpuPrecision(val label: String) {
     FP32("FP32 (精确)"),
 }
 
-enum class SpeedUnit(val label: String, val suffix: String, val factor: Float) {
-    KMH("km/h", "km/h", 1f),
-    MPH("mph", "mph", 0.621371f),
-    MS("m/s", "m/s", 0.277778f),
+enum class SpeedStyle(val label: String) {
+    COMPACT("紧凑"),
+    DIGITAL("数码"),
+    LARGE("大字"),
+    MINIMAL("极简"),
+}
+
+enum class CorridorProfile(val label: String, val description: String) {
+    NARROW("窄", "紧凑车道，适合城市"),
+    STANDARD("标准", "默认推荐"),
+    WIDE("宽", "更大安全区域"),
+    EXTRA_WIDE("超宽", "最大预警范围"),
+    CUSTOM("自定义", "手动调节参数"),
 }
 
 enum class AnalysisResolution(
@@ -70,7 +79,17 @@ data class InferenceSettings(
     val soundAlertsEnabled: Boolean = true,
     val alertSoundStyle: AlertSoundStyle = AlertSoundStyle.TESLA,
     val showRoutePrediction: Boolean = true,
-    val speedUnit: SpeedUnit = SpeedUnit.KMH,
+    val corridorProfile: CorridorProfile = CorridorProfile.STANDARD,
+    val corridorBaseHalfWidth: Float = 0.85f,
+    val corridorMaxHalfWidth: Float = 1.55f,
+    val corridorHorizonSeconds: Float = 2.0f,
+    val corridorMinDistance: Float = 8f,
+    val corridorMaxDistance: Float = 32f,
+    val corridorWidthGrowthPerMeter: Float = 0.018f,
+    val corridorWidthGrowthPerYawRate: Float = 0.18f,
+    val corridorSpeedRangeLow: Float = 10f,
+    val corridorSpeedRangeHigh: Float = 60f,
+    val speedStyle: SpeedStyle = SpeedStyle.COMPACT,
     val dangerDistanceM: Float = 8f,
     val urgentDistanceM: Float = 18f,
     val cautionDistanceM: Float = 35f,
@@ -147,10 +166,63 @@ fun InferenceSettings.withPreset(mode: DetectionMode): InferenceSettings = when 
     DetectionMode.CUSTOM -> copy(detectionMode = mode)
 }
 
+fun InferenceSettings.withCorridorProfile(profile: CorridorProfile): InferenceSettings = when (profile) {
+    CorridorProfile.NARROW -> copy(
+        corridorProfile = profile,
+        corridorBaseHalfWidth = 0.55f,
+        corridorMaxHalfWidth = 1.0f,
+        corridorHorizonSeconds = 1.5f,
+        corridorMinDistance = 6f,
+        corridorMaxDistance = 24f,
+        corridorWidthGrowthPerMeter = 0.012f,
+        corridorWidthGrowthPerYawRate = 0.12f,
+        corridorSpeedRangeLow = 8f,
+        corridorSpeedRangeHigh = 40f,
+    )
+    CorridorProfile.STANDARD -> copy(
+        corridorProfile = profile,
+        corridorBaseHalfWidth = 0.85f,
+        corridorMaxHalfWidth = 1.55f,
+        corridorHorizonSeconds = 2.0f,
+        corridorMinDistance = 8f,
+        corridorMaxDistance = 32f,
+        corridorWidthGrowthPerMeter = 0.018f,
+        corridorWidthGrowthPerYawRate = 0.18f,
+        corridorSpeedRangeLow = 10f,
+        corridorSpeedRangeHigh = 60f,
+    )
+    CorridorProfile.WIDE -> copy(
+        corridorProfile = profile,
+        corridorBaseHalfWidth = 1.1f,
+        corridorMaxHalfWidth = 2.0f,
+        corridorHorizonSeconds = 2.5f,
+        corridorMinDistance = 10f,
+        corridorMaxDistance = 40f,
+        corridorWidthGrowthPerMeter = 0.022f,
+        corridorWidthGrowthPerYawRate = 0.22f,
+        corridorSpeedRangeLow = 12f,
+        corridorSpeedRangeHigh = 70f,
+    )
+    CorridorProfile.EXTRA_WIDE -> copy(
+        corridorProfile = profile,
+        corridorBaseHalfWidth = 1.4f,
+        corridorMaxHalfWidth = 2.5f,
+        corridorHorizonSeconds = 3.0f,
+        corridorMinDistance = 12f,
+        corridorMaxDistance = 50f,
+        corridorWidthGrowthPerMeter = 0.028f,
+        corridorWidthGrowthPerYawRate = 0.28f,
+        corridorSpeedRangeLow = 15f,
+        corridorSpeedRangeHigh = 80f,
+    )
+    CorridorProfile.CUSTOM -> copy(corridorProfile = profile)
+}
+
 fun InferenceSettings.sanitized(): InferenceSettings {
     val danger = dangerDistanceM.coerceIn(1f, 50f)
     val urgent = urgentDistanceM.coerceIn(3f, 80f).coerceAtLeast(danger)
     val caution = cautionDistanceM.coerceIn(5f, 150f).coerceAtLeast(urgent)
+    val baseHW = corridorBaseHalfWidth.coerceIn(0.3f, 2.0f)
     return copy(
         confidenceThreshold = confidenceThreshold.coerceIn(0.05f, 0.90f),
         vulnerableUserConfidence = vulnerableUserConfidence.coerceIn(0.05f, 0.90f),
@@ -168,6 +240,15 @@ fun InferenceSettings.sanitized(): InferenceSettings {
         dangerDistanceM = danger,
         urgentDistanceM = urgent,
         cautionDistanceM = caution,
+        corridorBaseHalfWidth = baseHW,
+        corridorMaxHalfWidth = corridorMaxHalfWidth.coerceIn(baseHW, 3.5f),
+        corridorHorizonSeconds = corridorHorizonSeconds.coerceIn(0.5f, 5.0f),
+        corridorMinDistance = corridorMinDistance.coerceIn(3f, 20f),
+        corridorMaxDistance = corridorMaxDistance.coerceIn(10f, 80f).coerceAtLeast(corridorMinDistance),
+        corridorWidthGrowthPerMeter = corridorWidthGrowthPerMeter.coerceIn(0f, 0.06f),
+        corridorWidthGrowthPerYawRate = corridorWidthGrowthPerYawRate.coerceIn(0f, 0.5f),
+        corridorSpeedRangeLow = corridorSpeedRangeLow.coerceIn(0f, 60f),
+        corridorSpeedRangeHigh = corridorSpeedRangeHigh.coerceIn(corridorSpeedRangeLow, 120f),
     )
 }
 
@@ -206,7 +287,17 @@ class InferenceSettingsStore(context: Context) {
             soundAlertsEnabled = preferences.getBoolean("sound", defaults.soundAlertsEnabled),
             alertSoundStyle = enumValue("alert_sound_style", defaults.alertSoundStyle),
             showRoutePrediction = preferences.getBoolean("show_route", defaults.showRoutePrediction),
-            speedUnit = enumValue("speed_unit", defaults.speedUnit),
+            corridorProfile = enumValue("corridor_profile", defaults.corridorProfile),
+            corridorBaseHalfWidth = preferences.getFloat("corridor_base_hw", defaults.corridorBaseHalfWidth),
+            corridorMaxHalfWidth = preferences.getFloat("corridor_max_hw", defaults.corridorMaxHalfWidth),
+            corridorHorizonSeconds = preferences.getFloat("corridor_horizon_s", defaults.corridorHorizonSeconds),
+            corridorMinDistance = preferences.getFloat("corridor_min_dist", defaults.corridorMinDistance),
+            corridorMaxDistance = preferences.getFloat("corridor_max_dist", defaults.corridorMaxDistance),
+            corridorWidthGrowthPerMeter = preferences.getFloat("corridor_wg_pm", defaults.corridorWidthGrowthPerMeter),
+            corridorWidthGrowthPerYawRate = preferences.getFloat("corridor_wg_pyr", defaults.corridorWidthGrowthPerYawRate),
+            corridorSpeedRangeLow = preferences.getFloat("corridor_spd_lo", defaults.corridorSpeedRangeLow),
+            corridorSpeedRangeHigh = preferences.getFloat("corridor_spd_hi", defaults.corridorSpeedRangeHigh),
+            speedStyle = enumValue("speed_style", defaults.speedStyle),
             dangerDistanceM = preferences.getFloat("danger_dist", defaults.dangerDistanceM),
             urgentDistanceM = preferences.getFloat("urgent_dist", defaults.urgentDistanceM),
             cautionDistanceM = preferences.getFloat("caution_dist", defaults.cautionDistanceM),
@@ -244,7 +335,17 @@ class InferenceSettingsStore(context: Context) {
             .putBoolean("sound", value.soundAlertsEnabled)
             .putString("alert_sound_style", value.alertSoundStyle.name)
             .putBoolean("show_route", value.showRoutePrediction)
-            .putString("speed_unit", value.speedUnit.name)
+            .putString("corridor_profile", value.corridorProfile.name)
+            .putFloat("corridor_base_hw", value.corridorBaseHalfWidth)
+            .putFloat("corridor_max_hw", value.corridorMaxHalfWidth)
+            .putFloat("corridor_horizon_s", value.corridorHorizonSeconds)
+            .putFloat("corridor_min_dist", value.corridorMinDistance)
+            .putFloat("corridor_max_dist", value.corridorMaxDistance)
+            .putFloat("corridor_wg_pm", value.corridorWidthGrowthPerMeter)
+            .putFloat("corridor_wg_pyr", value.corridorWidthGrowthPerYawRate)
+            .putFloat("corridor_spd_lo", value.corridorSpeedRangeLow)
+            .putFloat("corridor_spd_hi", value.corridorSpeedRangeHigh)
+            .putString("speed_style", value.speedStyle.name)
             .putFloat("danger_dist", value.dangerDistanceM)
             .putFloat("urgent_dist", value.urgentDistanceM)
             .putFloat("caution_dist", value.cautionDistanceM)

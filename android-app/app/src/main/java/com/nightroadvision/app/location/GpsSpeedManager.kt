@@ -24,7 +24,9 @@ class GpsSpeedManager(
 ) {
     companion object {
         private const val TAG = "GpsSpeedManager"
-        private const val UPDATE_INTERVAL_MS = 1000L
+        private const val UPDATE_INTERVAL_MS = 2000L
+        private const val MIN_UPDATE_INTERVAL_MS = 1000L
+        private const val MIN_UPDATE_DISTANCE_METERS = 2f
     }
 
     private val client: FusedLocationProviderClient =
@@ -51,7 +53,8 @@ class GpsSpeedManager(
         }
 
         val request = LocationRequest.Builder(Priority.PRIORITY_HIGH_ACCURACY, UPDATE_INTERVAL_MS)
-            .setMinUpdateIntervalMillis(500)
+            .setMinUpdateIntervalMillis(MIN_UPDATE_INTERVAL_MS)
+            .setMinUpdateDistanceMeters(MIN_UPDATE_DISTANCE_METERS)
             .build()
 
         try {

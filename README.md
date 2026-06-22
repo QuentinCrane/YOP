@@ -6,10 +6,10 @@ Android phone-side real-time road perception project focused on on-device YOLO i
 
 This repository currently has two main parts:
 
-- `android-app/`: Android app built with Jetpack Compose, CameraX, LiteRT, and ONNX Runtime
+- `android-app/`: Android app built with Jetpack Compose, CameraX, and LiteRT
 - `training/`: dataset preparation, training, evaluation, and model export scripts for the YOLO pipeline
 
-In the current codebase, the app uses YOLO models for live camera detection and can optionally load an `openpilot`-style `supercombo` ONNX model to enrich lead-vehicle perception when that asset is present.
+The app uses YOLO models for live camera detection and a low-power motion-sensor corridor to estimate the rider's short-horizon travel area.
 
 ## Current App Capabilities
 
@@ -19,7 +19,7 @@ In the current codebase, the app uses YOLO models for live camera detection and 
 - CameraX preview and analysis pipeline
 - Object tracking for more stable overlay behavior
 - Riding-risk evaluation with vibration and sound alerts
-- Optional `supercombo` ONNX inference path for lead-vehicle merging
+- Gyroscope- and speed-driven dynamic risk corridor, shared by the overlay and alert logic
 - Runtime performance monitoring and file-based logging
 
 ## Repository Structure
@@ -59,7 +59,6 @@ night-road-vision/
 - Kotlin + Jetpack Compose
 - CameraX
 - Google LiteRT (`com.google.ai.edge.litert`)
-- ONNX Runtime Android
 - Material 3
 
 Key app settings from the current Gradle config:
@@ -103,6 +102,7 @@ The app currently requests:
 
 - Camera permission
 - Vibration permission
+- Precise location permission (used for vehicle speed)
 
 ### 4. Run on a physical device
 
@@ -139,7 +139,7 @@ python evaluate.py --help
 
 - The repository name is still `night-road-vision`, but the project title in this README is now `YOP - Real-time YOLO Camera on phone`
 - The Android app name shown in resources is currently `夜视路况`
-- `supercombo` support is optional in code and depends on the corresponding ONNX model asset being available
+- The dynamic risk corridor is geometric and does not require a second vision model
 - This repo already contains committed model files, so `.gitignore` should be kept careful not to hide the tracked assets you still want in source control
 
 ## Development Docs

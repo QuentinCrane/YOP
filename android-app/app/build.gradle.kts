@@ -39,8 +39,7 @@ android {
     }
 
     androidResources {
-        // Compress .onnx model assets to reduce APK size.
-        // TFLite uses openFd() requiring STORED, but ONNX uses open().readBytes() so DEFLATED is fine.
+        // LiteRT opens model assets through a file descriptor, so keep them uncompressed.
         noCompress += listOf("tflite", "txt")
     }
 
@@ -55,8 +54,8 @@ android {
     }
 
     // Keep the riding build lightweight. Larger accuracy experiments remain in the
-    // repository but are not shipped inside every APK; YOLO26n is the default and
-    // YOLOv8n remains available as a compatibility fallback.
+    // repository but are not shipped inside every APK; YOLO26n INT8 is the default
+    // and YOLOv8n remains available as a compatibility fallback.
     sourceSets.getByName("main") {
         assets.setSrcDirs(listOf(lightweightAssetsDir.get().asFile))
     }
@@ -72,7 +71,10 @@ android {
 }
 
 afterEvaluate {
-    tasks.matching { it.name.contains("LintModel") }.configureEach {
+    tasks.matching { it.name.startsWith("merge") && it.name.endsWith("Assets") }.configureEach {
+        dependsOn(prepareLightweightAssets)
+    }
+    tasks.matching { it.name.contains("lint", ignoreCase = true) }.configureEach {
         dependsOn(prepareLightweightAssets)
     }
 }
@@ -102,9 +104,6 @@ dependencies {
     implementation("com.google.ai.edge.litert:litert-gpu:1.0.1")
     implementation("com.google.ai.edge.litert:litert-gpu-api:1.0.1")
     implementation("com.google.ai.edge.litert:litert-support:1.0.1")
-
-    // ONNX Runtime for openpilot supercombo model
-    implementation("com.microsoft.onnxruntime:onnxruntime-android:1.20.0")
 
     // GPS speed
     implementation("com.google.android.gms:play-services-location:21.3.0")

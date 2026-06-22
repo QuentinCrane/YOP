@@ -176,6 +176,7 @@ class InferenceEngine(private val context: Context) {
     @Volatile private var outputDataType: DataType = DataType.FLOAT32
     @Volatile private var inputQuantizationScale: Float = 0f
     @Volatile private var inputQuantizationZeroPoint: Int = 0
+    @Volatile private var inputQuantizationLut: ByteArray? = null
     @Volatile private var outputQuantizationScale: Float = 0f
     @Volatile private var outputQuantizationZeroPoint: Int = 0
 
@@ -216,6 +217,7 @@ class InferenceEngine(private val context: Context) {
             closeDelegates()
             currentModelPath = assetPath
             outputCoordinatesNormalized = null
+            inputQuantizationLut = null
             createInterpreterWithFallback(assetPath)
 
             // Read actual model input dimensions from TFLite
@@ -337,6 +339,9 @@ class InferenceEngine(private val context: Context) {
      * Whether a model is currently loaded and ready for inference.
      */
     val isReady: Boolean get() = interpreter != null
+
+    /** Immutable 8-bit RGB lookup table used by CameraManager for direct tensor writes. */
+    fun getInputQuantizationLut(): ByteArray? = inputQuantizationLut
 
     /**
      * Run a warm-up inference to prime GPU kernels / JIT compilation.
@@ -822,6 +827,7 @@ class InferenceEngine(private val context: Context) {
                 inputQuantizationScale = params.scale
                 inputQuantizationZeroPoint = params.zeroPoint
             }
+            inputQuantizationLut = createInputQuantizationLut()
             val shape = inputTensor.shape() // e.g. [1, 640, 640, 3] or [1, 320, 512, 3]
             if (shape.size >= 4) {
                 // shape = [batch, height, width, channels]
@@ -952,10 +958,7 @@ class InferenceEngine(private val context: Context) {
         val trackId: Int? = null,
         val cameraWidth: Int = DEFAULT_CAMERA_WIDTH,
         val cameraHeight: Int = DEFAULT_CAMERA_HEIGHT,
-        val distanceMeters: Float? = null,         // real distance from supercombo (meters)
         val estimatedDistanceMeters: Float? = null, // pinhole model estimated distance (meters)
-        val velocityMps: Float? = null,            // velocity from supercombo (m/s)
-        val isLeadVehicle: Boolean = false,         // detected by supercombo as lead vehicle
     ) {
         val centerX: Float get() = (x1 + x2) / 2f
         val centerY: Float get() = (y1 + y2) / 2f
@@ -989,6 +992,7 @@ class InferenceEngine(private val context: Context) {
      */
     fun runInference(
         inputBuffer: ByteBuffer,
+        inputAlreadyQuantized: Boolean = false,
         confidenceThreshold: Float = DEFAULT_CONFIDENCE_THRESHOLD,
         iouThreshold: Float = DEFAULT_NMS_IOU_THRESHOLD,
         classConfidenceThresholds: Map<Int, Float> = emptyMap(),
@@ -1009,7 +1013,7 @@ class InferenceEngine(private val context: Context) {
         val startTime = System.nanoTime()
         val interp = interpreter
             ?: throw IllegalStateException("No interpreter loaded — model may have failed to initialize")
-        runInterpreter(interp, inputBuffer, output)
+        runInterpreter(interp, inputBuffer, output, inputAlreadyQuantized)
         val inferenceTimeMs = (System.nanoTime() - startTime) / 1_000_000L
 
         // Parse detections based on output format
@@ -1019,15 +1023,23 @@ class InferenceEngine(private val context: Context) {
             parsePostProcessedOutput(output, letterboxParams, confidenceThreshold, classConfidenceThresholds)
         }
 
-        val nmsDetections = nms(
-            detections = detections,
-            iouThreshold = iouThreshold,
-            classAware = classAwareNms,
-            maxDetections = maxDetections.coerceIn(1, NUM_DETECTIONS),
-        )
+        val detectionLimit = maxDetections.coerceIn(1, NUM_DETECTIONS)
+        val finalDetections = if (isRawFormat) {
+            nms(
+                detections = detections,
+                iouThreshold = iouThreshold,
+                classAware = classAwareNms,
+                maxDetections = detectionLimit,
+            )
+        } else if (detections.size <= detectionLimit) {
+            // YOLO26's [1, 300, 6] export already includes NMS.
+            detections
+        } else {
+            detections.sortedByDescending { it.confidence }.take(detectionLimit)
+        }
 
         InferenceResult(
-            detections = nmsDetections,
+            detections = finalDetections,
             letterboxParams = letterboxParams,
             inferenceTimeMs = inferenceTimeMs,
             preprocessTimeMs = 0L,
@@ -1144,8 +1156,9 @@ class InferenceEngine(private val context: Context) {
         interp: Interpreter,
         floatInput: ByteBuffer,
         floatOutput: Array<Array<FloatArray>>,
+        inputAlreadyQuantized: Boolean = false,
     ) {
-        val preparedInput = prepareInputBuffer(floatInput)
+        val preparedInput = prepareInputBuffer(floatInput, inputAlreadyQuantized)
         if (outputDataType == DataType.FLOAT32) {
             interp.run(preparedInput, floatOutput)
             return
@@ -1174,7 +1187,17 @@ class InferenceEngine(private val context: Context) {
         }
     }
 
-    private fun prepareInputBuffer(floatInput: ByteBuffer): ByteBuffer {
+    private fun prepareInputBuffer(
+        floatInput: ByteBuffer,
+        inputAlreadyQuantized: Boolean,
+    ): ByteBuffer {
+        if (inputAlreadyQuantized) {
+            require(inputDataType == DataType.INT8 || inputDataType == DataType.UINT8) {
+                "Direct quantized input supplied to $inputDataType model"
+            }
+            floatInput.rewind()
+            return floatInput
+        }
         if (inputDataType == DataType.FLOAT32) {
             floatInput.rewind()
             return floatInput
@@ -1201,6 +1224,21 @@ class InferenceEngine(private val context: Context) {
         }
         quantizedInput.rewind()
         return quantizedInput
+    }
+
+    private fun createInputQuantizationLut(): ByteArray? {
+        if (inputDataType != DataType.INT8 && inputDataType != DataType.UINT8) return null
+        val scale = inputQuantizationScale.takeIf { it > 0f } ?: (1f / 255f)
+        return ByteArray(256) { channel ->
+            val normalized = channel / 255f
+            val quantized = (normalized / scale + inputQuantizationZeroPoint).roundToInt()
+            val clamped = if (inputDataType == DataType.UINT8) {
+                quantized.coerceIn(0, 255)
+            } else {
+                quantized.coerceIn(-128, 127)
+            }
+            clamped.toByte()
+        }
     }
 
     /**

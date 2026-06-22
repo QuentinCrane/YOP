@@ -31,7 +31,7 @@ class ModelManager(private val context: Context) {
         private const val TAG = "ModelManager"
         private const val PREFS_NAME = "model_preferences"
         private const val KEY_CURRENT_MODEL = "current_model"
-        private const val DEFAULT_MODEL = "models/yolo26n_float16.tflite"
+        private const val DEFAULT_MODEL = "models/yolo26n_balanced_512x320_int8.tflite"
 
         /** Default YOLO input dimensions (width x height). */
         const val DEFAULT_INPUT_WIDTH = 640

@@ -14,13 +14,14 @@ import com.nightroadvision.app.alert.RidingVibrationController
 import com.nightroadvision.app.camera.CameraManager
 import com.nightroadvision.app.camera.FrameGeometry
 import com.nightroadvision.app.inference.InferenceEngine
-import com.nightroadvision.app.inference.LeadVehicleMerger
-import com.nightroadvision.app.inference.SupercomboEngine
-import com.nightroadvision.app.inference.SupercomboPreprocessor
-import com.nightroadvision.app.ui.overlay.RoutePoint
 import com.nightroadvision.app.location.GpsSpeedManager
 import com.nightroadvision.app.model.ModelManager
 import com.nightroadvision.app.model.ModelQuantization
+import com.nightroadvision.app.motion.CorridorConfig
+import com.nightroadvision.app.motion.DrivingCorridor
+import com.nightroadvision.app.motion.RiskCorridorEstimator
+import com.nightroadvision.app.motion.VehicleMotionEstimator
+import com.nightroadvision.app.motion.VehicleMotionSample
 import com.nightroadvision.app.performance.PerformanceMonitor
 import com.nightroadvision.app.tracking.Detection as TrackingDetection
 import com.nightroadvision.app.tracking.ObjectTracker
@@ -44,6 +45,9 @@ class MainScreenViewModel(application: Application) : AndroidViewModel(applicati
 
     companion object {
         private const val TAG = "MainScreenVM"
+        private const val METRICS_PUBLISH_INTERVAL_NS = 250_000_000L
+        private const val FPS_WINDOW_NS = 1_000_000_000L
+        private const val MIN_ANALYSIS_INTERVAL_NS = 30_000_000L
         private val COCO_ROAD_USER_CLASS_IDS = setOf(0, 1, 2, 3, 5, 7)
         private val NIGHT_ROAD_CLASS_NAMES = listOf(
             "person", "rider", "bicycle", "motorcycle", "car", "bus", "truck",
@@ -61,35 +65,66 @@ class MainScreenViewModel(application: Application) : AndroidViewModel(applicati
     private val ridingVibrationController = RidingVibrationController(application)
     private val alertSoundPlayer = AlertSoundPlayer(application)
 
-    // -- Supercombo (openpilot) ------------------------------------------------
-
-    private val supercomboEngine = SupercomboEngine(application)
-    private val supercomboPreprocessor = SupercomboPreprocessor()
-    private val leadVehicleMerger = LeadVehicleMerger()
-
-    private val _supercomboEnabled = MutableStateFlow(false)
-    val supercomboEnabled: StateFlow<Boolean> = _supercomboEnabled.asStateFlow()
-
-    private val _supercomboLatencyMs = MutableStateFlow(0L)
-    val supercomboLatencyMs: StateFlow<Long> = _supercomboLatencyMs.asStateFlow()
-
-    private val _supercomboAvailable = MutableStateFlow(false)
-    val supercomboAvailable: StateFlow<Boolean> = _supercomboAvailable.asStateFlow()
-
-    @Volatile
-    private var supercomboReady = false
-
-    // -- GPS Speed ------------------------------------------------------------
+    // -- Speed + low-power motion corridor ------------------------------------
 
     private val _speedKmh = MutableStateFlow(0f)
     val speedKmh: StateFlow<Float> = _speedKmh.asStateFlow()
 
+    private val riskCorridorEstimator = RiskCorridorEstimator()
+    private val _drivingCorridor = MutableStateFlow(
+        riskCorridorEstimator.estimate(0f, 0f, motionSensorAvailable = false)
+    )
+    val drivingCorridor: StateFlow<DrivingCorridor> = _drivingCorridor.asStateFlow()
+
+    @Volatile
+    private var latestMotionSample = VehicleMotionSample()
+
+    private val vehicleMotionEstimator = VehicleMotionEstimator(application) { sample ->
+        latestMotionSample = sample
+        updateDrivingCorridor()
+    }
+
     private val gpsSpeedManager = GpsSpeedManager(application) { speed ->
         _speedKmh.value = speed
+        updateDrivingCorridor()
     }
 
     fun startGpsSpeed() {
         gpsSpeedManager.start()
+    }
+
+    fun stopGpsSpeed() {
+        gpsSpeedManager.stop()
+    }
+
+    fun startMotionEstimation() {
+        vehicleMotionEstimator.start()
+        updateDrivingCorridor()
+    }
+
+    fun stopMotionEstimation() {
+        vehicleMotionEstimator.stop()
+    }
+
+    private fun updateDrivingCorridor() {
+        val motion = latestMotionSample
+        val s = _settings.value
+        _drivingCorridor.value = riskCorridorEstimator.estimate(
+            speedKmh = _speedKmh.value,
+            yawRateRadPerSecond = motion.yawRateRadPerSecond,
+            motionSensorAvailable = motion.sensorAvailable,
+            config = CorridorConfig(
+                baseHalfWidthMeters = s.corridorBaseHalfWidth,
+                maxHalfWidthMeters = s.corridorMaxHalfWidth,
+                horizonSeconds = s.corridorHorizonSeconds,
+                minDistanceMeters = s.corridorMinDistance,
+                maxDistanceMeters = s.corridorMaxDistance,
+                widthGrowthPerMeter = s.corridorWidthGrowthPerMeter,
+                widthGrowthPerYawRate = s.corridorWidthGrowthPerYawRate,
+                speedRangeLowKmh = s.corridorSpeedRangeLow,
+                speedRangeHighKmh = s.corridorSpeedRangeHigh,
+            ),
+        )
     }
 
     // -- Camera ---------------------------------------------------------------
@@ -109,9 +144,6 @@ class MainScreenViewModel(application: Application) : AndroidViewModel(applicati
 
     private val _ridingRisk = MutableStateFlow(RidingRisk())
     val ridingRisk: StateFlow<RidingRisk> = _ridingRisk.asStateFlow()
-
-    private val _routePoints = MutableStateFlow<List<RoutePoint>>(emptyList())
-    val routePoints: StateFlow<List<RoutePoint>> = _routePoints.asStateFlow()
 
     // -- Settings (driven by UI's InferenceSettings data class) ----------------
 
@@ -146,14 +178,24 @@ class MainScreenViewModel(application: Application) : AndroidViewModel(applicati
 
     private var frameCount = 0L
     private var fpsWindowStartNs = System.nanoTime()
+    private var lastMetricsPublishNs = fpsWindowStartNs
+    private var latestFps = 0f
+    private var latestThermalStatus = "Normal"
     private var totalFrameCount = 0L
 
     // -- Camera-frame gate -----------------------------------------------------
 
     private var frameSkipCounter = 0
+    private var lastAnalyzedFrameNs = 0L
     private var errorCount = 0
+    private var thresholdCacheModelId = ""
+    private var thresholdCacheVulnerable = Float.NaN
+    private var thresholdCacheVehicle = Float.NaN
+    private var thresholdCache: Map<Int, Float> = emptyMap()
     private val engineUpdateMutex = Mutex()
     @Volatile private var pipelineUpdating = false
+    @Volatile private var inferencePaused = false
+    private val inferencePauseLock = Any()
 
     // -- Initialization -------------------------------------------------------
 
@@ -212,28 +254,6 @@ class MainScreenViewModel(application: Application) : AndroidViewModel(applicati
                         "input=${inferenceEngine.modelInputWidth}x${inferenceEngine.modelInputHeight}, " +
                         "isRawFormat=${inferenceEngine.isRawFormat}, " +
                         "delegate: ${inferenceEngine.getActiveDelegate()}")
-
-                    // Try loading supercombo model (optional, non-fatal)
-                    try {
-                        val scPath = "models/driving_supercombo.onnx"
-                        val assetList = try { application.assets.list("models")?.toList() } catch (_: Exception) { null }
-                        FileLogger.i(TAG, "Assets in models/: ${assetList?.joinToString() ?: "(null)"}")
-                        supercomboReady = supercomboEngine.loadModel(scPath)
-                        _supercomboAvailable.value = supercomboReady
-                        if (supercomboReady) {
-                            FileLogger.i(TAG, "Supercombo model loaded OK")
-                        } else {
-                            val msg = "Supercombo 模型加载失败（文件可能不存在或格式不兼容）"
-                            FileLogger.w(TAG, msg)
-                            _errorMessage.value = msg
-                        }
-                    } catch (e: Exception) {
-                        supercomboReady = false
-                        _supercomboAvailable.value = false
-                        val msg = "Supercombo 加载异常: ${e.message}"
-                        FileLogger.e(TAG, msg, e)
-                        _errorMessage.value = msg
-                    }
                 } else {
                     FileLogger.e(TAG, "Model load failed: ${savedModel.name} — interpreter is null")
                     _errorMessage.value = "模型加载失败: ${savedModel.name}"
@@ -264,20 +284,15 @@ class MainScreenViewModel(application: Application) : AndroidViewModel(applicati
         val manager = CameraManager(
             context = getApplication(),
             lifecycleOwner = lifecycleOwner,
-            onFrameReady = { buffer, imageProxy, geometry ->
-                onCameraFrame(buffer, imageProxy, geometry)
+            onFrameReady = { buffer, imageProxy, geometry, inputAlreadyQuantized ->
+                onCameraFrame(buffer, imageProxy, geometry, inputAlreadyQuantized)
             },
             modelInputWidth = currentModel.inputWidth,
             modelInputHeight = currentModel.inputHeight,
             analysisWidth = _settings.value.analysisResolution.width,
             analysisHeight = _settings.value.analysisResolution.height,
-            onYuvFrameReady = { nv21, width, height ->
-                if (_supercomboEnabled.value && supercomboReady) {
-                    supercomboPreprocessor.feedFrame(nv21, width, height)
-                }
-            },
             shouldAnalyzeFrame = ::shouldAnalyzeCameraFrame,
-            shouldCaptureYuvFrame = { _supercomboEnabled.value && supercomboReady },
+            inputQuantizationLutProvider = inferenceEngine::getInputQuantizationLut,
         )
         cameraManager = manager
         manager.setZoomRatio(_settings.value.digitalZoomRatio)
@@ -293,11 +308,14 @@ class MainScreenViewModel(application: Application) : AndroidViewModel(applicati
      */
     private fun shouldAnalyzeCameraFrame(): Boolean {
         totalFrameCount++
-        if (pipelineUpdating || !inferenceEngine.isReady) return false
+        if (inferencePaused || pipelineUpdating || !inferenceEngine.isReady) return false
         frameSkipCounter++
         val interval = _settings.value.frameSkip.coerceAtLeast(1)
         if (frameSkipCounter < interval) return false
         frameSkipCounter = 0
+        val now = System.nanoTime()
+        if (now - lastAnalyzedFrameNs < MIN_ANALYSIS_INTERVAL_NS) return false
+        lastAnalyzedFrameNs = now
         return true
     }
 
@@ -305,6 +323,7 @@ class MainScreenViewModel(application: Application) : AndroidViewModel(applicati
         inputBuffer: ByteBuffer,
         imageProxy: ImageProxy,
         geometry: FrameGeometry,
+        inputAlreadyQuantized: Boolean,
     ) {
         // The model tensor and its output use the same upright coordinate space.
         if (geometry != lastFrameGeometry) {
@@ -347,57 +366,23 @@ class MainScreenViewModel(application: Application) : AndroidViewModel(applicati
                     "${inferenceEngine.modelInputWidth}x${inferenceEngine.modelInputHeight}")
             }
 
+            val currentModel = modelManager.getCurrentModel()
+            val useNightRoad = currentModel.numClasses <= NIGHT_ROAD_CLASS_NAMES.size
             val result = inferenceEngine.runInference(
                 inputBuffer = inputBuffer,
+                inputAlreadyQuantized = inputAlreadyQuantized,
                 confidenceThreshold = currentSettings.confidenceThreshold,
                 iouThreshold = currentSettings.iouThreshold,
-                classConfidenceThresholds = classThresholds(currentSettings),
+                classConfidenceThresholds = classThresholds(currentSettings, currentModel),
                 maxDetections = currentSettings.maxDetections,
                 classAwareNms = currentSettings.classAwareNms,
             )
+            if (inferencePaused) return
 
-            // Hoist model lookup outside filter to avoid per-detection getCurrentModel() call
-            val currentModel = modelManager.getCurrentModel()
-            val useNightRoad = currentModel.numClasses <= NIGHT_ROAD_CLASS_NAMES.size
-            var roadDetections = if (useNightRoad) {
+            val roadDetections = if (useNightRoad) {
                 result.detections.filter { it.classId in NIGHT_ROAD_CLASS_NAMES.indices }
             } else {
                 result.detections.filter { it.classId in COCO_ROAD_USER_CLASS_IDS }
-            }
-
-            // Run supercombo if enabled and ready
-            if (_supercomboEnabled.value && supercomboReady) {
-                val scInputs = supercomboPreprocessor.prepareInputs()
-                if (scInputs == null) {
-                    Log.d(TAG, "Supercombo: no inputs yet (waiting for YUV frames)")
-                }
-                val scOutput = scInputs?.let(supercomboEngine::runInference)
-                if (scOutput != null) {
-                    _supercomboLatencyMs.value = scOutput.inferenceTimeMs
-                    val vehicleClassIds = if (useNightRoad) setOf(4, 5, 6) else setOf(2, 5, 7)
-                    // Merge YOLO detections with supercombo lead vehicles.
-                    roadDetections = leadVehicleMerger.merge(
-                        yoloDetections = roadDetections,
-                        supercomboOutput = scOutput,
-                        cameraWidth = cameraFrameWidth,
-                        cameraHeight = cameraFrameHeight,
-                        vehicleClassIds = vehicleClassIds,
-                        syntheticVehicleClassId = if (useNightRoad) 4 else 2,
-                    )
-                    // Convert predicted path to overlay coordinates.
-                    _routePoints.value = scOutput.pathPoints.map { pt ->
-                        RoutePoint(vehicleX = pt.x, vehicleY = pt.y)
-                    }
-                    Log.d(TAG, "Supercombo: ${scOutput.pathPoints.size} path points, " +
-                        "${scOutput.leads.size} leads, latency=${scOutput.inferenceTimeMs}ms")
-                } else {
-                    _supercomboLatencyMs.value = 0L
-                    _routePoints.value = emptyList()
-                    Log.w(TAG, "Supercombo: inference returned null")
-                }
-            } else {
-                _supercomboLatencyMs.value = 0L
-                _routePoints.value = emptyList()
             }
 
             // Enrich detections with pinhole-model distance estimates
@@ -412,19 +397,24 @@ class MainScreenViewModel(application: Application) : AndroidViewModel(applicati
             } else {
                 enrichedDetections
             }
-            _detections.value = stabilizedDetections
             val ridingRisk = ridingRiskEvaluator.evaluate(
                 detections = stabilizedDetections,
                 rotationDegrees = 0,
                 cameraWidth = cameraFrameWidth,
                 cameraHeight = cameraFrameHeight,
+                drivingCorridor = _drivingCorridor.value,
+                corridorFilteringEnabled = currentSettings.showRoutePrediction,
             )
-            _ridingRisk.value = ridingRisk
-            ridingVibrationController.update(
-                risk = ridingRisk,
-                enabled = currentSettings.vibrationAlertsEnabled,
-            )
-            alertSoundPlayer.onRiskChanged(ridingRisk)
+            synchronized(inferencePauseLock) {
+                if (inferencePaused) return
+                _detections.value = stabilizedDetections
+                _ridingRisk.value = ridingRisk
+                ridingVibrationController.update(
+                    risk = ridingRisk,
+                    enabled = currentSettings.vibrationAlertsEnabled,
+                )
+                alertSoundPlayer.onRiskChanged(ridingRisk)
+            }
             _activeDelegate.value = result.delegateUsed
             errorCount = 0 // reset on success
 
@@ -457,6 +447,17 @@ class MainScreenViewModel(application: Application) : AndroidViewModel(applicati
         val sanitized = newSettings.sanitized()
         _settings.value = sanitized
         settingsStore.save(sanitized)
+        if (oldSettings.corridorBaseHalfWidth != sanitized.corridorBaseHalfWidth ||
+            oldSettings.corridorMaxHalfWidth != sanitized.corridorMaxHalfWidth ||
+            oldSettings.corridorHorizonSeconds != sanitized.corridorHorizonSeconds ||
+            oldSettings.corridorMinDistance != sanitized.corridorMinDistance ||
+            oldSettings.corridorMaxDistance != sanitized.corridorMaxDistance ||
+            oldSettings.corridorWidthGrowthPerMeter != sanitized.corridorWidthGrowthPerMeter ||
+            oldSettings.corridorWidthGrowthPerYawRate != sanitized.corridorWidthGrowthPerYawRate ||
+            oldSettings.corridorSpeedRangeLow != sanitized.corridorSpeedRangeLow ||
+            oldSettings.corridorSpeedRangeHigh != sanitized.corridorSpeedRangeHigh) {
+            updateDrivingCorridor()
+        }
         applyTrackerConfig(sanitized)
         ridingRiskEvaluator.setDistanceThresholds(
             sanitized.dangerDistanceM,
@@ -550,29 +551,30 @@ class MainScreenViewModel(application: Application) : AndroidViewModel(applicati
         _errorMessage.value = null
     }
 
+    /** Pause expensive frame analysis while an opaque configuration surface is open. */
+    fun setInferencePaused(paused: Boolean) {
+        synchronized(inferencePauseLock) {
+            if (inferencePaused == paused) return
+            inferencePaused = paused
+            frameSkipCounter = 0
+            lastAnalyzedFrameNs = 0L
+        }
+        if (paused) {
+            ridingRiskEvaluator.reset()
+            _detections.value = emptyList()
+            _ridingRisk.value = RidingRisk()
+            ridingVibrationController.reset()
+            alertSoundPlayer.onRiskChanged(RidingRisk())
+            FileLogger.i(TAG, "Inference paused for configuration UI")
+        } else {
+            FileLogger.i(TAG, "Inference resumed after configuration UI")
+        }
+    }
+
     // -- Public API: alert preview --------------------------------------------
 
     fun previewAlertSound(severity: com.nightroadvision.app.alert.RiskSeverity) {
         alertSoundPlayer.previewPlay(severity)
-    }
-
-    // -- Public API: supercombo toggle -----------------------------------------
-
-    fun setSupercomboEnabled(enabled: Boolean) {
-        if (enabled && !supercomboReady) {
-            _supercomboEnabled.value = false
-            _routePoints.value = emptyList()
-            _supercomboLatencyMs.value = 0L
-            _errorMessage.value = "Supercombo 模型未包含在当前应用中"
-            return
-        }
-        _supercomboEnabled.value = enabled
-        if (!enabled) {
-            supercomboPreprocessor.reset()
-            _supercomboLatencyMs.value = 0L
-            _routePoints.value = emptyList()
-        }
-        FileLogger.i(TAG, "Supercombo ${if (enabled) "enabled" else "disabled"}")
     }
 
     // -- Public API: camera switching ------------------------------------------
@@ -583,10 +585,8 @@ class MainScreenViewModel(application: Application) : AndroidViewModel(applicati
         val selected = manager.cycleCamera() ?: return null
         synchronized(objectTracker) { objectTracker.reset() }
         ridingRiskEvaluator.reset()
-        supercomboPreprocessor.reset()
         _ridingRisk.value = RidingRisk()
         _detections.value = emptyList()
-        _routePoints.value = emptyList()
         return selected
     }
 
@@ -642,10 +642,8 @@ class MainScreenViewModel(application: Application) : AndroidViewModel(applicati
                     synchronized(objectTracker) { objectTracker.reset() }
                     ridingRiskEvaluator.reset()
                     ridingVibrationController.reset()
-                    supercomboPreprocessor.reset()
                     _ridingRisk.value = RidingRisk()
                     _detections.value = emptyList()
-                    _routePoints.value = emptyList()
                     _currentModelName.value = model.name
                     _activeDelegate.value = inferenceEngine.getActiveDelegate()
                     _settings.update { current ->
@@ -804,9 +802,18 @@ class MainScreenViewModel(application: Application) : AndroidViewModel(applicati
         }
     }
 
-    private fun classThresholds(settings: InferenceSettings): Map<Int, Float> {
-        val model = modelManager.getCurrentModel()
-        return if (model.numClasses <= NIGHT_ROAD_CLASS_NAMES.size) {
+    private fun classThresholds(
+        settings: InferenceSettings,
+        model: ModelManager.ModelInfo,
+    ): Map<Int, Float> {
+        if (thresholdCacheModelId == model.id &&
+            thresholdCacheVulnerable == settings.vulnerableUserConfidence &&
+            thresholdCacheVehicle == settings.vehicleConfidence
+        ) {
+            return thresholdCache
+        }
+
+        val thresholds = if (model.numClasses <= NIGHT_ROAD_CLASS_NAMES.size) {
             buildMap {
                 for (classId in 0..3) put(classId, settings.vulnerableUserConfidence)
                 for (classId in 4..6) put(classId, settings.vehicleConfidence)
@@ -821,6 +828,11 @@ class MainScreenViewModel(application: Application) : AndroidViewModel(applicati
                 7 to settings.vehicleConfidence,
             )
         }
+        thresholdCacheModelId = model.id
+        thresholdCacheVulnerable = settings.vulnerableUserConfidence
+        thresholdCacheVehicle = settings.vehicleConfidence
+        thresholdCache = thresholds
+        return thresholds
     }
 
     private fun isRoadUserDetection(detection: InferenceEngine.Detection): Boolean {
@@ -885,10 +897,7 @@ class MainScreenViewModel(application: Application) : AndroidViewModel(applicati
                 trackId = track.id,
                 cameraWidth = cameraFrameWidth,
                 cameraHeight = cameraFrameHeight,
-                distanceMeters = original?.distanceMeters,
                 estimatedDistanceMeters = original?.estimatedDistanceMeters,
-                velocityMps = original?.velocityMps,
-                isLeadVehicle = original?.isLeadVehicle ?: false,
             )
         }
     }
@@ -898,26 +907,26 @@ class MainScreenViewModel(application: Application) : AndroidViewModel(applicati
         val now = System.nanoTime()
         val elapsedNs = now - fpsWindowStartNs
 
-        if (elapsedNs >= 1_000_000_000L) {
-            val fps = frameCount * 1_000_000_000f / elapsedNs
+        if (elapsedNs >= FPS_WINDOW_NS) {
+            latestFps = frameCount * 1_000_000_000f / elapsedNs
+            latestThermalStatus = performanceMonitor.getThermalStatusLabel()
+            frameCount = 0
+            fpsWindowStartNs = now
+        }
+
+        // Telemetry is informational; publishing it at inference FPS needlessly
+        // recomposes the entire camera screen. Four updates per second feels live.
+        if (now - lastMetricsPublishNs >= METRICS_PUBLISH_INTERVAL_NS) {
             _performanceMetrics.update {
                 it.copy(
-                    fps = fps,
+                    fps = latestFps,
                     inferenceLatencyMs = inferenceTimeMs.toFloat(),
                     detectionCount = detectionCount,
                     backend = delegateLabel(),
-                    thermalStatus = performanceMonitor.getThermalStatusLabel(),
+                    thermalStatus = latestThermalStatus,
                 )
             }
-            frameCount = 0
-            fpsWindowStartNs = now
-        } else {
-            _performanceMetrics.update {
-                it.copy(
-                    inferenceLatencyMs = inferenceTimeMs.toFloat(),
-                    detectionCount = detectionCount,
-                )
-            }
+            lastMetricsPublishNs = now
         }
     }
 
@@ -958,7 +967,7 @@ class MainScreenViewModel(application: Application) : AndroidViewModel(applicati
             } else {
                 det.className.lowercase()
             }
-            if (det.distanceMeters != null || det.estimatedDistanceMeters != null) {
+            if (det.estimatedDistanceMeters != null) {
                 return@map if (det.className == className) det else det.copy(className = className)
             }
             val classHeight = pinholeClassHeights[className] ?: return@map det
@@ -989,11 +998,11 @@ class MainScreenViewModel(application: Application) : AndroidViewModel(applicati
     override fun onCleared() {
         super.onCleared()
         gpsSpeedManager.stop()
+        vehicleMotionEstimator.stop()
         cameraManager?.release()
         ridingVibrationController.reset()
         alertSoundPlayer.release()
         inferenceEngine.close()
-        supercomboEngine.close()
         FileLogger.i(TAG, "onCleared — resources released")
     }
 }

@@ -8,25 +8,20 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.drawscope.DrawScope
-import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.StrokeJoin
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.nativeCanvas
 import androidx.compose.ui.platform.LocalDensity
 import com.nightroadvision.app.inference.InferenceEngine
+import com.nightroadvision.app.motion.CorridorProjection
+import com.nightroadvision.app.motion.DrivingCorridor
+import com.nightroadvision.app.motion.NormalizedScreenPoint
 import java.util.Locale
-
-/**
- * A point on the predicted driving path in vehicle frame.
- * vehicleX = forward distance (m), vehicleY = lateral offset (m).
- */
-data class RoutePoint(
-    val vehicleX: Float,
-    val vehicleY: Float,
-)
+import kotlin.math.roundToInt
 
 private enum class TargetProximity(val label: String) {
     FAR("远"),
@@ -56,7 +51,7 @@ fun DetectionOverlay(
     showLabels: Boolean = true,
     showConfidence: Boolean = true,
     showTrackIds: Boolean = false,
-    routePoints: List<RoutePoint> = emptyList(),
+    drivingCorridor: DrivingCorridor = DrivingCorridor.EMPTY,
 ) {
     val density = LocalDensity.current.density
 
@@ -75,6 +70,24 @@ fun DetectionOverlay(
             isAntiAlias = true
             textSize = 10f * density
         }
+    }
+    val corridorSections = remember(drivingCorridor) {
+        drivingCorridor.points.asSequence()
+            .filter { it.forwardMeters >= 2.25f }
+            .mapNotNull { point ->
+                val center = CorridorProjection.project(point.forwardMeters, point.lateralMeters)
+                    ?: return@mapNotNull null
+                val left = CorridorProjection.project(
+                    point.forwardMeters,
+                    point.lateralMeters + point.halfWidthMeters,
+                ) ?: return@mapNotNull null
+                val right = CorridorProjection.project(
+                    point.forwardMeters,
+                    point.lateralMeters - point.halfWidthMeters,
+                ) ?: return@mapNotNull null
+                NormalizedCorridorSection(left = left, center = center, right = right)
+            }
+            .toList()
     }
 
     Canvas(modifier = modifier.fillMaxSize()) {
@@ -103,13 +116,12 @@ fun DetectionOverlay(
             offsetY = (overlayHeight - cameraHeight * scale) / 2f
         }
 
-        // ── Draw predicted driving route ──
-        if (routePoints.size >= 2) {
-            drawRoutePath(
-                routePoints = routePoints,
+        // ── Draw short-horizon riding corridor ──
+        if (corridorSections.size >= 2) {
+            drawDrivingCorridor(
+                normalizedSections = corridorSections,
                 overlayWidth = overlayWidth,
                 overlayHeight = overlayHeight,
-                density = density,
             )
         }
 
@@ -191,7 +203,7 @@ private fun DrawScope.drawDetectionBox(
         className = detection.className,
         proximity = proximity,
         inAttentionZone = inRidingAttentionZone,
-        distanceMeters = detection.distanceMeters ?: detection.estimatedDistanceMeters,
+        distanceMeters = detection.estimatedDistanceMeters,
     )
 
     if (highlighted) {
@@ -236,15 +248,19 @@ private fun DrawScope.drawDetectionBox(
         (boxWidth >= 56f * density && boxHeight >= 40f * density)
     if (!shouldDrawLabel || (!showLabels && !showConfidence && !showTrackIds)) return
 
-    val distanceLabel = (detection.distanceMeters ?: detection.estimatedDistanceMeters)
-        ?.let { "${String.format(Locale.US, "%.0f", it)}m" }
+    val distanceLabel = detection.estimatedDistanceMeters
+        ?.let { "${it.roundToInt()}m" }
         .orEmpty()
-    val label = buildList {
-        if (showTrackIds) detection.trackId?.let { add("#$it") }
-        if (showLabels) add(detection.className.uppercase(Locale.ROOT))
-        if (showConfidence) add("${(detection.confidence * 100).toInt()}%")
-        if (distanceLabel.isNotEmpty()) add(distanceLabel)
-    }.joinToString("  ")
+    val label = buildString {
+        fun appendPart(value: String) {
+            if (isNotEmpty()) append("  ")
+            append(value)
+        }
+        if (showTrackIds) detection.trackId?.let { appendPart("#$it") }
+        if (showLabels) appendPart(detection.className.uppercase(Locale.ROOT))
+        if (showConfidence) appendPart("${(detection.confidence * 100).toInt()}%")
+        if (distanceLabel.isNotEmpty()) appendPart(distanceLabel)
+    }
     val textWidth = bgPaint.measureText(label)
     val textHeight = bgPaint.textSize
     val labelPadding = 4f * density
@@ -318,68 +334,54 @@ private fun DrawScope.drawLeadChevron(
 }
 
 /**
- * Draw the predicted driving path as a glowing curve.
+ * Draw the predicted footprint as an openpilot-style tapered path polygon.
  *
- * Vehicle frame → screen mapping:
- *   vehicleX (forward, m) → moves up on screen (toward horizon)
- *   vehicleY (lateral, m) → moves left/right on screen
- *
- * The path starts at the bottom-center of the screen and curves upward,
- * simulating the driver's forward perspective.
+ * openpilot renders its planned path as one filled polygon whose opacity falls to
+ * zero toward the horizon. Keeping the same visual grammar makes the occupied area
+ * immediately legible and avoids the false-lane impression created by side rails.
  */
-private fun DrawScope.drawRoutePath(
-    routePoints: List<RoutePoint>,
+private fun DrawScope.drawDrivingCorridor(
+    normalizedSections: List<NormalizedCorridorSection>,
     overlayWidth: Float,
     overlayHeight: Float,
-    density: Float,
 ) {
-    // Approximate pinhole projection. openpilot road coordinates use x forward
-    // and y left, while screen x grows to the right.
-    val startX = overlayWidth / 2f
-    val startY = overlayHeight * 0.92f
-    val horizonY = overlayHeight * 0.42f
-    val focalXPixels = overlayWidth * 0.46f
-    val focalYPixels = overlayHeight * 0.82f
-    val cameraHeightMeters = 1.20f
+    if (normalizedSections.size < 2) return
+    fun screenPoint(point: NormalizedScreenPoint) =
+        Offset(point.x * overlayWidth, point.y * overlayHeight)
 
-    val path = Path()
-    path.moveTo(startX, startY)
-
-    for (pt in routePoints) {
-        val forwardMeters = pt.vehicleX
-        if (!forwardMeters.isFinite() || !pt.vehicleY.isFinite() ||
-            forwardMeters !in 0.75f..80f
-        ) continue
-
-        // u = cx - fx * lateral / depth. Positive road-frame y is left.
-        val screenX = startX - pt.vehicleY * focalXPixels / forwardMeters
-        // Ground points approach the horizon asymptotically instead of moving
-        // linearly past it as distance grows.
-        val screenY = (horizonY + cameraHeightMeters * focalYPixels / forwardMeters)
-            .coerceIn(horizonY, startY)
-
-        path.lineTo(screenX, screenY)
+    val ribbon = Path().apply {
+        val firstLeft = screenPoint(normalizedSections.first().left)
+        moveTo(firstLeft.x, firstLeft.y)
+        for (index in 1 until normalizedSections.size) {
+            val left = screenPoint(normalizedSections[index].left)
+            lineTo(left.x, left.y)
+        }
+        for (index in normalizedSections.lastIndex downTo 0) {
+            val right = screenPoint(normalizedSections[index].right)
+            lineTo(right.x, right.y)
+        }
+        close()
     }
-
-    // Outer glow (wider, semi-transparent)
     drawPath(
-        path = path,
-        color = Color(0xFF00FF41).copy(alpha = 0.18f),
-        style = Stroke(width = 8f * density, cap = StrokeCap.Round, join = StrokeJoin.Round),
-    )
-    // Inner bright line
-    drawPath(
-        path = path,
-        color = Color(0xFF00FF41).copy(alpha = 0.65f),
-        style = Stroke(width = 2.5f * density, cap = StrokeCap.Round, join = StrokeJoin.Round),
-    )
-    // Center bright core
-    drawPath(
-        path = path,
-        color = Color(0xFFAAFFCC).copy(alpha = 0.90f),
-        style = Stroke(width = 1.2f * density, cap = StrokeCap.Round, join = StrokeJoin.Round),
+        path = ribbon,
+        brush = Brush.verticalGradient(
+            colors = listOf(
+                // Current openpilot non-experimental throttle-path palette.
+                Color(0xFF0DF87A).copy(alpha = 0.40f),
+                Color(0xFF72FF5C).copy(alpha = 0.35f),
+                Color(0xFF72FF5C).copy(alpha = 0f),
+            ),
+            startY = normalizedSections.first().center.y * overlayHeight,
+            endY = normalizedSections.last().center.y * overlayHeight,
+        ),
     )
 }
+
+private data class NormalizedCorridorSection(
+    val left: NormalizedScreenPoint,
+    val center: NormalizedScreenPoint,
+    val right: NormalizedScreenPoint,
+)
 
 private fun estimateProximity(widthRatio: Float, heightRatio: Float): TargetProximity {
     val areaRatio = widthRatio * heightRatio
@@ -396,7 +398,7 @@ private fun getClassColor(
     inAttentionZone: Boolean,
     distanceMeters: Float? = null,
 ): Color {
-    // If we have real distance from supercombo, use it for color coding
+    // Use the best available distance estimate for color coding.
     if (distanceMeters != null) {
         return when {
             distanceMeters < 10f -> Color(0xFFFF4D5E)   // red: very close
